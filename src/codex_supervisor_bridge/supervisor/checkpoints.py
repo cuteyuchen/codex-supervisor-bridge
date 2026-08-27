@@ -237,13 +237,15 @@ def normalize_progress_snapshot(
 
     previous_status = previous.remote_status if previous else None
     previous_action = previous.next_action if previous else None
+    status_changed = previous is not None and bool(status and status != previous_status)
+    action_changed = previous is not None and bool(next_action and next_action != previous_action)
     material_progress = bool(
         completed
         or in_progress
         or files
         or validation
-        or (status and status != previous_status)
-        or (next_action and next_action != previous_action)
+        or status_changed
+        or action_changed
     )
     if gate_reasons:
         checkpoint_type = CheckpointType.GATE

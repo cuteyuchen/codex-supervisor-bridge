@@ -87,6 +87,15 @@ def _assert_task_can_write(phase: TaskPhase) -> None:
 
 
 def _assert_workspace_transition_safe(conn: Any, task_id: str) -> None:
+    safety = conn.execute(
+        "SELECT state FROM task_agent_safety WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    if safety is not None and safety["state"] != "NONE":
+        raise ConflictError(
+            "Agent runtime compensation requires reconciliation before changing execution mode "
+            "or writer ownership"
+        )
     prepared = conn.execute(
         "SELECT operation_id, operation_type FROM direct_workspace_operations "
         "WHERE task_id = ? AND status = 'PREPARED' LIMIT 1",

@@ -86,6 +86,7 @@ class PlanResult(BaseModel):
 
 class AgentSnapshot(BaseModel):
     status: str
+    reconciliation_required: bool = False
     plan: PlanResult | None = None
     operation_id: str | None = None
     workflow_id: str | None = None

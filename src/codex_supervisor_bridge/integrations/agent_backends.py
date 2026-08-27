@@ -204,6 +204,9 @@ def snapshot_from_payload(
         thread_id = thread_id or _string(nested, "thread_id", "threadId", "active_thread_id")
         turn_id = turn_id or _string(nested, "turn_id", "turnId", "active_turn_id")
     status = _string(source, "status", "runtime_status", "turn_status") or status
+    reconciliation_required = bool(
+        _value(source, "reconciliation_required", "reconciliationRequired")
+    ) or status.lower() in {"unknown", "reconciliation_required", "compensation_required"}
     events = _value(source, "events", "progressEvents", "progress_events")
     completed = _strings(_value(source, "completed", "completed_items"))
     in_progress = _strings(_value(source, "in_progress", "inProgress", "active_items"))
@@ -237,6 +240,7 @@ def snapshot_from_payload(
                     in_progress.append(text[:300])
     return AgentSnapshot(
         status=status,
+        reconciliation_required=reconciliation_required,
         plan=plan,
         operation_id=operation_id or _string(source, "operation_id", "operationId"),
         workflow_id=workflow_id or _string(source, "workflow_id", "workflowId"),
@@ -284,6 +288,7 @@ def _unknown_handle(operation: str) -> PlanHandle:
 def _unknown_snapshot(operation: str, *, handle: PlanHandle | None = None) -> AgentSnapshot:
     return AgentSnapshot(
         status="UNKNOWN",
+        reconciliation_required=True,
         operation_id=handle.operation_id if handle else None,
         workflow_id=handle.workflow_id if handle else None,
         thread_id=handle.thread_id if handle else None,

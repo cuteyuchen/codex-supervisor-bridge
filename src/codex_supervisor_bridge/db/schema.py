@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = r"""
 PRAGMA foreign_keys = ON;
@@ -415,6 +415,25 @@ CREATE TABLE IF NOT EXISTS direct_command_sessions (
 
 CREATE INDEX IF NOT EXISTS idx_direct_command_running
 ON direct_command_sessions(task_id, status, created_at DESC);
+"""
+
+AGENT_SAFETY_MIGRATION_SQL = r"""
+CREATE TABLE IF NOT EXISTS task_agent_safety (
+    task_id TEXT PRIMARY KEY REFERENCES supervised_tasks(task_id) ON DELETE CASCADE,
+    state TEXT NOT NULL DEFAULT 'NONE'
+        CHECK (state IN ('NONE', 'COMPENSATION_REQUIRED', 'RECONCILIATION_REQUIRED')),
+    operation TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    workflow_id TEXT,
+    operation_id TEXT,
+    thread_id TEXT,
+    turn_id TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_agent_safety_state
+ON task_agent_safety(state, updated_at DESC);
 """
 
 OPTIONAL_FTS_SQL = r"""

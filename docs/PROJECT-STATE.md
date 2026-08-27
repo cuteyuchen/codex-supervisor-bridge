@@ -302,6 +302,9 @@ The following behaviors are implemented and covered:
 - semantic Direct Workspace MCP tools backed by `WorkspaceBackend` and DevSpace;
 - Local-Codex-Bridge `AgentBackend` with same-turn steer, observe, interrupt,
   pending interaction normalization, and UNKNOWN acknowledgement semantics;
+- backend-neutral external-call race compensation for plan/execution start,
+  with durable agent safety guards that fail closed on UNKNOWN or failed
+  interrupt compensation;
 - backend-neutral Supervisor Plan Gate carrying a read-only `PlanResult` through
   local DRAFT/import, explicit APPROVED review, writer-lease validation, and
   workspace-write execution;
@@ -314,7 +317,7 @@ The following behaviors are implemented and covered:
 - Context Pack preservation of execution state, workspace identity, Git/review
   evidence, checkpoints, and reconciliation warnings;
 - SQLite persistence/recovery for task, execution, workspace, direct operation,
-  handoff, review, and checkpoint state.
+  handoff, review, checkpoint, and agent compensation state (schema version 7).
 
 P6.5 deliberately does **not** claim real Windows installation, Local-Codex-
 Bridge process startup, DevSpace OAuth, ChatGPT Remote MCP tunnel proof, or

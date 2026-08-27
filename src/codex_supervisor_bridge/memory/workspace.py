@@ -257,6 +257,14 @@ def prepare_direct_operation(
     with store._write() as conn:
         task_row = store._task_row(conn, task_id)
         store._assert_revision(task_row, expected_revision)
+        safety = conn.execute(
+            "SELECT state FROM task_agent_safety WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if safety is not None and safety["state"] != "NONE":
+            raise ConflictError(
+                "Agent runtime compensation requires reconciliation before another workspace write"
+            )
         execution = conn.execute(
             "SELECT * FROM task_execution_state WHERE task_id = ?",
             (task_id,),

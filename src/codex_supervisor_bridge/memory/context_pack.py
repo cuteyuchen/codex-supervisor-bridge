@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass, field
 from math import ceil
 
+from .agent_safety import AgentSafetyState, get_agent_safety
 from .checkpoint_reviews import get_checkpoint_review
 from .checkpoint_store import latest_checkpoint
 from .execution import get_execution_state
@@ -58,6 +59,7 @@ class ContextPackBuilder:
         execution = get_execution_state(self.store, task_id)
         workspace = get_workspace_binding(self.store, task_id)
         prepared_operation = get_prepared_direct_operation(self.store, task_id)
+        agent_safety = get_agent_safety(self.store, task_id)
         constraints = self.store.active_constraints(task_id)
         decisions = self.store.active_decisions(task_id)
         approved_plan = self.store.approved_plan(task_id)
@@ -75,6 +77,7 @@ class ContextPackBuilder:
                 self._workspace_state(workspace, prepared_operation),
             )
         )
+        mandatory.append(("AGENT SAFETY", self._agent_safety(agent_safety)))
         mandatory.append(("USER GOAL", task.current_goal or "No explicit goal recorded."))
 
         hard_constraints = [
@@ -314,6 +317,32 @@ class ContextPackBuilder:
             )
             rows.append(
                 f"Prepared Operation: {prepared_operation.operation_id} / {prepared_operation.operation_type}"
+            )
+        return "\n".join(rows)
+
+    @staticmethod
+    def _agent_safety(safety: object | None) -> str:
+        if safety is None or safety.state == AgentSafetyState.NONE:
+            return "No pending agent compensation or reconciliation requirement."
+        rows = [
+            "RECONCILIATION REQUIRED: agent compensation is incomplete; writer transitions, "
+            "direct mutation, and new Codex execution are blocked.",
+            f"State: {safety.state}",
+            f"Operation: {safety.operation}",
+            f"Summary: {safety.summary}",
+        ]
+        if safety.workflow_id or safety.operation_id or safety.thread_id or safety.turn_id:
+            rows.append(
+                "Runtime: "
+                + " / ".join(
+                    value or "-"
+                    for value in (
+                        safety.workflow_id,
+                        safety.operation_id,
+                        safety.thread_id,
+                        safety.turn_id,
+                    )
+                )
             )
         return "\n".join(rows)
 

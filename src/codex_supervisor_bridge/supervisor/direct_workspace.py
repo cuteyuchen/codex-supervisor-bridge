@@ -10,6 +10,7 @@ from codex_supervisor_bridge.backends.models import (
     WriterLeaseToken,
 )
 from codex_supervisor_bridge.backends.workspace import WorkspaceBackend
+from codex_supervisor_bridge.memory.agent_safety import assert_agent_safety_clear
 from codex_supervisor_bridge.memory.execution import get_execution_state
 from codex_supervisor_bridge.memory.models import ActiveWriter, EvidenceType
 from codex_supervisor_bridge.memory.service import MemoryService
@@ -81,6 +82,7 @@ class DirectWorkspaceCoordinator:
         base_ref: str | None = None,
     ) -> DirectWorkspaceOpenResult:
         task = self.memory.assert_revision(task_id, expected_revision)
+        assert_agent_safety_clear(self.memory.store, task_id)
         selected_repository = (repository or task.repository or "").strip()
         if not selected_repository:
             raise ValueError("Task has no repository/project path to open")

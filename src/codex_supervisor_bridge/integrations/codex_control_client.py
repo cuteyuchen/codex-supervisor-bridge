@@ -94,6 +94,15 @@ class CodexControlAdapter:
     def _decode_payload(cls, tool: str, result: Any) -> dict[str, Any]:
         structured = result.structured_content
         payload: dict[str, Any] | None = structured if isinstance(structured, dict) else None
+        if payload is not None and set(payload) == {"result"}:
+            wrapped = payload.get("result")
+            if isinstance(wrapped, str):
+                try:
+                    decoded_wrapped = json.loads(wrapped)
+                except json.JSONDecodeError:
+                    decoded_wrapped = None
+                if isinstance(decoded_wrapped, dict):
+                    payload = decoded_wrapped
         if payload is None:
             text = cls._text(result)
             if text:

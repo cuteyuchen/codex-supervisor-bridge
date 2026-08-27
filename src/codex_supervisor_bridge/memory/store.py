@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
 
-from codex_supervisor_bridge.db.schema import OPTIONAL_FTS_SQL, SCHEMA_SQL, SCHEMA_VERSION
+from codex_supervisor_bridge.db.migrations import apply_migrations
+from codex_supervisor_bridge.db.schema import OPTIONAL_FTS_SQL
 
 from .errors import ConflictError, InvalidTransitionError, StaleRevisionError, TaskNotFoundError
 from .models import (
@@ -91,12 +92,7 @@ class MemoryStore:
             if self.path != ":memory:":
                 self._conn.execute("PRAGMA journal_mode = WAL")
                 self._conn.execute("PRAGMA synchronous = NORMAL")
-            self._conn.executescript(SCHEMA_SQL)
-            self._conn.execute(
-                "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (str(SCHEMA_VERSION),),
-            )
+            apply_migrations(self._conn)
             try:
                 self._conn.executescript(OPTIONAL_FTS_SQL)
                 self._fts_enabled = True
@@ -332,6 +328,19 @@ class MemoryStore:
             and (event_types is None or event.event_type in event_types)
         ]
         return filtered[-limit:]
+
+    def record_event(
+        self,
+        task_id: str,
+        expected_revision: int,
+        actor: Actor,
+        event_type: EventType,
+        payload: dict[str, Any] | None = None,
+    ) -> TaskEvent:
+        """Append a supervisor-relevant event and atomically advance task revision."""
+        with self._write() as conn:
+            task = self._update_task(conn, task_id, expected_revision)
+            return self._insert_event(conn, task, actor, event_type, payload)
 
     def update_intent(
         self,
@@ -746,7 +755,8 @@ class MemoryStore:
             )
             now = _iso()
             old_rows = conn.execute(
-                "SELECT plan_id FROM task_plans WHERE task_id = ? AND status = ?",
+                "SELECT plan_id, plan_version, content FROM task_plans "
+                "WHERE task_id = ? AND status = ?",
                 (task_id, PlanStatus.APPROVED.value),
             ).fetchall()
             conn.execute(
@@ -761,6 +771,15 @@ class MemoryStore:
                     actor,
                     EventType.PLAN_SUPERSEDED,
                     {"plan_id": old["plan_id"], "superseded_by": plan_id},
+                )
+                self._upsert_document(
+                    conn,
+                    task_id,
+                    "plan",
+                    old["plan_id"],
+                    f"Plan V{old['plan_version']}",
+                    old["content"],
+                    PlanStatus.SUPERSEDED.value,
                 )
             conn.execute(
                 "UPDATE task_plans SET status = ?, updated_at = ? WHERE plan_id = ?",

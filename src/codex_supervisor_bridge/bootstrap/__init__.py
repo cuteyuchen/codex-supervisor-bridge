@@ -24,6 +24,7 @@ from .configuration import (
     ConfigStore,
     DevelopmentStyle,
 )
+from .devspace import DevSpaceBootstrap, DevSpaceBootstrapConfig
 from .doctor import Doctor, DoctorOptions
 from .harness import (
     HarnessComparison,
@@ -79,6 +80,8 @@ __all__ = [
     "DevelopmentStyle",
     "Doctor",
     "DoctorOptions",
+    "DevSpaceBootstrap",
+    "DevSpaceBootstrapConfig",
     "DoctorStatus",
     "HarnessComparison",
     "HarnessStep",

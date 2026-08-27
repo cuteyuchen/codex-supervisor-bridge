@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 
 from .configuration import AppConfig, ConfigStore
+from .devspace import DevSpaceBootstrap
 from .doctor import Doctor
 from .models import DoctorStatus, HealthStatus, RepairAction
 from .paths import AppDataPaths
@@ -44,6 +45,14 @@ class RepairService:
             config.basic.project_directory = project_directory.expanduser().resolve()
         if config.advanced.sqlite_path is None:
             config.advanced.sqlite_path = self.paths.database
+        if "devspace" not in config.advanced.ports:
+            try:
+                lease = self.port_allocator.reserve(excluded={config.advanced.ports.get("supervisor", -1)})
+                config.advanced.ports["devspace"] = lease.port
+                lease.release()
+                actions.append(RepairAction(action="allocate_devspace_port", status=HealthStatus.READY, message="Local workspace port selected."))
+            except OSError:
+                actions.append(RepairAction(action="allocate_devspace_port", status=HealthStatus.UNAVAILABLE, message="No local workspace port is available.", requires_user_action=True))
         port_health = status.component("Local port")
         if port_health is None or port_health.status != HealthStatus.READY or "supervisor" not in config.advanced.ports:
             try:
@@ -56,6 +65,16 @@ class RepairService:
         self.config_store.save(config)
         self._write_mcp_config(config)
         actions.append(RepairAction(action="generate_mcp_config", status=HealthStatus.READY, message="Local connection settings are ready."))
+        project = project_directory or config.basic.project_directory
+        if config.advanced.ports.get("devspace"):
+            devspace = DevSpaceBootstrap.from_app_data(
+                self.paths,
+                port=config.advanced.ports["devspace"],
+                project_directory=project,
+                executable=config.advanced.executable_paths.get("devspace", "devspace"),
+            )
+            devspace.write_config()
+            actions.append(RepairAction(action="generate_workspace_config", status=HealthStatus.READY, message="Local workspace settings are ready."))
 
         for process in self.process_manager.statuses():
             if process.status in {"STALE", "CRASHED"}:
@@ -63,7 +82,6 @@ class RepairService:
                 actions.append(RepairAction(action=f"repair_process:{process.name}", status=HealthStatus.READY, message="Stopped process state was recovered.", advanced=repaired.as_dict()))
             elif process.status == "UNKNOWN":
                 actions.append(RepairAction(action=f"repair_process:{process.name}", status=HealthStatus.DEGRADED, message="A process may still be running; inspect before restarting.", requires_user_action=True, advanced=process.as_dict()))
-        project = project_directory or config.basic.project_directory
         if project is None:
             actions.append(RepairAction(action="select_project_directory", status=HealthStatus.DEGRADED, message="Select a project directory to continue.", requires_user_action=True))
         return actions

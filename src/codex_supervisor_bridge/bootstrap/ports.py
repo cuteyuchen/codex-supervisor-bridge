@@ -32,11 +32,16 @@ class PortAllocator:
         self.start = start
         self.end = end
 
-    def reserve(self, preferred: int | None = None) -> PortLease:
+    def reserve(self, preferred: int | None = None, *, excluded: set[int] | None = None) -> PortLease:
+        excluded = excluded or set()
         candidates: list[int] = []
-        if preferred is not None:
+        if preferred is not None and preferred not in excluded:
             candidates.append(preferred)
-        candidates.extend(port for port in range(self.start, self.end + 1) if port != preferred)
+        candidates.extend(
+            port
+            for port in range(self.start, self.end + 1)
+            if port != preferred and port not in excluded
+        )
         for port in candidates:
             lease = self._try_reserve(port)
             if lease is not None:

@@ -15,6 +15,7 @@ from codex_supervisor_bridge.bootstrap import (
     CommandSessionStatus,
     CommandVerdict,
     ConfigStore,
+    DevSpaceBootstrap,
     Doctor,
     FirstAuthorizationFlow,
     HarnessStep,
@@ -80,6 +81,15 @@ def test_port_allocator_prefers_configured_port_then_recovers_conflict() -> None
             second.release()
     finally:
         first.release()
+
+
+def test_port_allocator_can_exclude_persisted_ports() -> None:
+    allocator = PortAllocator(start=39010, end=39012)
+    lease = allocator.reserve(39010, excluded={39010})
+    try:
+        assert lease.port != 39010
+    finally:
+        lease.release()
 
 
 class DummyProcess:
@@ -169,6 +179,25 @@ def test_repair_creates_data_and_mcp_config_without_secrets(tmp_path: Path) -> N
     assert paths.generated_mcp_config.exists()
     assert any(action.action == "generate_mcp_config" for action in actions)
     assert "token" not in paths.generated_mcp_config.read_text(encoding="utf-8").lower()
+
+
+def test_devspace_bootstrap_writes_scoped_v1_config_and_process_command(tmp_path: Path) -> None:
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    bootstrap = DevSpaceBootstrap.from_app_data(paths, port=39101, project_directory=project)
+    config_path = bootstrap.write_config()
+    document = json.loads(config_path.read_text(encoding="utf-8"))
+    assert document["configVersion"] == 1
+    assert document["server"]["host"] == "127.0.0.1"
+    assert document["server"]["port"] == 39101
+    assert document["tools"]["mode"] == "codex"
+    assert str(project) in document["workspaces"]["allowedRoots"]
+    assert not (bootstrap.config_directory / "auth.json").exists()
+    assert bootstrap.process_spec(log_dir=paths.logs).command == ["devspace", "serve"]
 
 
 def test_secret_store_round_trip_and_remote_access_security_gate() -> None:

@@ -239,16 +239,22 @@ class CodexCoordinator:
         if runtime is None or not runtime.workflow_id:
             raise CodexPlanGateError("Task has no Codex plan workflow to execute")
 
+        # Read the remote plan in a clean MCP context and close it before
+        # evaluating the local approval gate. Raising the domain error inside
+        # the MCP Client task group can wrap it in an ExceptionGroup and hide
+        # the model-readable CODEX_PLAN_GATE message.
         async with self.adapter_factory() as adapter:
             before = await adapter.get_workflow_status(runtime.workflow_id)
-            remote_plan, _, _ = _latest_plan(before)
-            if _normalized_plan(remote_plan) != _normalized_plan(approved.content):
-                raise CodexPlanGateError(
-                    "Locally approved plan no longer matches Codex latestPlan; re-import and review"
-                )
-            client_request_id = (
-                f"codex-supervisor-bridge:{task_id}:execute:plan-v{approved.plan_version}"
+        remote_plan, _, _ = _latest_plan(before)
+        if _normalized_plan(remote_plan) != _normalized_plan(approved.content):
+            raise CodexPlanGateError(
+                "Locally approved plan no longer matches Codex latestPlan; re-import and review"
             )
+
+        client_request_id = (
+            f"codex-supervisor-bridge:{task_id}:execute:plan-v{approved.plan_version}"
+        )
+        async with self.adapter_factory() as adapter:
             remote = await adapter.approve_plan(
                 {
                     "workflow_id": runtime.workflow_id,

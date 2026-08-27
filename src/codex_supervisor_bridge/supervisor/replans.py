@@ -5,13 +5,13 @@ from typing import Any
 from codex_supervisor_bridge.integrations.codex_control_errors import CodexControlError
 from codex_supervisor_bridge.integrations.codex_coordinator import CodexCoordinator
 from codex_supervisor_bridge.memory.errors import ConflictError
+from codex_supervisor_bridge.memory.replan_bindings import prepare_interrupt_retry
 from codex_supervisor_bridge.memory.replan_models import HardReplanStatus
 from codex_supervisor_bridge.memory.replans import (
     active_hard_replan,
     begin_hard_replan,
     classify_work_snapshot,
     finalize_interrupt,
-    get_hard_replan,
     get_work_snapshot,
     latest_work_snapshot,
 )
@@ -111,17 +111,12 @@ class HardReplanService:
         expected_revision: int,
         replan_id: str,
     ) -> dict[str, Any]:
-        task = self.memory.assert_revision(task_id, expected_revision)
-        replan = get_hard_replan(self.memory.store, replan_id)
-        if replan is None or replan.task_id != task_id:
-            raise ConflictError(f"Unknown hard replan for task {task_id}: {replan_id}")
-        if replan.status != HardReplanStatus.INTERRUPT_FAILED:
-            raise ConflictError(
-                f"Hard replan interrupt retry is invalid from {replan.status.value}"
-            )
-        snapshot = get_work_snapshot(self.memory.store, replan.snapshot_id)
-        if snapshot is None:
-            raise ConflictError(f"Missing work snapshot: {replan.snapshot_id}")
+        retry_task, replan, snapshot = prepare_interrupt_retry(
+            self.memory.store,
+            task_id,
+            replan_id,
+            expected_revision,
+        )
         identifiers = {
             "workflow_id": snapshot.codex_workflow_id,
             "operation_id": snapshot.operation_id,
@@ -132,8 +127,8 @@ class HardReplanService:
             final = finalize_interrupt(
                 self.memory.store,
                 task_id,
-                replan_id,
-                task.revision,
+                replan.replan_id,
+                retry_task.revision,
                 succeeded=True,
             )
             return {
@@ -148,8 +143,8 @@ class HardReplanService:
             final = finalize_interrupt(
                 self.memory.store,
                 task_id,
-                replan_id,
-                task.revision,
+                replan.replan_id,
+                retry_task.revision,
                 succeeded=False,
                 error=str(exc),
             )
@@ -159,11 +154,21 @@ class HardReplanService:
                 "remote": None,
                 "recommended_next_tool": "retry_hard_replan_interrupt",
             }
+        except Exception:
+            finalize_interrupt(
+                self.memory.store,
+                task_id,
+                replan.replan_id,
+                retry_task.revision,
+                succeeded=False,
+                error="unexpected remote interrupt retry failure",
+            )
+            raise
         final = finalize_interrupt(
             self.memory.store,
             task_id,
-            replan_id,
-            task.revision,
+            replan.replan_id,
+            retry_task.revision,
             succeeded=True,
         )
         return {

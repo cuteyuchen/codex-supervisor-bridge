@@ -206,7 +206,7 @@ def test_devspace_bootstrap_writes_scoped_v1_config_and_process_command(tmp_path
     assert document["tools"]["mode"] == "codex"
     assert str(project) in document["workspaces"]["allowedRoots"]
     assert not (bootstrap.config_directory / "auth.json").exists()
-    assert bootstrap.process_spec(log_dir=paths.logs).command == ["devspace", "serve"]
+    assert bootstrap.process_spec().command == ["devspace", "serve"]
 
 
 def test_local_codex_bridge_bootstrap_checks_current_control_surface() -> None:

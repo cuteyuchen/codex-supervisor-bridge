@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shlex
+import shutil
 import sys
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from codex_supervisor_bridge.backends.models import BackendHealth, BackendHealth
 from codex_supervisor_bridge.capabilities import CapabilityResolver
 
 from .configuration import AppConfig, ConfigStore
+from .devspace import DevSpaceBootstrap
 from .doctor import Doctor, DoctorOptions
 from .models import BootstrapStatus, DoctorStatus, HealthStatus, RepairAction
 from .paths import AppDataPaths
@@ -91,6 +93,37 @@ class BootstrapService:
             advanced=state.as_dict(),
         )
         result.repairs.append(start_action)
+        if shutil.which(config.advanced.executable_paths.get("devspace", "devspace")):
+            devspace = DevSpaceBootstrap.from_app_data(
+                self.paths,
+                port=config.advanced.ports.get("devspace", port),
+                project_directory=project_directory or config.basic.project_directory,
+                executable=config.advanced.executable_paths.get("devspace", "devspace"),
+            )
+            try:
+                component = self.process_manager.start(
+                    devspace.process_spec(
+                        startup_timeout=config.advanced.startup_timeout_seconds,
+                        shutdown_timeout=config.advanced.shutdown_timeout_seconds,
+                    )
+                )
+                result.repairs.append(
+                    RepairAction(
+                        action="start_process:devspace",
+                        status=HealthStatus.READY if component.status == "RUNNING" else HealthStatus.UNAVAILABLE,
+                        message="Local workspace started." if component.status == "RUNNING" else "Local workspace could not start.",
+                        advanced=component.as_dict(),
+                    )
+                )
+            except (OSError, ValueError) as exc:
+                result.repairs.append(
+                    RepairAction(
+                        action="start_process:devspace",
+                        status=HealthStatus.UNAVAILABLE,
+                        message="Local workspace could not start.",
+                        advanced={"technical_detail": str(exc)},
+                    )
+                )
         for name, command in config.advanced.process_commands.items():
             if name == "supervisor" or not command.strip():
                 continue

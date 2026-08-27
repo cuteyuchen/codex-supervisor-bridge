@@ -120,7 +120,7 @@ class DevSpaceBootstrap:
                 os.unlink(temporary)
         return self.config_path
 
-    def process_spec(self, *, log_dir: Path, startup_timeout: float = 15.0, shutdown_timeout: float = 10.0) -> ManagedProcessSpec:
+    def process_spec(self, *, startup_timeout: float = 15.0, shutdown_timeout: float = 10.0) -> ManagedProcessSpec:
         return ManagedProcessSpec(
             name="devspace",
             command=[self.executable, "serve"],

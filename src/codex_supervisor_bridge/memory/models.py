@@ -180,7 +180,7 @@ class Decision(BaseModel):
     title: str
     content: str
     source_event_id: str | None = None
-    created_intent_version: int = Field(ge=1)
+    created_intent_version: int = Field(default=1, ge=1)
     superseded_by: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
@@ -194,7 +194,7 @@ class Constraint(BaseModel):
     status: ConstraintStatus = ConstraintStatus.ACTIVE
     content: str
     source_event_id: str | None = None
-    created_revision: int = Field(ge=0)
+    created_revision: int = Field(default=0, ge=0)
     superseded_by: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
@@ -211,7 +211,7 @@ class Plan(BaseModel):
     updated_at: datetime = Field(default_factory=utcnow)
 
 
-class Summary(BaseModel):
+class TaskSummary(BaseModel):
     summary_id: str
     task_id: str
     summary_type: SummaryType
@@ -251,4 +251,4 @@ class MemorySearchHit(BaseModel):
     title: str
     content: str
     status: str | None = None
-    updated_at: datetime
+    score: float | None = None

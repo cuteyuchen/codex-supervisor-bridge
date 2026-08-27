@@ -4,6 +4,7 @@ from pathlib import Path
 
 from .context_pack import BuiltContextPack, ContextPackBuilder
 from .errors import StaleRevisionError
+from .kandev_binding import bind_kandev_task
 from .models import (
     Actor,
     Constraint,
@@ -233,6 +234,22 @@ class MemoryService:
 
     def approved_plan(self, task_id: str) -> Plan | None:
         return self.store.approved_plan(task_id)
+
+    def bind_kandev_task(
+        self,
+        task_id: str,
+        expected_revision: int,
+        kandev_task_id: str,
+        *,
+        external_id: str,
+    ) -> TaskMemory:
+        return bind_kandev_task(
+            self.store,
+            task_id,
+            expected_revision,
+            kandev_task_id,
+            external_id=external_id,
+        )
 
     def assert_revision(self, task_id: str, expected_revision: int) -> TaskMemory:
         task = self.store.get_task(task_id)

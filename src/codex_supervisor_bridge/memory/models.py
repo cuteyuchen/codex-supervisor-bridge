@@ -43,6 +43,7 @@ class TaskPhase(str, Enum):
 
 class EventType(str, Enum):
     TASK_CREATED = "TASK_CREATED"
+    TASK_PHASE_CHANGED = "TASK_PHASE_CHANGED"
     USER_REQUEST = "USER_REQUEST"
     USER_OVERRIDE = "USER_OVERRIDE"
     INTENT_CREATED = "INTENT_CREATED"
@@ -239,3 +240,12 @@ class ContextSnapshot(BaseModel):
     token_estimate: int = Field(ge=0)
     content: str
     created_at: datetime = Field(default_factory=utcnow)
+
+
+class MemorySearchHit(BaseModel):
+    kind: str
+    source_id: str
+    title: str
+    content: str
+    status: str | None = None
+    score: float | None = None

@@ -8,7 +8,6 @@ from codex_supervisor_bridge import __version__
 from codex_supervisor_bridge.mcp.server import create_mcp_server
 from codex_supervisor_bridge.memory.service import MemoryService
 
-
 BASE_MEMORY_TOOLS = {
     "create_supervised_task",
     "get_supervised_task",

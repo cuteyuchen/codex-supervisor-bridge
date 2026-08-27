@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import sqlite3
 
-from .schema import CODEX_RUNTIME_MIGRATION_SQL, SCHEMA_SQL, SCHEMA_VERSION
+from .schema import (
+    CHECKPOINT_MIGRATION_SQL,
+    CODEX_RUNTIME_MIGRATION_SQL,
+    SCHEMA_SQL,
+    SCHEMA_VERSION,
+)
 
 MIGRATIONS: dict[int, str] = {
     1: SCHEMA_SQL,
     2: CODEX_RUNTIME_MIGRATION_SQL,
+    3: CHECKPOINT_MIGRATION_SQL,
 }
 
 

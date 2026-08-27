@@ -69,11 +69,12 @@ class Doctor:
             self._port(config),
             self._github(project),
             self._secure_remote(config),
+            self._shell(),
         ]
         if options.check_optional_components:
             components.extend(
                 [
-                    self._executable("Local workspace", "devspace", "devspace --version"),
+                    self._workspace(),
                     self._executable("Codex control", "local-codex-bridge", "local-codex-bridge --version"),
                     self._executable("Fallback workspace", "kandev", "kandev --version"),
                     self._executable("Fallback control", "codex-control-plane-mcp", "codex-control-plane-mcp --version"),
@@ -275,6 +276,34 @@ class Doctor:
             recommended_action="connect_chatgpt",
             advanced={"technical_detail": errors, "bind_host": remote.bind_host},
         )
+
+    def _shell(self) -> ComponentHealth:
+        bash = self._find("bash")
+        if bash is None:
+            return ComponentHealth(
+                capability="Shell support",
+                status=HealthStatus.UNAVAILABLE,
+                repairable=False,
+                user_message="A compatible local shell is required for the workspace.",
+                recommended_action="install_git_bash_or_wsl",
+                advanced={"provider": "bash", "executable": None},
+            )
+        return ComponentHealth(
+            capability="Shell support",
+            status=HealthStatus.READY,
+            user_message="Local shell is ready.",
+            advanced={"provider": "bash", "executable": bash},
+        )
+
+    def _workspace(self) -> ComponentHealth:
+        result = self._executable("Local workspace", "devspace", "devspace --version")
+        if result.status == HealthStatus.READY and self._find("bash") is None:
+            result.status = HealthStatus.DEGRADED
+            result.repairable = False
+            result.user_message = "Local workspace needs Git Bash or WSL."
+            result.recommended_action = "install_git_bash_or_wsl"
+            result.advanced["shell"] = None
+        return result
 
     def _codex(self, config: AppConfig, *, workspace: Path | None) -> ComponentHealth:
         configured = config.advanced.executable_paths.get("codex")

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = r"""
 PRAGMA foreign_keys = ON;
@@ -232,6 +232,68 @@ CREATE TABLE IF NOT EXISTS checkpoint_reviews (
 
 CREATE INDEX IF NOT EXISTS idx_checkpoint_reviews_task
 ON checkpoint_reviews(task_id, created_at DESC);
+"""
+
+HARD_REPLAN_MIGRATION_SQL = r"""
+CREATE TABLE IF NOT EXISTS work_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES supervised_tasks(task_id) ON DELETE CASCADE,
+    captured_revision INTEGER NOT NULL CHECK (captured_revision >= 0),
+    intent_version INTEGER NOT NULL CHECK (intent_version >= 1),
+    plan_version INTEGER NOT NULL CHECK (plan_version >= 0),
+    goal TEXT,
+    phase TEXT NOT NULL,
+    approved_plan_id TEXT,
+    kandev_task_id TEXT,
+    git_branch TEXT,
+    git_head TEXT,
+    checkpoint_id TEXT,
+    codex_workflow_id TEXT,
+    operation_id TEXT,
+    thread_id TEXT,
+    turn_id TEXT,
+    remote_status TEXT,
+    changed_files_json TEXT NOT NULL DEFAULT '[]',
+    validation_json TEXT NOT NULL DEFAULT '{}',
+    evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+    keep_json TEXT NOT NULL DEFAULT '[]',
+    modify_json TEXT NOT NULL DEFAULT '[]',
+    drop_json TEXT NOT NULL DEFAULT '[]',
+    classification_notes TEXT,
+    classification_status TEXT NOT NULL DEFAULT 'UNCLASSIFIED',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_work_snapshots_task_revision
+ON work_snapshots(task_id, captured_revision DESC, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS hard_replans (
+    replan_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES supervised_tasks(task_id) ON DELETE CASCADE,
+    snapshot_id TEXT NOT NULL REFERENCES work_snapshots(snapshot_id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    from_intent_version INTEGER NOT NULL CHECK (from_intent_version >= 1),
+    target_intent_version INTEGER NOT NULL CHECK (target_intent_version >= 1),
+    previous_plan_id TEXT,
+    new_plan_id TEXT,
+    new_goal TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    interrupt_error TEXT,
+    new_workflow_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_hard_replans_one_active
+ON hard_replans(task_id)
+WHERE status IN (
+    'INTERRUPT_PENDING', 'SNAPSHOT_READY', 'INTERRUPT_FAILED',
+    'READY_TO_PLAN', 'PLANNING', 'PLAN_REVIEW'
+);
+
+CREATE INDEX IF NOT EXISTS idx_hard_replans_task_created
+ON hard_replans(task_id, created_at DESC);
 """
 
 OPTIONAL_FTS_SQL = r"""

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from codex_supervisor_bridge.db import current_schema_version
+from codex_supervisor_bridge.db.schema import SCHEMA_VERSION
 from codex_supervisor_bridge.memory.context_pack import ContextPackBuilder
 from codex_supervisor_bridge.memory.errors import StaleRevisionError
 from codex_supervisor_bridge.memory.models import (
@@ -47,7 +48,7 @@ def test_task_persists_across_reopen(tmp_path: Path) -> None:
         assert restored.revision == 1
         constraints = reopened.active_constraints(restored.task_id)
         assert [item.content for item in constraints] == ["Reuse the existing StorageManager."]
-        assert current_schema_version(reopened._conn) == 3
+        assert current_schema_version(reopened._conn) == SCHEMA_VERSION
 
 
 def test_stale_revision_is_rejected_without_partial_write() -> None:

@@ -14,6 +14,7 @@ from codex_supervisor_bridge.backends.models import (
     BackendHealthStatus,
     PendingInteraction,
     PlanHandle,
+    PlanResult,
     WorkspaceState,
     WriterLeaseToken,
 )
@@ -113,7 +114,7 @@ def _pending(raw: Any, *, thread_id: str | None, turn_id: str | None) -> list[Pe
     for item in raw[:50]:
         if not isinstance(item, dict):
             continue
-        request_id = _value(item, "request_id", "requestId", "id")
+        request_id = _value(item, "request_id", "requestId", "interaction_id", "interactionId", "id")
         if not isinstance(request_id, (str, int)):
             continue
         method = _string(item, "method", "kind", "type") or "unknown"
@@ -156,6 +157,35 @@ def _pending(raw: Any, *, thread_id: str | None, turn_id: str | None) -> list[Pe
     return result
 
 
+def _plan_result(value: Any) -> PlanResult | None:
+    if isinstance(value, str) and value.strip():
+        return PlanResult(content=value.strip())
+    if not isinstance(value, dict):
+        return None
+    content = _string(value, "content", "markdown", "text", "plan")
+    if not content:
+        return None
+    return PlanResult(
+        content=content,
+        status=_string(value, "status", "quality") or "ready",
+        plan_hash=_string(value, "plan_hash", "planHash", "hash"),
+    )
+
+
+def _plan_from_source(source: dict[str, Any]) -> PlanResult | None:
+    plan = _plan_result(_value(source, "plan", "plan_result", "latest_plan", "latestPlan"))
+    if plan is not None:
+        return plan
+    content = _string(source, "plan_content", "planContent")
+    if not content:
+        return None
+    return PlanResult(
+        content=content,
+        status=_string(source, "plan_status", "planStatus") or "ready",
+        plan_hash=_string(source, "plan_hash", "planHash"),
+    )
+
+
 def snapshot_from_payload(
     payload: dict[str, Any],
     *,
@@ -185,10 +215,18 @@ def snapshot_from_payload(
     risks = _strings(_value(source, "risks", "warnings"))
     next_steps = _strings(_value(source, "next_steps", "nextSteps"))
     pending = _pending(
-        _value(source, "pending_requests", "pendingRequests", "interactions"),
+        _value(
+            source,
+            "pending_requests",
+            "pendingRequests",
+            "pending_interactions",
+            "pendingInteractions",
+            "interactions",
+        ),
         thread_id=thread_id,
         turn_id=turn_id,
     )
+    plan = _plan_from_source(source)
     if pending:
         blockers.append(f"{len(pending)} pending Codex interaction(s)")
     if isinstance(events, list):
@@ -199,6 +237,7 @@ def snapshot_from_payload(
                     in_progress.append(text[:300])
     return AgentSnapshot(
         status=status,
+        plan=plan,
         operation_id=operation_id or _string(source, "operation_id", "operationId"),
         workflow_id=workflow_id or _string(source, "workflow_id", "workflowId"),
         thread_id=thread_id or _string(source, "thread_id", "threadId"),
@@ -223,12 +262,14 @@ def _handle(payload: dict[str, Any], *, default_status: str) -> PlanHandle:
     operation = payload.get("operation") if isinstance(payload.get("operation"), dict) else {}
     turn = payload.get("turn") if isinstance(payload.get("turn"), dict) else {}
     source = {**workflow, **operation, **turn, **payload}
+    plan = _plan_from_source(source)
     return PlanHandle(
         operation_id=_string(source, "operation_id", "operationId", "executionOperationId"),
         workflow_id=_string(source, "workflow_id", "workflowId"),
         thread_id=_string(source, "thread_id", "threadId"),
         turn_id=_string(source, "turn_id", "turnId", "executionTurnId", "planTurnId"),
         status=_string(source, "status", "phase") or default_status,
+        plan=plan,
     )
 
 

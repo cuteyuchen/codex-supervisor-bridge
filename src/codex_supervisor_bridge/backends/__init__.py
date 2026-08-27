@@ -10,6 +10,7 @@ from .models import (
     GitState,
     PendingInteraction,
     PlanHandle,
+    PlanResult,
     WorkspaceState,
     WriterLeaseToken,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "DeliveryStatus",
     "GitState",
     "PendingInteraction",
+    "PlanResult",
     "PlanHandle",
     "WorkspaceBackend",
     "WorkspaceState",

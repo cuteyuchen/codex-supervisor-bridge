@@ -76,8 +76,17 @@ class PendingInteraction(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class PlanResult(BaseModel):
+    """Provider-neutral result returned by a read-only planning turn."""
+
+    content: str
+    status: str = "ready"
+    plan_hash: str | None = None
+
+
 class AgentSnapshot(BaseModel):
     status: str
+    plan: PlanResult | None = None
     operation_id: str | None = None
     workflow_id: str | None = None
     thread_id: str | None = None
@@ -102,6 +111,7 @@ class PlanHandle(BaseModel):
     thread_id: str | None = None
     turn_id: str | None = None
     status: str
+    plan: PlanResult | None = None
     reconciliation_required: bool = False
     message: str | None = None
 

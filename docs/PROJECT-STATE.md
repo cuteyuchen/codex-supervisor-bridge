@@ -285,11 +285,13 @@ Its task checkpoint is not a replacement for Supervisor Core because it is keyed
   - read-only replan transition;
   - stale-revision protection.
 
-### Current branch: P6.5 implementation status
+### P6.5 — code-complete status
 
-The `feat/p6-5-execution-backends` branch contains the P6.5 implementation and
-is ready for a Draft PR review. The following behaviors are implemented and
-covered by fake/protocol tests:
+P1 through P6 are complete. P6.5 code is complete and was reviewed in Draft
+PR #8. The implementation is covered by fake/protocol tests; this statement is
+intended to remain correct after the change is merged into `main`.
+
+The following behaviors are implemented and covered:
 
 - task-scoped `DIRECT` / `HYBRID` / `CODEX_SUPERVISED` modes;
 - `MANUAL_ONLY` / `SUPERVISOR_ALLOWED` delegation policy;
@@ -300,6 +302,11 @@ covered by fake/protocol tests:
 - semantic Direct Workspace MCP tools backed by `WorkspaceBackend` and DevSpace;
 - Local-Codex-Bridge `AgentBackend` with same-turn steer, observe, interrupt,
   pending interaction normalization, and UNKNOWN acknowledgement semantics;
+- backend-neutral Supervisor Plan Gate carrying a read-only `PlanResult` through
+  local DRAFT/import, explicit APPROVED review, writer-lease validation, and
+  workspace-write execution;
+- one fake/protocol orchestration test covering the same TaskMemory semantics
+  under Profile A and Profile B agent implementations;
 - existing Control Plane wrapped by the same backend-neutral AgentSnapshot model;
 - CheckpointService consumption of normalized AgentSnapshot data;
 - automatic capability resolution with user-facing `READY` / `DEGRADED` /
@@ -310,12 +317,12 @@ covered by fake/protocol tests:
   handoff, review, and checkpoint state.
 
 P6.5 deliberately does **not** claim real Windows installation, Local-Codex-
-Bridge process startup, DevSpace OAuth, or ChatGPT Remote MCP tunnel proof.
-Those are P6.6 integration gates.
+Bridge process startup, DevSpace OAuth, ChatGPT Remote MCP tunnel proof, or
+real Profile A/B runtime validation. Those are P6.6 integration gates.
 
 ### Revised next phases
 
-#### P6.5 — Execution Modes + Backend Abstraction (implemented on current branch)
+#### P6.5 — Execution Modes + Backend Abstraction (code complete; PR #8)
 
 - task-scoped DIRECT / HYBRID / CODEX_SUPERVISED mode;
 - MANUAL_ONLY / SUPERVISOR_ALLOWED delegation policy;
@@ -328,6 +335,8 @@ Those are P6.6 integration gates.
 - backend-neutral AgentSnapshot consumed by checkpoints;
 - capability/configuration resolver;
 - low-learning-cost / zero-config normal workflow principle.
+
+**Next active phase: P6.6 — Windows integration A/B proof.**
 
 #### P6.6 — Windows integration A/B proof
 

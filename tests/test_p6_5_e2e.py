@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from codex_supervisor_bridge.backends.models import (
     AgentSnapshot,
     BackendHealth,
@@ -10,15 +12,24 @@ from codex_supervisor_bridge.backends.models import (
     ChangeReview,
     GitState,
     PlanHandle,
+    PlanResult,
     WorkspaceState,
     WriterLeaseToken,
 )
 from codex_supervisor_bridge.memory.checkpoint_store import latest_checkpoint
-from codex_supervisor_bridge.memory.codex_runtime import bind_codex_runtime, get_codex_runtime
-from codex_supervisor_bridge.memory.execution import acquire_writer, handoff_writer
-from codex_supervisor_bridge.memory.models import ActiveWriter, EventType, TaskPhase
+from codex_supervisor_bridge.memory.codex_runtime import get_codex_runtime
+from codex_supervisor_bridge.memory.execution import (
+    acquire_writer,
+    get_execution_state,
+    handoff_writer,
+)
+from codex_supervisor_bridge.memory.models import ActiveWriter, Actor
 from codex_supervisor_bridge.memory.service import MemoryService
 from codex_supervisor_bridge.memory.workspace import get_workspace_binding
+from codex_supervisor_bridge.supervisor.agent_execution import (
+    AgentExecutionCoordinator,
+    AgentPlanGateError,
+)
 from codex_supervisor_bridge.supervisor.checkpoints import CheckpointService
 from codex_supervisor_bridge.supervisor.direct_workspace import DirectWorkspaceCoordinator
 
@@ -83,7 +94,10 @@ class FakeAgent:
         return PlanHandle(workflow_id="wf-e2e", thread_id="thread-e2e", turn_id="turn-plan", status="planning")
 
     async def get_plan_status(self, handle: PlanHandle) -> AgentSnapshot:
-        return await self.observe(handle)
+        snapshot = await self.observe(handle)
+        return snapshot.model_copy(
+            update={"status": "completed", "plan": PlanResult(content="1. Implement\n2. Test")}
+        )
 
     async def start_execution(self, *, task_id: str, context_pack: str, approved_plan: str, workspace: WorkspaceState, lease: WriterLeaseToken) -> PlanHandle:
         assert lease.writer == ActiveWriter.CODEX
@@ -120,6 +134,61 @@ class FakeAgent:
         return await self.observe(handle)
 
 
+class FakeProfileAgent(FakeAgent):
+    """Two protocol-compatible fake profiles sharing one Supervisor flow."""
+
+    def __init__(self, profile: str) -> None:
+        self.profile = profile
+        self.calls: list[str] = []
+
+    async def start_plan(
+        self,
+        *,
+        task_id: str,
+        context_pack: str,
+        workspace: WorkspaceState,
+    ) -> PlanHandle:
+        del task_id, context_pack, workspace
+        self.calls.append("start_plan")
+        return PlanHandle(
+            workflow_id=f"{self.profile}-workflow",
+            thread_id=f"{self.profile}-thread",
+            turn_id=f"{self.profile}-plan-turn",
+            status="planning",
+        )
+
+    async def get_plan_status(self, handle: PlanHandle) -> AgentSnapshot:
+        self.calls.append("get_plan_status")
+        return AgentSnapshot(
+            status="completed",
+            workflow_id=handle.workflow_id,
+            thread_id=handle.thread_id,
+            turn_id=handle.turn_id,
+            plan=PlanResult(content="1. Implement\n2. Test", status="ready"),
+        )
+
+    async def start_execution(
+        self,
+        *,
+        task_id: str,
+        context_pack: str,
+        approved_plan: str,
+        workspace: WorkspaceState,
+        lease: WriterLeaseToken,
+    ) -> PlanHandle:
+        del task_id, context_pack, workspace
+        assert approved_plan == "1. Implement\n2. Test"
+        assert lease.writer.value == "CODEX"
+        self.calls.append("start_execution")
+        return PlanHandle(
+            operation_id=f"{self.profile}-operation",
+            workflow_id=f"{self.profile}-workflow",
+            thread_id=f"{self.profile}-thread",
+            turn_id=f"{self.profile}-execution-turn",
+            status="executing",
+        )
+
+
 def test_direct_codex_direct_round_trip_survives_restart(tmp_path: Path) -> None:
     database = tmp_path / "p65-e2e.db"
     memory = MemoryService(database)
@@ -149,38 +218,42 @@ def test_direct_codex_direct_round_trip_survives_restart(tmp_path: Path) -> None
             explicit_user_authorization=True,
         )
 
-        plan = memory.create_plan(task.task_id, handed.task.revision, "1. Implement\n2. Test")
-        plan_revision = memory.get_task(task.task_id).revision
-        approved = memory.approve_plan(task.task_id, plan_revision, plan.plan_id)
-        await agent.start_plan(
-            task_id=task.task_id,
+        agent_coordinator = AgentExecutionCoordinator(memory, agent)
+        plan_handle = await agent_coordinator.start_plan(
+            task.task_id,
+            handed.task.revision,
             context_pack=memory.get_context_pack(task.task_id).content,
             workspace=WorkspaceState(workspace_id="ws-e2e", repository="C:/repo", root="C:/repo"),
         )
-        execution_handle = await agent.start_execution(
-            task_id=task.task_id,
+        plan_snapshot = await agent.get_plan_status(plan_handle)
+        assert plan_snapshot.plan is not None
+        plan = agent_coordinator.import_plan(
+            task.task_id,
+            memory.get_task(task.task_id).revision,
+            plan_snapshot,
+        )
+        approved = memory.approve_plan(
+            task.task_id,
+            memory.get_task(task.task_id).revision,
+            plan.plan_id,
+        )
+        task = memory.get_task(task.task_id)
+        execution_handle = await agent_coordinator.start_execution(
+            task.task_id,
+            task.revision,
+            plan_id=approved.plan_id,
+            plan_handle=plan_handle,
+            plan_result=plan_snapshot.plan,
             context_pack=memory.get_context_pack(task.task_id).content,
-            approved_plan=approved.content,
             workspace=WorkspaceState(workspace_id="ws-e2e", repository="C:/repo", root="C:/repo"),
             lease=WriterLeaseToken(
                 task_id=task.task_id,
                 writer=ActiveWriter.CODEX,
                 writer_epoch=handed.execution.writer_epoch,
-                task_revision=memory.get_task(task.task_id).revision,
+                task_revision=task.revision,
             ),
         )
-        task_after_runtime, _ = bind_codex_runtime(
-            memory.store,
-            task.task_id,
-            memory.get_task(task.task_id).revision,
-            event_type=EventType.CODEX_STARTED,
-            workflow_id=execution_handle.workflow_id,
-            operation_id=execution_handle.operation_id,
-            thread_id=execution_handle.thread_id,
-            turn_id=execution_handle.turn_id,
-            remote_status="executing",
-            task_phase=TaskPhase.IMPLEMENTING,
-        )
+        task_after_runtime = memory.get_task(task.task_id)
         observed = await agent.observe(execution_handle)
         assert observed.status == "completed"
         steered = await agent.steer(
@@ -233,3 +306,148 @@ def test_direct_codex_direct_round_trip_survives_restart(tmp_path: Path) -> None
         assert reopened.get_context_pack("P65-E2E").task.task_id == "P65-E2E"
     finally:
         reopened.close()
+
+
+def test_backend_profiles_share_supervisor_plan_gate_semantics() -> None:
+    async def run_profile(profile: str) -> dict[str, object]:
+        memory = MemoryService()
+        agent = FakeProfileAgent(profile)
+        coordinator = AgentExecutionCoordinator(memory, agent)
+        workspace = WorkspaceState(workspace_id=f"{profile}-workspace", repository="C:/repo")
+        try:
+            task = memory.store.create_task(
+                f"P65-{profile}",
+                "Backend-neutral plan gate",
+                repository="C:/repo",
+            )
+            plan_handle = await coordinator.start_plan(
+                task.task_id,
+                task.revision,
+                context_pack="Goal: implement and test",
+                workspace=workspace,
+            )
+            task = memory.get_task(task.task_id)
+            plan_snapshot = await agent.get_plan_status(plan_handle)
+            assert plan_snapshot.plan is not None
+
+            no_writer_lease = WriterLeaseToken(
+                task_id=task.task_id,
+                writer=ActiveWriter.CODEX,
+                writer_epoch=1,
+                task_revision=task.revision,
+            )
+            with pytest.raises(AgentPlanGateError, match="active CODEX writer lease"):
+                await coordinator.start_execution(
+                    task.task_id,
+                    task.revision,
+                    plan_id="missing",
+                    plan_handle=plan_handle,
+                    plan_result=plan_snapshot.plan,
+                    context_pack="Goal: implement and test",
+                    workspace=workspace,
+                    lease=no_writer_lease,
+                )
+
+            acquired = acquire_writer(
+                memory.store,
+                task.task_id,
+                task.revision,
+                ActiveWriter.CODEX,
+                explicit_user_authorization=True,
+            )
+            task = acquired.task
+            lease = WriterLeaseToken(
+                task_id=task.task_id,
+                writer=ActiveWriter.CODEX,
+                writer_epoch=acquired.execution.writer_epoch,
+                task_revision=task.revision,
+            )
+            with pytest.raises(AgentPlanGateError, match="No locally APPROVED"):
+                await coordinator.start_execution(
+                    task.task_id,
+                    task.revision,
+                    plan_id="missing",
+                    plan_handle=plan_handle,
+                    plan_result=plan_snapshot.plan,
+                    context_pack="Goal: implement and test",
+                    workspace=workspace,
+                    lease=lease,
+                )
+            assert "start_execution" not in agent.calls
+
+            draft = coordinator.import_plan(task.task_id, task.revision, plan_snapshot)
+            approved = memory.approve_plan(
+                task.task_id,
+                memory.get_task(task.task_id).revision,
+                draft.plan_id,
+            )
+            task = memory.get_task(task.task_id)
+            execution = await coordinator.start_execution(
+                task.task_id,
+                task.revision,
+                plan_id=approved.plan_id,
+                plan_handle=plan_handle,
+                plan_result=plan_snapshot.plan,
+                context_pack="Goal: implement and test",
+                workspace=workspace,
+                lease=WriterLeaseToken(
+                    task_id=task.task_id,
+                    writer=ActiveWriter.CODEX,
+                    writer_epoch=lease.writer_epoch,
+                    task_revision=task.revision,
+                ),
+            )
+            assert execution.status == "executing"
+            assert agent.calls.count("start_execution") == 1
+
+            replacement = memory.store.create_plan(
+                task.task_id,
+                memory.get_task(task.task_id).revision,
+                "1. Replace the implementation\n2. Skip tests",
+                actor=Actor.CODEX,
+            )
+            replacement_approved = memory.approve_plan(
+                task.task_id,
+                memory.get_task(task.task_id).revision,
+                replacement.plan_id,
+            )
+            current = memory.get_task(task.task_id)
+            with pytest.raises(AgentPlanGateError, match="stale or superseded"):
+                await coordinator.start_execution(
+                    task.task_id,
+                    current.revision,
+                    plan_id=approved.plan_id,
+                    plan_handle=plan_handle,
+                    plan_result=plan_snapshot.plan,
+                    context_pack="Goal: implement and test",
+                    workspace=workspace,
+                    lease=WriterLeaseToken(
+                        task_id=task.task_id,
+                        writer=ActiveWriter.CODEX,
+                        writer_epoch=lease.writer_epoch,
+                        task_revision=current.revision,
+                    ),
+                )
+            assert replacement_approved.status.value == "APPROVED"
+            assert agent.calls.count("start_execution") == 1
+
+            current = memory.get_task(task.task_id)
+            state = get_execution_state(memory.store, task.task_id)
+            return {
+                "phase": current.phase.value,
+                "intent_version": current.intent_version,
+                "plan_version": current.plan_version,
+                "revision": current.revision,
+                "active_writer": state.active_writer.value,
+                "writer_epoch": state.writer_epoch,
+                "event_types": [event.event_type.value for event in memory.timeline(task.task_id)],
+            }
+        finally:
+            memory.close()
+
+    async def scenario() -> None:
+        profile_a = await run_profile("profile-a")
+        profile_b = await run_profile("profile-b")
+        assert profile_a == profile_b
+
+    asyncio.run(scenario())

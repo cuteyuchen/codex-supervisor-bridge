@@ -7,7 +7,6 @@ from mcp import Client
 
 from codex_supervisor_bridge.integrations import kandev_errors, kandev_models
 
-
 REQUIRED_EXTERNAL_TOOLS = {
     "list_workspaces_kandev",
     "list_workflows_kandev",

@@ -161,8 +161,18 @@ class ContextPackBuilder:
                 EventType.DECISION_SUPERSEDED,
                 EventType.CODEX_STEERED,
             },
-            limit=5,
+            limit=10,
         )
+        # Historical decision events remain durable/searchable, but the normal
+        # context must not resurrect superseded decision bodies. Only a
+        # DECISION_ADDED event for a decision that is still ACTIVE is surfaced.
+        active_decision_ids = {item.decision_id for item in decisions}
+        supervisor_events = [
+            event
+            for event in supervisor_events
+            if event.event_type != EventType.DECISION_ADDED
+            or event.payload.get("decision_id") in active_decision_ids
+        ][-5:]
         optional.append(
             (
                 "RECENT SUPERVISOR DECISIONS",

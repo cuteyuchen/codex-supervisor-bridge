@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA_SQL = r"""
 PRAGMA foreign_keys = ON;
@@ -294,6 +294,63 @@ WHERE status IN (
 
 CREATE INDEX IF NOT EXISTS idx_hard_replans_task_created
 ON hard_replans(task_id, created_at DESC);
+"""
+
+EXECUTION_STATE_MIGRATION_SQL = r"""
+CREATE TABLE IF NOT EXISTS task_execution_state (
+    task_id TEXT PRIMARY KEY REFERENCES supervised_tasks(task_id) ON DELETE CASCADE,
+    execution_mode TEXT NOT NULL DEFAULT 'HYBRID'
+        CHECK (execution_mode IN ('DIRECT', 'HYBRID', 'CODEX_SUPERVISED')),
+    active_writer TEXT NOT NULL DEFAULT 'NONE'
+        CHECK (active_writer IN ('NONE', 'CHATGPT', 'CODEX')),
+    handoff_policy TEXT NOT NULL DEFAULT 'MANUAL_ONLY'
+        CHECK (handoff_policy IN ('MANUAL_ONLY', 'SUPERVISOR_ALLOWED')),
+    writer_epoch INTEGER NOT NULL DEFAULT 0 CHECK (writer_epoch >= 0),
+    writer_acquired_revision INTEGER CHECK (writer_acquired_revision >= 0),
+    updated_at TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO task_execution_state(
+    task_id, execution_mode, active_writer, handoff_policy,
+    writer_epoch, writer_acquired_revision, updated_at
+)
+SELECT
+    task_id, 'CODEX_SUPERVISED', 'NONE', 'MANUAL_ONLY',
+    0, NULL, updated_at
+FROM supervised_tasks;
+
+CREATE TRIGGER IF NOT EXISTS trg_supervised_task_execution_state
+AFTER INSERT ON supervised_tasks
+BEGIN
+    INSERT OR IGNORE INTO task_execution_state(
+        task_id, execution_mode, active_writer, handoff_policy,
+        writer_epoch, writer_acquired_revision, updated_at
+    ) VALUES (
+        NEW.task_id, 'HYBRID', 'NONE', 'MANUAL_ONLY',
+        0, NULL, NEW.created_at
+    );
+END;
+
+CREATE TABLE IF NOT EXISTS execution_handoffs (
+    handoff_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES supervised_tasks(task_id) ON DELETE CASCADE,
+    from_writer TEXT NOT NULL CHECK (from_writer IN ('CHATGPT', 'CODEX')),
+    to_writer TEXT NOT NULL CHECK (to_writer IN ('CHATGPT', 'CODEX')),
+    from_revision INTEGER NOT NULL CHECK (from_revision >= 0),
+    to_revision INTEGER NOT NULL CHECK (to_revision >= 0),
+    intent_version INTEGER NOT NULL CHECK (intent_version >= 1),
+    plan_version INTEGER NOT NULL CHECK (plan_version >= 0),
+    writer_epoch INTEGER NOT NULL CHECK (writer_epoch >= 1),
+    git_head TEXT,
+    change_ref TEXT,
+    validation_json TEXT NOT NULL DEFAULT '{}',
+    reason TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_execution_handoffs_task_created
+ON execution_handoffs(task_id, created_at DESC);
 """
 
 OPTIONAL_FTS_SQL = r"""

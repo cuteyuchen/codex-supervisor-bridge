@@ -9,17 +9,19 @@ from codex_supervisor_bridge.memory.codex_runtime import (
     bind_codex_runtime,
     get_codex_runtime,
 )
+from codex_supervisor_bridge.memory.errors import StaleRevisionError
 from codex_supervisor_bridge.memory.models import (
     Actor,
     ContextPackMode,
     EventType,
     PlanStatus,
+    TaskMemory,
     TaskPhase,
 )
 from codex_supervisor_bridge.memory.service import MemoryService
 
 from .codex_control_client import CodexControlAdapter
-from .codex_control_errors import CodexPlanGateError
+from .codex_control_errors import CodexCompensationError, CodexPlanGateError
 
 AdapterFactory = Callable[[], CodexControlAdapter]
 
@@ -94,6 +96,73 @@ class CodexCoordinator:
     def runtime_state(self, task_id: str) -> CodexRuntimeState | None:
         return get_codex_runtime(self.memory.store, task_id)
 
+    async def _interrupt_stale_remote(
+        self,
+        stale: StaleRevisionError,
+        *,
+        workflow_id: str | None,
+        operation_id: str | None,
+        thread_id: str | None,
+        turn_id: str | None,
+    ) -> None:
+        """Best-effort fail-closed compensation after a remote write races a user override."""
+        try:
+            async with self.adapter_factory() as adapter:
+                await adapter.interrupt(
+                    workflow_id=workflow_id,
+                    operation_id=operation_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                )
+        except Exception as exc:
+            raise CodexCompensationError(str(stale)) from exc
+
+    async def _bind_remote_transition(
+        self,
+        task_id: str,
+        expected_revision: int,
+        *,
+        event_type: EventType,
+        workflow_id: str | None = None,
+        operation_id: str | None = None,
+        thread_id: str | None = None,
+        turn_id: str | None = None,
+        remote_status: str | None = None,
+        next_action: str | None = None,
+        client_request_id: str | None = None,
+        task_phase: TaskPhase | None = None,
+        current_state: str | None = None,
+        event_payload: dict[str, Any] | None = None,
+        compensate_on_stale: bool = True,
+    ) -> tuple[TaskMemory, CodexRuntimeState]:
+        try:
+            return bind_codex_runtime(
+                self.memory.store,
+                task_id,
+                expected_revision,
+                event_type=event_type,
+                workflow_id=workflow_id,
+                operation_id=operation_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                remote_status=remote_status,
+                next_action=next_action,
+                client_request_id=client_request_id,
+                task_phase=task_phase,
+                current_state=current_state,
+                event_payload=event_payload,
+            )
+        except StaleRevisionError as stale:
+            if compensate_on_stale:
+                await self._interrupt_stale_remote(
+                    stale,
+                    workflow_id=workflow_id,
+                    operation_id=operation_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                )
+            raise
+
     @staticmethod
     def _plan_request_id(task_id: str, intent_version: int, next_plan_version: int) -> str:
         return (
@@ -151,8 +220,7 @@ class CodexCoordinator:
         )
         status = _string(remote, "status", "phase") or "planning"
         next_action = _string(remote, "nextRecommendedAction")
-        current, runtime = bind_codex_runtime(
-            self.memory.store,
+        current, runtime = await self._bind_remote_transition(
             task_id,
             expected_revision,
             event_type=EventType.CODEX_STARTED,
@@ -239,10 +307,6 @@ class CodexCoordinator:
         if runtime is None or not runtime.workflow_id:
             raise CodexPlanGateError("Task has no Codex plan workflow to execute")
 
-        # Read the remote plan in a clean MCP context and close it before
-        # evaluating the local approval gate. Raising the domain error inside
-        # the MCP Client task group can wrap it in an ExceptionGroup and hide
-        # the model-readable CODEX_PLAN_GATE message.
         async with self.adapter_factory() as adapter:
             before = await adapter.get_workflow_status(runtime.workflow_id)
         remote_plan, _, _ = _latest_plan(before)
@@ -270,8 +334,7 @@ class CodexCoordinator:
         turn_id = _string(remote, "executionTurnId", "turnId", "turn_id") or runtime.turn_id
         status = _string(remote, "status", "phase") or "executing"
         next_action = _string(remote, "nextRecommendedAction")
-        current, current_runtime = bind_codex_runtime(
-            self.memory.store,
+        current, current_runtime = await self._bind_remote_transition(
             task_id,
             expected_revision,
             event_type=EventType.CODEX_STARTED,
@@ -334,8 +397,7 @@ class CodexCoordinator:
                 client_request_id=client_request_id,
             )
         operation_id = _string(remote, "operationId", "operation_id")
-        current, current_runtime = bind_codex_runtime(
-            self.memory.store,
+        current, current_runtime = await self._bind_remote_transition(
             task_id,
             expected_revision,
             event_type=EventType.CODEX_STEERED,
@@ -375,8 +437,7 @@ class CodexCoordinator:
                 thread_id=runtime.thread_id,
                 turn_id=runtime.turn_id,
             )
-        current, current_runtime = bind_codex_runtime(
-            self.memory.store,
+        current, current_runtime = await self._bind_remote_transition(
             task_id,
             expected_revision,
             event_type=EventType.CODEX_INTERRUPTED,
@@ -389,6 +450,7 @@ class CodexCoordinator:
             task_phase=TaskPhase.PAUSED,
             current_state=reason or "Codex turn interrupted by Supervisor.",
             event_payload={"reason": reason},
+            compensate_on_stale=False,
         )
         return {
             "task": current.model_dump(mode="json"),
@@ -435,8 +497,7 @@ class CodexCoordinator:
                 answers=answers,
                 scope=scope,
             )
-        current, current_runtime = bind_codex_runtime(
-            self.memory.store,
+        current, current_runtime = await self._bind_remote_transition(
             task_id,
             expected_revision,
             event_type=EventType.CODEX_PROGRESS,

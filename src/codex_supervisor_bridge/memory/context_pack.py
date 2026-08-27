@@ -9,7 +9,6 @@ from .models import (
     ConstraintSeverity,
     ContextPackMode,
     EventType,
-    PlanStatus,
     SummaryType,
     TaskEvent,
     TaskMemory,

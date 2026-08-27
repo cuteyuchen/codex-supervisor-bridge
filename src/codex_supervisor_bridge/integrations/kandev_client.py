@@ -6,7 +6,12 @@ from typing import Any
 
 from mcp import Client
 
-from .kandev_errors import KandevCapabilityError, KandevProtocolError, KandevToolError
+from .kandev_errors import (
+    KandevCapabilityError,
+    KandevError,
+    KandevProtocolError,
+    KandevToolError,
+)
 from .kandev_models import KandevCapabilities, KandevCreateTaskRequest
 
 
@@ -39,7 +44,10 @@ class KandevAdapter:
         self._tool_names: set[str] | None = None
 
     async def __aenter__(self) -> "KandevAdapter":
-        await self._client.__aenter__()
+        try:
+            await self._client.__aenter__()
+        except Exception as exc:
+            raise KandevError("Kandev external MCP is unavailable") from exc
         self._entered = True
         return self
 

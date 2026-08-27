@@ -1,6 +1,6 @@
 [project]
 name = "codex-supervisor-bridge"
-version = "0.2.0"
+version = "0.3.0"
 description = "Persistent supervision, memory, steering, and workflow bridge for ChatGPT and Codex"
 requires-python = ">=3.12"
 dependencies = [

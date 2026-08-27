@@ -60,6 +60,7 @@ class EventType(str, Enum):
     EVIDENCE_ADDED = "EVIDENCE_ADDED"
     CONTEXT_SNAPSHOT_CREATED = "CONTEXT_SNAPSHOT_CREATED"
     CHECKPOINT_CREATED = "CHECKPOINT_CREATED"
+    CHECKPOINT_REVIEWED = "CHECKPOINT_REVIEWED"
     KANDEV_TASK_BOUND = "KANDEV_TASK_BOUND"
     KANDEV_SYNCED = "KANDEV_SYNCED"
     CODEX_STARTED = "CODEX_STARTED"
@@ -179,7 +180,7 @@ class Decision(BaseModel):
     title: str
     content: str
     source_event_id: str | None = None
-    created_intent_version: int = Field(default=1, ge=1)
+    created_intent_version: int = Field(ge=1)
     superseded_by: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
@@ -193,7 +194,7 @@ class Constraint(BaseModel):
     status: ConstraintStatus = ConstraintStatus.ACTIVE
     content: str
     source_event_id: str | None = None
-    created_revision: int = Field(default=0, ge=0)
+    created_revision: int = Field(ge=0)
     superseded_by: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
@@ -210,7 +211,7 @@ class Plan(BaseModel):
     updated_at: datetime = Field(default_factory=utcnow)
 
 
-class TaskSummary(BaseModel):
+class Summary(BaseModel):
     summary_id: str
     task_id: str
     summary_type: SummaryType
@@ -250,4 +251,4 @@ class MemorySearchHit(BaseModel):
     title: str
     content: str
     status: str | None = None
-    score: float | None = None
+    updated_at: datetime

@@ -10,7 +10,7 @@ class SecureRemoteAccessConfig(BaseModel):
     public_url: str | None = None
     bind_host: str = "127.0.0.1"
     bind_port: int | None = Field(default=None, ge=1, le=65535)
-    auth_secret_ref: str | None = None
+    auth_secret_ref: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]+$")
     session_identity: str | None = None
 
 

@@ -35,6 +35,7 @@ from .harness import (
     ProfileScenarioRunner,
     ScenarioObservation,
 )
+from .local_codex import LocalCodexBridgeBootstrap, LocalCodexBridgeBootstrapConfig
 from .models import (
     BootstrapStatus,
     ComponentHealth,
@@ -88,6 +89,8 @@ __all__ = [
     "HarnessTrace",
     "HealthStatus",
     "ManagedProcessSpec",
+    "LocalCodexBridgeBootstrap",
+    "LocalCodexBridgeBootstrapConfig",
     "MemorySecretStore",
     "PortAllocator",
     "PortLease",

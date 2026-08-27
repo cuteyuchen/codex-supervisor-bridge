@@ -7,7 +7,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .paths import AppDataPaths
 
@@ -51,6 +51,17 @@ class AdvancedSettings(BaseModel):
     startup_timeout_seconds: int = Field(default=15, ge=1, le=300)
     shutdown_timeout_seconds: int = Field(default=10, ge=1, le=300)
     log_level: str = "INFO"
+
+    @field_validator("process_commands", "oauth_detail", "tunnel_detail")
+    @classmethod
+    def reject_credentials(cls, value: dict[str, str]) -> dict[str, str]:
+        sensitive = ("token", "secret", "password", "bearer", "credential")
+        for key, item in value.items():
+            if any(marker in key.lower() for marker in sensitive) or any(
+                marker in item.lower() for marker in ("bearer ", "access_token=", "refresh_token=", "password=")
+            ):
+                raise ValueError("credentials must be stored through SecretStore")
+        return value
 
 
 class AppConfig(BaseModel):

@@ -63,7 +63,7 @@ class FirstAuthorizationFlow:
         )
 
     def complete(self, *, state: str, credential: str, secret_ref: str) -> AuthorizationResult:
-        if not self._state or not secrets.compare_digest(state, self._state):
+        if not credential or not self._state or not secrets.compare_digest(state, self._state):
             return AuthorizationResult(
                 status=AuthorizationStatus.FAILED,
                 provider=self.provider,

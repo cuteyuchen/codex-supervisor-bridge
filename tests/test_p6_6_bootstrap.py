@@ -21,6 +21,8 @@ from codex_supervisor_bridge.bootstrap import (
     HarnessStep,
     HarnessTrace,
     HealthStatus,
+    LocalCodexBridgeBootstrap,
+    LocalCodexBridgeBootstrapConfig,
     ManagedProcessSpec,
     MemorySecretStore,
     PortAllocator,
@@ -67,6 +69,13 @@ def test_config_migrates_old_shape_and_invalid_config_degrades(tmp_path: Path) -
     degraded = store.load()
     assert degraded.status == "DEGRADED"
     assert degraded.config == AppConfig.safe_defaults(paths)
+
+    paths.settings.write_text(
+        json.dumps({"config_version": 1, "advanced": {"oauth_detail": {"access_token": "secret"}}}),
+        encoding="utf-8",
+    )
+    secret_config = store.load()
+    assert secret_config.status == "DEGRADED"
 
 
 def test_port_allocator_prefers_configured_port_then_recovers_conflict() -> None:
@@ -198,6 +207,20 @@ def test_devspace_bootstrap_writes_scoped_v1_config_and_process_command(tmp_path
     assert str(project) in document["workspaces"]["allowedRoots"]
     assert not (bootstrap.config_directory / "auth.json").exists()
     assert bootstrap.process_spec(log_dir=paths.logs).command == ["devspace", "serve"]
+
+
+def test_local_codex_bridge_bootstrap_checks_current_control_surface() -> None:
+    bootstrap = LocalCodexBridgeBootstrap(
+        LocalCodexBridgeBootstrapConfig(launch_command=["node", "bridge.js"])
+    )
+    missing = bootstrap.protocol_health({"codex_turn", "codex_observe"})
+    assert missing.status == HealthStatus.DEGRADED
+    assert missing.repairable is True
+    ready = bootstrap.protocol_health(
+        {"codex_turn", "codex_observe", "codex_steer", "codex_respond", "codex_interrupt"}
+    )
+    assert ready.status == HealthStatus.READY
+    assert ready.advanced["semantics"] == ["turn", "observe", "steer", "respond", "interrupt"]
 
 
 def test_secret_store_round_trip_and_remote_access_security_gate() -> None:

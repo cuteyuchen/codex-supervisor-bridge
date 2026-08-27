@@ -77,8 +77,11 @@ class CommandSession(BaseModel):
 
 
 _DANGEROUS = re.compile(
-    r"(?:git\s+(?:reset\s+--hard|clean\s+-[^\s]*f)|format(?:\.com)?\b|"
+    r"(?:git\s+(?:reset\s+--hard|clean(?:\s+--\S+|\s+-[^\s]*f)|checkout\s+--|restore\s+--source)|"
+    r"rm\s+-[^\s]*r[^\s]*f|rmdir\s+/[^\s]*s|del\s+/[^\s]*s|"
+    r"Remove-Item\b[^\r\n]*-(?:Recurse|Force)|format(?:\.com)?\b|"
     r"diskpart\b|Remove-Partition\b|reg\s+(?:delete|add)\b|"
+    r"bcdedit\b|cipher\s+/w\b|takeown\b|icacls\b[^\r\n]*(?:/reset|/grant)|"
     r"(?:npm|pip|winget|choco)\s+uninstall\b|(?:secret|credential|token).*(?:dump|export))",
     re.IGNORECASE,
 )

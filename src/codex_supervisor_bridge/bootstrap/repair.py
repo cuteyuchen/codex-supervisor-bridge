@@ -45,23 +45,30 @@ class RepairService:
             config.basic.project_directory = project_directory.expanduser().resolve()
         if config.advanced.sqlite_path is None:
             config.advanced.sqlite_path = self.paths.database
-        if "devspace" not in config.advanced.ports:
+        selected_ports: set[int] = set()
+        for name, action, message in (
+            ("devspace", "allocate_devspace_port", "Local workspace port selected."),
+            ("supervisor", "allocate_local_port", "Local connection port selected."),
+        ):
+            preferred = config.advanced.ports.get(name)
             try:
-                lease = self.port_allocator.reserve(excluded={config.advanced.ports.get("supervisor", -1)})
-                config.advanced.ports["devspace"] = lease.port
-                lease.release()
-                actions.append(RepairAction(action="allocate_devspace_port", status=HealthStatus.READY, message="Local workspace port selected."))
+                lease = self.port_allocator.reserve(preferred, excluded=selected_ports)
             except OSError:
-                actions.append(RepairAction(action="allocate_devspace_port", status=HealthStatus.UNAVAILABLE, message="No local workspace port is available.", requires_user_action=True))
-        port_health = status.component("Local port")
-        if port_health is None or port_health.status != HealthStatus.READY or "supervisor" not in config.advanced.ports:
-            try:
-                lease = self.port_allocator.reserve(config.advanced.ports.get("supervisor"))
-                config.advanced.ports["supervisor"] = lease.port
-                lease.release()
-                actions.append(RepairAction(action="allocate_local_port", status=HealthStatus.READY, message="Local connection port selected."))
-            except OSError:
-                actions.append(RepairAction(action="allocate_local_port", status=HealthStatus.UNAVAILABLE, message="No local connection port is available.", requires_user_action=True))
+                actions.append(
+                    RepairAction(
+                        action=action,
+                        status=HealthStatus.UNAVAILABLE,
+                        message="No local connection port is available.",
+                        requires_user_action=True,
+                    )
+                )
+                continue
+            selected_ports.add(lease.port)
+            changed = preferred != lease.port
+            config.advanced.ports[name] = lease.port
+            lease.release()
+            if changed:
+                actions.append(RepairAction(action=action, status=HealthStatus.READY, message=message))
         self.config_store.save(config)
         self._write_mcp_config(config)
         actions.append(RepairAction(action="generate_mcp_config", status=HealthStatus.READY, message="Local connection settings are ready."))

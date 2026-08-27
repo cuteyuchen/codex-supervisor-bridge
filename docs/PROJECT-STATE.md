@@ -352,6 +352,8 @@ The first implementation slice is intentionally backend-neutral and layered:
   and UNKNOWN-outcome reconciliation;
 - fail-closed ambiguous process-PID handling and loopback-only local MCP HTTP
   binding;
+- user-facing bootstrap projections hide internal repair/provider operation
+  names while advanced diagnostics retain them;
 - fake process/provider harnesses for Profile A/B semantic comparison.
 
 The current code-level work does not claim real Windows OAuth, ChatGPT Web

@@ -61,6 +61,14 @@ class RepairAction(BaseModel):
     requires_user_action: bool = False
     advanced: dict[str, Any] = Field(default_factory=dict)
 
+    def user_view(self) -> dict[str, Any]:
+        return {
+            "action": _public_repair_action(self.action),
+            "status": self.status.value,
+            "message": self.message,
+            "requires_user_action": self.requires_user_action,
+        }
+
 
 class BootstrapStatus(BaseModel):
     status: HealthStatus
@@ -76,15 +84,7 @@ class BootstrapStatus(BaseModel):
             "summary": self.summary,
             "project_directory": self.project_directory,
             "components": self.doctor.user_summary,
-            "repairs": [
-                {
-                    "action": item.action,
-                    "status": item.status.value,
-                    "message": item.message,
-                    "requires_user_action": item.requires_user_action,
-                }
-                for item in self.repairs
-            ],
+            "repairs": [item.user_view() for item in self.repairs],
         }
 
     def advanced_view(self) -> dict[str, Any]:
@@ -94,3 +94,16 @@ class BootstrapStatus(BaseModel):
             "diagnostics": self.doctor.advanced_diagnostics,
             "repair_details": [item.model_dump(mode="json") for item in self.repairs],
         }
+
+
+def _public_repair_action(action: str) -> str:
+    if action.startswith("start_process:") or action.startswith("repair_process:"):
+        return "repair_local_component"
+    return {
+        "repair_data_directory": "prepare_application_data",
+        "allocate_devspace_port": "prepare_local_connection",
+        "allocate_local_port": "prepare_local_connection",
+        "generate_mcp_config": "prepare_chatgpt_connection",
+        "generate_workspace_config": "prepare_local_workspace",
+        "start_supervisor": "start_development_environment",
+    }.get(action, action)

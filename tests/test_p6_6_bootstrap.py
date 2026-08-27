@@ -27,6 +27,7 @@ from codex_supervisor_bridge.bootstrap import (
     MemorySecretStore,
     PortAllocator,
     ProcessManager,
+    ProcessState,
     ProfileABHarness,
     ProfileScenarioRunner,
     ScenarioObservation,
@@ -35,6 +36,8 @@ from codex_supervisor_bridge.bootstrap import (
     SecureRemoteAccessValidator,
     authorize_command,
 )
+from codex_supervisor_bridge.bootstrap.service import _find_executable
+from codex_supervisor_bridge.mcp.server import _is_loopback_host
 from codex_supervisor_bridge.memory.models import ActiveWriter
 
 
@@ -181,6 +184,44 @@ def test_process_manager_does_not_start_duplicate_for_ambiguous_live_pid(tmp_pat
     assert launched == []
 
 
+def test_bootstrap_resolves_configured_absolute_executable_path(tmp_path: Path) -> None:
+    executable = tmp_path / "devspace.exe"
+    executable.write_text("placeholder", encoding="utf-8")
+
+    assert _find_executable(str(executable)) == str(executable)
+
+
+def test_bootstrap_start_reports_supervisor_launch_failure(tmp_path: Path) -> None:
+    from codex_supervisor_bridge.bootstrap import BootstrapService
+
+    class FailingProcessManager:
+        def statuses(self) -> list[ProcessState]:
+            return []
+
+        def health(self, name: str) -> ProcessState:
+            return ProcessState(name, "STOPPED")
+
+        def start(self, spec: ManagedProcessSpec, *, restart: bool = False) -> ProcessState:
+            del spec, restart
+            raise OSError("launcher unavailable")
+
+    service = BootstrapService(paths=AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    ), process_manager=FailingProcessManager())
+    result = service.start(project_directory=tmp_path)
+
+    assert result.repairs[-1].action == "start_supervisor"
+    assert result.repairs[-1].status == HealthStatus.UNAVAILABLE
+
+
+def test_http_mcp_bind_must_be_loopback() -> None:
+    assert _is_loopback_host("127.0.0.1") is True
+    assert _is_loopback_host("::1") is True
+    assert _is_loopback_host("localhost") is True
+    assert _is_loopback_host("0.0.0.0") is False
+
+
 def test_doctor_user_view_does_not_leak_provider_details(tmp_path: Path) -> None:
     paths = AppDataPaths.from_environment(
         environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
@@ -208,6 +249,34 @@ def test_repair_creates_data_and_mcp_config_without_secrets(tmp_path: Path) -> N
     assert paths.generated_mcp_config.exists()
     assert any(action.action == "generate_mcp_config" for action in actions)
     assert "token" not in paths.generated_mcp_config.read_text(encoding="utf-8").lower()
+
+
+def test_repair_persists_distinct_supervisor_and_workspace_ports(tmp_path: Path) -> None:
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    from codex_supervisor_bridge.bootstrap.repair import RepairService
+
+    service = RepairService(paths=paths, port_allocator=PortAllocator(start=39200, end=39202))
+    service.repair(project_directory=tmp_path)
+    ports = ConfigStore(paths=paths).load().config.advanced.ports
+
+    assert ports["supervisor"] != ports["devspace"]
+
+
+def test_bootstrap_user_view_hides_internal_repair_names(tmp_path: Path) -> None:
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    from codex_supervisor_bridge.bootstrap import BootstrapService
+
+    status = BootstrapService(paths=paths).repair_and_status(project_directory=tmp_path)
+    rendered = json.dumps(status.user_view(), ensure_ascii=False).lower()
+    assert "devspace" not in rendered
+    assert "mcp" not in rendered
+    assert "start_process:" not in rendered
 
 
 def test_devspace_bootstrap_writes_scoped_v1_config_and_process_command(tmp_path: Path) -> None:
@@ -356,6 +425,14 @@ def test_command_authorization_is_workspace_and_revision_fenced(tmp_path: Path) 
     assert authorize_command(request.model_copy(update={"cwd": tmp_path.parent})).verdict == CommandVerdict.DENY
     dangerous = request.model_copy(update={"command": "git reset --hard"})
     assert authorize_command(dangerous).verdict == CommandVerdict.DENY
+    for command in (
+        "rm -rf .",
+        "rmdir /s /q .",
+        "del /s /q *",
+        "Remove-Item . -Recurse -Force",
+        "bcdedit /delete {current}",
+    ):
+        assert authorize_command(request.model_copy(update={"command": command})).verdict == CommandVerdict.DENY
 
 
 def test_profile_ab_harness_compares_normalized_supervisor_semantics() -> None:

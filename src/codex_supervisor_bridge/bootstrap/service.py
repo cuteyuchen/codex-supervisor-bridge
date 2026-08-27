@@ -85,7 +85,19 @@ class BootstrapService:
             startup_timeout=config.advanced.startup_timeout_seconds,
             shutdown_timeout=config.advanced.shutdown_timeout_seconds,
         )
-        state = self.process_manager.start(spec)
+        try:
+            state = self.process_manager.start(spec)
+        except (OSError, ValueError) as exc:
+            result.repairs.append(
+                RepairAction(
+                    action="start_supervisor",
+                    status=HealthStatus.UNAVAILABLE,
+                    message="Local development environment could not start.",
+                    requires_user_action=False,
+                    advanced={"technical_detail": str(exc)},
+                )
+            )
+            return result
         start_action = RepairAction(
             action="start_supervisor",
             status=HealthStatus.READY if state.status == "RUNNING" else HealthStatus.UNAVAILABLE,
@@ -93,12 +105,13 @@ class BootstrapService:
             advanced=state.as_dict(),
         )
         result.repairs.append(start_action)
-        if shutil.which(config.advanced.executable_paths.get("devspace", "devspace")):
+        devspace_executable = config.advanced.executable_paths.get("devspace", "devspace")
+        if _find_executable(devspace_executable):
             devspace = DevSpaceBootstrap.from_app_data(
                 self.paths,
                 port=config.advanced.ports.get("devspace", port),
                 project_directory=project_directory or config.basic.project_directory,
-                executable=config.advanced.executable_paths.get("devspace", "devspace"),
+                executable=devspace_executable,
             )
             try:
                 component = self.process_manager.start(
@@ -202,3 +215,7 @@ def _profile(config: AppConfig, doctor: DoctorStatus) -> str:
             technical_detail=str(item.advanced.get("technical_detail", "")),
         )
     return CapabilityResolver(health).resolve().profile
+
+
+def _find_executable(value: str) -> str | None:
+    return value if Path(value).is_file() else shutil.which(value)

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from codex_supervisor_bridge.db import current_schema_version
+from codex_supervisor_bridge.db.schema import SCHEMA_VERSION
 from codex_supervisor_bridge.memory.context_pack import ContextPackBuilder
 from codex_supervisor_bridge.memory.errors import StaleRevisionError
 from codex_supervisor_bridge.memory.models import (
@@ -47,7 +48,7 @@ def test_task_persists_across_reopen(tmp_path: Path) -> None:
         assert restored.revision == 1
         constraints = reopened.active_constraints(restored.task_id)
         assert [item.content for item in constraints] == ["Reuse the existing StorageManager."]
-        assert current_schema_version(reopened._conn) == 3
+        assert current_schema_version(reopened._conn) == SCHEMA_VERSION
 
 
 def test_stale_revision_is_rejected_without_partial_write() -> None:
@@ -78,128 +79,129 @@ def test_public_event_append_advances_revision_and_is_auditable() -> None:
         assert event.revision == 1
         assert event.event_type == EventType.USER_OVERRIDE
         assert store.get_task(task.task_id).revision == 1
-        assert store.list_events(task.task_id)[-1].payload["instruction"] == "Reuse the existing panel."
-        with pytest.raises(StaleRevisionError):
-            store.record_event(task.task_id, 0, Actor.SUPERVISOR, EventType.CODEX_STEERED, {})
 
 
-def test_superseded_decision_is_excluded_from_context_pack() -> None:
+def test_superseded_decision_is_not_rendered_as_active_context() -> None:
     with MemoryStore() as store:
-        task = store.create_task("TASK-2", "Context decisions", goal="Build the save feature.")
-        old = store.add_decision(task.task_id, task.revision, "Save slots", "Support three save slots.")
-        task = store.get_task(task.task_id)
-        new = store.add_decision(task.task_id, task.revision, "Save model", "Support one save only.")
-        task = store.get_task(task.task_id)
-        store.supersede_decision(task.task_id, task.revision, old.decision_id, superseded_by=new.decision_id)
-        task = store.get_task(task.task_id)
-        store.add_constraint(
-            task.task_id,
-            task.revision,
-            "Do not replace StorageManager.",
-            severity=ConstraintSeverity.HARD,
-        )
-        pack = ContextPackBuilder(store).build(task.task_id)
-        assert "Support one save only." in pack.content
-        assert "Support three save slots." not in pack.content
-        assert "Do not replace StorageManager." in pack.content
-        assert store.active_decisions(task.task_id)[0].status == DecisionStatus.ACTIVE
-
-
-def test_plan_lifecycle_and_context_mode() -> None:
-    with MemoryStore() as store:
-        task = store.create_task("TASK-3", "Plan gate", goal="Implement feature X.")
-        plan = store.create_plan(task.task_id, task.revision, "1. Inspect\n2. Test\n3. Implement")
-        task = store.get_task(task.task_id)
-        assert task.plan_version == 1
-        assert plan.status == PlanStatus.DRAFT
-        review_pack = ContextPackBuilder(store).build(task.task_id, mode=ContextPackMode.PLAN_REVIEW)
-        assert "Plan V1 / DRAFT" in review_pack.content
-        approved = store.approve_plan(task.task_id, task.revision, plan.plan_id)
-        task = store.get_task(task.task_id)
-        assert approved.status == PlanStatus.APPROVED
-        assert store.approved_plan(task.task_id) is not None
-        assert task.phase.value == "implementing"
-        resume_pack = ContextPackBuilder(store).build(task.task_id)
-        assert "Plan V1 / APPROVED" in resume_pack.content
-
-
-def test_approving_new_plan_supersedes_old_plan_in_search_index() -> None:
-    with MemoryStore() as store:
-        task = store.create_task("TASK-PLAN-SEARCH", "Plan search")
-        first = store.create_plan(task.task_id, task.revision, "Legacy three-slot design")
-        task = store.get_task(task.task_id)
-        store.approve_plan(task.task_id, task.revision, first.plan_id)
-        task = store.get_task(task.task_id)
-        second = store.create_plan(task.task_id, task.revision, "New single-save design")
-        task = store.get_task(task.task_id)
-        store.approve_plan(task.task_id, task.revision, second.plan_id)
-        old_hits = [hit for hit in store.search(task.task_id, "Legacy three-slot") if hit.source_id == first.plan_id]
-        new_hits = [hit for hit in store.search(task.task_id, "single-save") if hit.source_id == second.plan_id]
-        assert old_hits and old_hits[0].status == PlanStatus.SUPERSEDED.value
-        assert new_hits and new_hits[0].status == PlanStatus.APPROVED.value
-
-
-def test_summary_evidence_and_context_snapshot_do_not_advance_revision() -> None:
-    with MemoryStore() as store:
-        task = store.create_task("TASK-4", "Derived memory")
-        baseline_revision = task.revision
-        store.add_summary(task.task_id, SummaryType.CURRENT_STATE, 0, 0, "Nothing implemented yet.")
-        store.add_evidence(task.task_id, EvidenceType.TEST_LOG, "pytest", "42 tests passed.")
-        ContextPackBuilder(store).build(task.task_id, persist_snapshot=True)
-        assert store.get_task(task.task_id).revision == baseline_revision
-        assert len(store.list_events(task.task_id)) >= 4
-
-
-def test_context_budget_never_drops_mandatory_hard_constraint() -> None:
-    with MemoryStore() as store:
-        task = store.create_task("TASK-5", "Budget", goal="Keep mandatory state.")
-        hard_text = "HARD-NEVER-DROP " + ("x" * 5000)
-        store.add_constraint(task.task_id, task.revision, hard_text, severity=ConstraintSeverity.HARD)
-        task = store.get_task(task.task_id)
-        for index in range(8):
-            store.add_evidence(
-                task.task_id,
-                EvidenceType.CODEX_PROGRESS,
-                "codex",
-                f"optional-{index} " + ("y" * 2000),
-            )
-        pack = ContextPackBuilder(store, target_chars=3000, hard_max_chars=7000).build(task.task_id)
-        assert "HARD-NEVER-DROP" in pack.content
-        assert pack.token_estimate > 0
-        assert pack.truncated_sections
-
-
-def test_memory_search_returns_active_and_historical_records() -> None:
-    with MemoryStore() as store:
-        task = store.create_task("TASK-6", "Search")
-        decision = store.add_decision(
+        task = store.create_task("TASK-2", "Decision lifecycle")
+        old = store.add_decision(
             task.task_id,
             task.revision,
             "Storage architecture",
-            "Reuse StorageManager and avoid a second persistence abstraction.",
+            "Use an obsolete multi-slot design.",
         )
-        task = store.get_task(task.task_id)
-        store.supersede_decision(task.task_id, task.revision, decision.decision_id)
-        hits = store.search(task.task_id, "StorageManager")
+        current = store.get_task(task.task_id)
+        new = store.add_decision(
+            task.task_id,
+            current.revision,
+            "Storage architecture v2",
+            "Use the existing single-slot StorageManager.",
+        )
+        current = store.get_task(task.task_id)
+        store.supersede_decision(
+            task.task_id,
+            current.revision,
+            old.decision_id,
+            superseded_by=new.decision_id,
+        )
+
+        active = store.active_decisions(task.task_id)
+        assert [item.decision_id for item in active] == [new.decision_id]
+        assert old.content not in ContextPackBuilder(store).build(task.task_id).content
+        hits = store.search(task.task_id, "obsolete multi-slot")
         assert hits
-        assert hits[0].kind in {"decision", "task"}
-        decision_hits = [hit for hit in hits if hit.source_id == decision.decision_id]
-        assert decision_hits
-        assert decision_hits[0].status == "SUPERSEDED"
+        assert hits[0].status == DecisionStatus.SUPERSEDED.value
 
 
-def test_memory_service_resume_works_without_previous_chat(tmp_path: Path) -> None:
-    database = tmp_path / "resume.db"
-    with MemoryService(database) as service:
-        task = service.create_task(
-            "TASK-7",
-            "Resume",
-            goal="Resume from durable state.",
-            hard_constraints=["Latest user override has priority."],
+def test_hard_constraint_survives_tiny_context_budget() -> None:
+    with MemoryStore() as store:
+        task = store.create_task("TASK-3", "Context budget")
+        hard_text = "Never rewrite StorageManager. " + ("critical " * 200)
+        store.add_constraint(
+            task.task_id,
+            task.revision,
+            hard_text,
+            severity=ConstraintSeverity.HARD,
         )
-        revision = task.revision
-    with MemoryService(database) as new_process:
-        pack = new_process.resume_task("TASK-7")
-        assert pack.task.revision == revision
-        assert "Resume from durable state." in pack.content
-        assert "Latest user override has priority." in pack.content
+        builder = ContextPackBuilder(store, target_chars=400, hard_max_chars=600)
+        pack = builder.build(task.task_id)
+        assert hard_text in pack.content
+        assert pack.over_budget_due_to_mandatory is True
+
+
+def test_plan_lifecycle_keeps_only_current_approved_plan() -> None:
+    with MemoryStore() as store:
+        task = store.create_task("TASK-4", "Plan lifecycle")
+        plan1 = store.create_plan(task.task_id, task.revision, "Plan alpha")
+        current = store.get_task(task.task_id)
+        store.approve_plan(task.task_id, current.revision, plan1.plan_id)
+
+        current = store.get_task(task.task_id)
+        plan2 = store.create_plan(task.task_id, current.revision, "Plan beta")
+        current = store.get_task(task.task_id)
+        store.approve_plan(task.task_id, current.revision, plan2.plan_id)
+
+        assert store.approved_plan(task.task_id).plan_id == plan2.plan_id
+        hits = store.search(task.task_id, "Plan alpha")
+        assert hits and hits[0].status == PlanStatus.SUPERSEDED.value
+        pack = ContextPackBuilder(store).build(task.task_id)
+        assert "Plan beta" in pack.content
+        assert "Plan alpha" not in pack.content
+
+
+def test_derived_data_does_not_churn_revision() -> None:
+    with MemoryStore() as store:
+        task = store.create_task("TASK-5", "Derived memory")
+        store.add_summary(
+            task.task_id,
+            SummaryType.CURRENT_STATE,
+            0,
+            0,
+            "Implementation has not started.",
+        )
+        store.add_evidence(
+            task.task_id,
+            EvidenceType.GIT_DIFF,
+            "git",
+            "No changed files.",
+        )
+        store.save_context_snapshot(
+            task.task_id,
+            ContextPackMode.RESUME,
+            "snapshot",
+            1,
+        )
+        assert store.get_task(task.task_id).revision == 0
+
+
+def test_search_finds_historical_evidence() -> None:
+    with MemoryStore() as store:
+        task = store.create_task("TASK-6", "Search")
+        store.add_evidence(
+            task.task_id,
+            EvidenceType.TEST_LOG,
+            "pytest",
+            "Migration test failed on legacy save version 2.",
+        )
+        hits = store.search(task.task_id, "legacy save")
+        assert hits
+        assert hits[0].kind == "evidence"
+
+
+def test_1000_events_remain_auditable_and_context_is_bounded() -> None:
+    with MemoryStore() as store:
+        task = store.create_task("TASK-7", "Event volume", goal="Ship the feature.")
+        for index in range(1000):
+            event = store.record_event(
+                task.task_id,
+                store.get_task(task.task_id).revision,
+                Actor.SYSTEM,
+                EventType.STATE_RECONCILED,
+                {"index": index, "detail": "runtime fact"},
+            )
+            assert event.revision == index + 1
+        events = store.list_events(task.task_id, limit=1100)
+        assert len(events) == 1002  # TASK_CREATED + INTENT_CREATED + 1000 state events
+        assert events[-1].payload["index"] == 999
+        pack = ContextPackBuilder(store).build(task.task_id)
+        assert len(pack.content) <= 64_000

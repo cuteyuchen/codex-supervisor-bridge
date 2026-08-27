@@ -42,7 +42,7 @@ def test_control_adapter_accepts_wrapped_json_string_result() -> None:
     asyncio.run(scenario())
 
 
-def test_chatgpt_surface_exposes_guarded_codex_tools_only() -> None:
+def test_chatgpt_surface_exposes_guarded_codex_and_checkpoint_tools_only() -> None:
     upstream = MCPServer("unused-control-plane")
     memory = MemoryService()
     coordinator = CodexCoordinator(memory, lambda: CodexControlAdapter(upstream))
@@ -66,15 +66,19 @@ def test_chatgpt_surface_exposes_guarded_codex_tools_only() -> None:
                 "list_codex_pending_interactions",
                 "answer_codex_pending_interaction",
             }
-            assert expected_codex <= set(tools)
+            expected_checkpoints = {
+                "collect_codex_checkpoint",
+                "get_latest_codex_checkpoint",
+                "list_codex_checkpoints",
+                "review_codex_checkpoint",
+            }
+            assert expected_codex | expected_checkpoints <= set(tools)
 
-            # Raw control-plane escape hatches are intentionally absent.
             assert "codex_submit_task" not in tools
             assert "codex_approve_plan" not in tools
             assert "codex_interrupt_turn" not in tools
+            assert "codex_get_operation_status" not in tools
 
-            # The Supervisor decides fixed sandbox policy internally. ChatGPT
-            # cannot request danger-full-access or override sandbox arguments.
             execute_schema = tools["execute_codex_approved_plan"].input_schema
             assert "sandbox" not in execute_schema.get("properties", {})
             start_schema = tools["start_codex_plan"].input_schema
@@ -86,6 +90,8 @@ def test_chatgpt_surface_exposes_guarded_codex_tools_only() -> None:
                 "preflight_codex_project",
                 "get_codex_status",
                 "list_codex_pending_interactions",
+                "get_latest_codex_checkpoint",
+                "list_codex_checkpoints",
             }
             for name in read_only:
                 annotations = tools[name].annotations
@@ -93,7 +99,8 @@ def test_chatgpt_surface_exposes_guarded_codex_tools_only() -> None:
                 assert annotations.read_only_hint is True
                 assert annotations.open_world_hint is False
 
-            for name in expected_codex - read_only:
+            mutating = (expected_codex | expected_checkpoints) - read_only
+            for name in mutating:
                 annotations = tools[name].annotations
                 assert annotations is not None
                 assert annotations.read_only_hint is False

@@ -4,6 +4,8 @@ import json
 from dataclasses import dataclass, field
 from math import ceil
 
+from .checkpoint_reviews import get_checkpoint_review
+from .checkpoint_store import latest_checkpoint
 from .models import (
     Actor,
     ConstraintSeverity,
@@ -63,9 +65,7 @@ class ContextPackBuilder:
         mandatory.append(("USER GOAL", task.current_goal or "No explicit goal recorded."))
 
         hard_constraints = [
-            item
-            for item in constraints
-            if item.severity == ConstraintSeverity.HARD
+            item for item in constraints if item.severity == ConstraintSeverity.HARD
         ]
         mandatory.append(
             (
@@ -76,28 +76,22 @@ class ContextPackBuilder:
                 ),
             )
         )
-
         mandatory.append(
             (
                 "ACTIVE DECISIONS",
                 self._bullets(
-                    [
-                        f"[{item.decision_id}] {item.title}: {item.content}"
-                        for item in decisions
-                    ],
+                    [f"[{item.decision_id}] {item.title}: {item.content}" for item in decisions],
                     empty="No active decisions.",
                 ),
             )
         )
 
         plan = latest_plan if mode == ContextPackMode.PLAN_REVIEW else approved_plan
-        if plan is not None:
-            label = (
-                f"Plan V{plan.plan_version} / {plan.status.value} / {plan.plan_id}\n"
-                f"{plan.content}"
-            )
-        else:
-            label = "No applicable plan recorded."
+        label = (
+            f"Plan V{plan.plan_version} / {plan.status.value} / {plan.plan_id}\n{plan.content}"
+            if plan is not None
+            else "No applicable plan recorded."
+        )
         mandatory.append(("APPROVED / REVIEW PLAN", label))
 
         state_text = (
@@ -108,9 +102,7 @@ class ContextPackBuilder:
         mandatory.append(("CURRENT STATE", state_text))
 
         soft_constraints = [
-            item
-            for item in constraints
-            if item.severity != ConstraintSeverity.HARD
+            item for item in constraints if item.severity != ConstraintSeverity.HARD
         ]
         optional.append(
             (
@@ -126,15 +118,12 @@ class ContextPackBuilder:
             )
         )
 
-        checkpoint_events = self.store.recent_events(
-            task_id,
-            event_types={EventType.CHECKPOINT_CREATED, EventType.CODEX_PROGRESS},
-            limit=3,
-        )
+        checkpoint = latest_checkpoint(self.store, task_id)
+        review = get_checkpoint_review(self.store, checkpoint.checkpoint_id) if checkpoint else None
         optional.append(
             (
-                "LATEST CODEX CHECKPOINT / PROGRESS",
-                self._events(checkpoint_events, empty="No checkpoint recorded."),
+                "LATEST CODEX CHECKPOINT",
+                self._checkpoint(checkpoint, review),
             )
         )
 
@@ -160,12 +149,10 @@ class ContextPackBuilder:
                 EventType.DECISION_ADDED,
                 EventType.DECISION_SUPERSEDED,
                 EventType.CODEX_STEERED,
+                EventType.CHECKPOINT_REVIEWED,
             },
             limit=10,
         )
-        # Historical decision events remain durable/searchable, but the normal
-        # context must not resurrect superseded decision bodies. Only a
-        # DECISION_ADDED event for a decision that is still ACTIVE is surfaced.
         active_decision_ids = {item.decision_id for item in decisions}
         supervisor_events = [
             event
@@ -196,27 +183,17 @@ class ContextPackBuilder:
                 ),
             )
         )
+        optional.append(("CURRENT DECISION REQUIRED", self._decision_prompt(mode)))
 
-        optional.append(
-            (
-                "CURRENT DECISION REQUIRED",
-                self._decision_prompt(mode),
-            )
-        )
-
-        rendered_sections = [self._section(title, body) for title, body in mandatory]
-        content = "\n\n".join(rendered_sections)
+        content = "\n\n".join(self._section(title, body) for title, body in mandatory)
         over_budget_due_to_mandatory = len(content) > self.hard_max_chars
         truncated: list[str] = []
-
         for title, body in optional:
             section = self._section(title, body)
             separator = "\n\n" if content else ""
-            proposed = len(content) + len(separator) + len(section)
-            if proposed <= self.target_chars:
+            if len(content) + len(separator) + len(section) <= self.target_chars:
                 content += separator + section
                 continue
-
             remaining = self.hard_max_chars - len(content) - len(separator)
             if remaining <= len(title) + 24:
                 truncated.append(title)
@@ -226,23 +203,20 @@ class ContextPackBuilder:
                 content += separator + trimmed
             truncated.append(title)
 
-        token_estimate = self.estimate_tokens(content)
         pack = BuiltContextPack(
             task=task,
             mode=mode,
             content=content,
-            token_estimate=token_estimate,
+            token_estimate=self.estimate_tokens(content),
             truncated_sections=tuple(truncated),
             over_budget_due_to_mandatory=over_budget_due_to_mandatory,
         )
         if persist_snapshot:
-            self.store.save_context_snapshot(task_id, mode, content, token_estimate)
+            self.store.save_context_snapshot(task_id, mode, content, pack.token_estimate)
         return pack
 
     @staticmethod
     def estimate_tokens(content: str) -> int:
-        # Conservative dependency-free estimate. It intentionally avoids coupling
-        # the durable memory layer to one model tokenizer.
         return ceil(len(content) / 4)
 
     @staticmethod
@@ -251,9 +225,7 @@ class ContextPackBuilder:
 
     @staticmethod
     def _bullets(values: list[str], *, empty: str) -> str:
-        if not values:
-            return empty
-        return "\n".join(f"- {value}" for value in values)
+        return "\n".join(f"- {value}" for value in values) if values else empty
 
     @staticmethod
     def _truncate(value: str, max_chars: int) -> str:
@@ -284,11 +256,55 @@ class ContextPackBuilder:
             return empty
         rows: list[str] = []
         for event in events:
-            payload = json.dumps(event.payload, ensure_ascii=False, sort_keys=True)
-            payload = cls._truncate(payload, 1200)
+            payload = cls._truncate(
+                json.dumps(event.payload, ensure_ascii=False, sort_keys=True),
+                1200,
+            )
             rows.append(
                 f"- Rev {event.revision} {event.actor.value}/{event.event_type.value}: {payload}"
             )
+        return "\n".join(rows)
+
+    @classmethod
+    def _checkpoint(cls, checkpoint: object | None, review: object | None) -> str:
+        if checkpoint is None:
+            return "No checkpoint recorded."
+        rows = [
+            f"Sequence: {checkpoint.sequence}",
+            f"Type: {checkpoint.checkpoint_type.value}",
+            f"Task Revision: {checkpoint.task_revision}",
+            f"Trigger: {checkpoint.trigger_reason}",
+            f"Remote Status: {checkpoint.remote_status or '-'}",
+            f"Next Action: {checkpoint.next_action or '-'}",
+            f"Requires Review: {checkpoint.requires_review}",
+        ]
+        for label, values in (
+            ("Completed", checkpoint.completed),
+            ("In Progress", checkpoint.in_progress),
+            ("Files Changed", checkpoint.files_changed),
+            ("Assumptions", checkpoint.assumptions),
+            ("Deviations", checkpoint.deviations),
+            ("Blockers", checkpoint.blockers),
+            ("Risks", checkpoint.risks),
+            ("Next Steps", checkpoint.next_steps),
+            ("Evidence", checkpoint.evidence_refs),
+        ):
+            if values:
+                rows.append(f"{label}: " + " | ".join(values[:8]))
+        if checkpoint.validation:
+            rows.append(
+                "Validation: "
+                + cls._truncate(
+                    json.dumps(checkpoint.validation, ensure_ascii=False, sort_keys=True),
+                    1000,
+                )
+            )
+        if review is not None:
+            rows.append(f"Review: {review.decision.value}")
+            if review.instruction:
+                rows.append(f"Review Instruction: {review.instruction}")
+        else:
+            rows.append("Review: PENDING" if checkpoint.requires_review else "Review: NOT_REQUIRED")
         return "\n".join(rows)
 
     @staticmethod

@@ -16,7 +16,8 @@ The bridge keeps durable supervisor state outside the browser chat:
 - append-only supervisory events;
 - explicit intent / plan / task revisions;
 - bounded Context Packs for cross-conversation recovery;
-- searchable historical evidence without re-injecting obsolete decisions as current truth.
+- searchable historical evidence without re-injecting obsolete decisions as current truth;
+- durable Codex workflow / operation / thread / turn identity for restart-safe supervision.
 
 A new ChatGPT conversation can therefore resume a task from canonical external memory instead of depending on the old browser transcript.
 
@@ -32,7 +33,7 @@ ChatGPT Web Supervisor
   v
 Codex Supervisor Bridge
   |-- Persistent Memory / Context Packs
-  |-- Revision Guard
+  |-- Revision Guard / Plan Gate
   |-- Checkpoint / Override policy (later phases)
   |
   +-------------------+
@@ -40,7 +41,9 @@ Codex Supervisor Bridge
   v                   v
 Kandev             Codex Control Plane
   |                   |
-  |                   +-- Codex app-server / turn steering
+  |                   +-- central worker
+  |                   +-- Codex app-server
+  |                   +-- turn/start / steer / interrupt
   |
   +-- workflow / worktree / review / PR / CI
              |
@@ -79,9 +82,9 @@ Implemented and merged:
 
 Real ChatGPT Web + Secure MCP Tunnel connectivity is intentionally deferred until the local integration boundary.
 
-### P3 — Kandev Adapter 🚧
+### P3 — Kandev Adapter ✅
 
-Under development:
+Implemented and merged:
 
 - typed client for Kandev external MCP;
 - runtime capability discovery;
@@ -89,9 +92,24 @@ Under development:
 - stable Kandev `external_id` for idempotent provisioning;
 - Kandev session/conversation observation through Supervisor MCP;
 - safe integration error boundary;
-- `start_agent=false` and `autopilot=false` hard gate until P4.
+- provisioning hard gate: `start_agent=false`, `autopilot=false`.
 
-See `docs/P1-memory-core.md`, `docs/P2-remote-mcp.md`, `docs/P3-kandev-adapter.md`, and `docs/architecture.md`.
+### P4 — Codex Live Control 🚧
+
+Under development:
+
+- contract-verified `codex-control-plane-mcp` adapter;
+- schema v2 durable Codex workflow/operation/thread/turn state;
+- read-only Codex Plan Mode;
+- local DRAFT import and explicit Supervisor plan approval;
+- remote-plan drift guard before execution;
+- fixed `workspace-write` execution surface;
+- current-turn soft steering through upstream `steer_turn`;
+- pending approval/question handling;
+- interrupt-to-PAUSED control path;
+- raw `codex_submit_task` / sandbox escalation intentionally hidden from ChatGPT.
+
+See `docs/P1-memory-core.md`, `docs/P2-remote-mcp.md`, `docs/P3-kandev-adapter.md`, `docs/P4-codex-live-control.md`, and `docs/architecture.md`.
 
 ## Local server targets
 
@@ -107,7 +125,9 @@ Kandev external MCP default:
 http://127.0.0.1:38429/mcp
 ```
 
-Both are expected to remain local. Supervisor MCP will later be exposed to ChatGPT through an authenticated Secure MCP Tunnel rather than opening the local service directly to the public internet.
+Codex Control Plane is invoked by the Bridge as a client-mode MCP gateway (default executable `codex-control-plane-mcp`) and is expected to share state with a separately running central worker. The worker, not the Bridge process, owns the long-running Codex app-server runtime.
+
+All local control services are expected to remain local. Supervisor MCP will later be exposed to ChatGPT through an authenticated Secure MCP Tunnel rather than opening the local service directly to the public internet.
 
 ## Design principles
 
@@ -120,14 +140,16 @@ Both are expected to remain local. Supervisor MCP will later be exposed to ChatG
 - Raw evidence is retrieved progressively instead of injected into every model context.
 - Kandev owns development workflow/worktrees; Codex Control Plane owns Codex runtime state; GitHub owns code/PR/CI facts.
 - The ChatGPT-facing MCP surface exposes semantic operations, not unrestricted local execution.
-- Kandev provisioning alone never starts an agent; Codex execution must pass the later supervised plan/control gate.
+- Kandev provisioning alone never starts an agent.
+- Codex execution is plan-gated: read-only plan → local approval → remote equality check → workspace-write.
+- Soft steering modifies the current active turn; architecture/scope changes require interrupt + replan.
 
 ## Planned milestones
 
 1. P1 — Memory Core + Context Pack Builder ✅
 2. P2 — Remote MCP surface for ChatGPT ✅
-3. P3 — Kandev adapter 🚧
-4. P4 — Codex live control and steering
+3. P3 — Kandev adapter ✅
+4. P4 — Codex live control and steering 🚧
 5. P5 — Checkpoints and supervisor review
 6. P6 — Human override and hard replan
 7. P7 — Review / QA / PR / CI integration

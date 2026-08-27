@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = r"""
 PRAGMA foreign_keys = ON;
@@ -157,6 +157,26 @@ CREATE TABLE IF NOT EXISTS memory_documents (
 
 CREATE INDEX IF NOT EXISTS idx_memory_documents_task_kind
 ON memory_documents(task_id, kind, updated_at DESC);
+"""
+
+CODEX_RUNTIME_MIGRATION_SQL = r"""
+CREATE TABLE IF NOT EXISTS codex_runtime_state (
+    task_id TEXT PRIMARY KEY REFERENCES supervised_tasks(task_id) ON DELETE CASCADE,
+    workflow_id TEXT,
+    operation_id TEXT,
+    thread_id TEXT,
+    turn_id TEXT,
+    remote_status TEXT,
+    next_action TEXT,
+    last_client_request_id TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_codex_runtime_workflow
+ON codex_runtime_state(workflow_id);
+
+CREATE INDEX IF NOT EXISTS idx_codex_runtime_operation
+ON codex_runtime_state(operation_id);
 """
 
 OPTIONAL_FTS_SQL = r"""

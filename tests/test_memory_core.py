@@ -47,7 +47,7 @@ def test_task_persists_across_reopen(tmp_path: Path) -> None:
         assert restored.revision == 1
         constraints = reopened.active_constraints(restored.task_id)
         assert [item.content for item in constraints] == ["Reuse the existing StorageManager."]
-        assert current_schema_version(reopened._conn) == 1
+        assert current_schema_version(reopened._conn) == 2
 
 
 def test_stale_revision_is_rejected_without_partial_write() -> None:

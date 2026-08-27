@@ -15,6 +15,7 @@ class Settings:
     host: str = "127.0.0.1"
     port: int = 8765
     kandev_mcp_url: str = "http://127.0.0.1:38429/mcp"
+    codex_control_command: str = "codex-control-plane-mcp"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -24,6 +25,10 @@ class Settings:
         host = os.getenv("SUPERVISOR_HOST", "127.0.0.1")
         port_text = os.getenv("SUPERVISOR_PORT", "8765")
         kandev_mcp_url = os.getenv("KANDEV_MCP_URL", "http://127.0.0.1:38429/mcp").strip()
+        codex_control_command = os.getenv(
+            "CODEX_CONTROL_PLANE_COMMAND",
+            "codex-control-plane-mcp",
+        ).strip()
         try:
             port = int(port_text)
         except ValueError as exc:
@@ -32,9 +37,12 @@ class Settings:
             raise ValueError("SUPERVISOR_PORT must be between 1 and 65535")
         if not kandev_mcp_url:
             raise ValueError("KANDEV_MCP_URL must not be empty")
+        if not codex_control_command:
+            raise ValueError("CODEX_CONTROL_PLANE_COMMAND must not be empty")
         return cls(
             database_path=database_path,
             host=host,
             port=port,
             kandev_mcp_url=kandev_mcp_url,
+            codex_control_command=codex_control_command,
         )

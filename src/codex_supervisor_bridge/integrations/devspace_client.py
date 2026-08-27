@@ -27,6 +27,11 @@ REQUIRED_DEVSPACE_TOOLS = {
 }
 
 _BRANCH_LINE = re.compile(r"^##\s+([^\.\s]+)(?:\.\.\.|\s|$)")
+_PROCESS_STATUS_PREFIXES = (
+    "Process exited with code ",
+    "Process exited with signal ",
+    "Process running with session ID ",
+)
 
 
 class DevSpaceWorkspaceAdapter:
@@ -348,6 +353,8 @@ class DevSpaceWorkspaceAdapter:
         head: str | None = None
         changed: list[str] = []
         for line in lines:
+            if line.startswith(_PROCESS_STATUS_PREFIXES):
+                continue
             if line.startswith("## "):
                 match = _BRANCH_LINE.match(line)
                 branch = match.group(1) if match else line[3:].split()[0]

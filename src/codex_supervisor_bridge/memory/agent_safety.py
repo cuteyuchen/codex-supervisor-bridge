@@ -169,6 +169,34 @@ def record_agent_compensation_succeeded(
     )
 
 
+def latch_agent_compensation(
+    store: MemoryStore,
+    task_id: str,
+    *,
+    operation: str,
+    summary: str,
+    details: dict[str, Any] | None = None,
+    workflow_id: str | None = None,
+    operation_id: str | None = None,
+    thread_id: str | None = None,
+    turn_id: str | None = None,
+) -> AgentSafety:
+    """Durably fence all new writes before waiting on remote interruption."""
+    return _record(
+        store,
+        task_id,
+        state=AgentSafetyState.COMPENSATION_REQUIRED,
+        operation=operation,
+        summary=summary,
+        details=details,
+        workflow_id=workflow_id,
+        operation_id=operation_id,
+        thread_id=thread_id,
+        turn_id=turn_id,
+        event_type=EventType.AGENT_COMPENSATION_REQUIRED,
+    )
+
+
 def record_agent_compensation_required(
     store: MemoryStore,
     task_id: str,

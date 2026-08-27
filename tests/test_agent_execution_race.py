@@ -22,6 +22,7 @@ from codex_supervisor_bridge.memory.errors import ConflictError
 from codex_supervisor_bridge.memory.execution import acquire_writer, handoff_writer, release_writer
 from codex_supervisor_bridge.memory.models import ActiveWriter
 from codex_supervisor_bridge.memory.service import MemoryService
+from codex_supervisor_bridge.memory.workspace import bind_workspace, prepare_direct_operation
 from codex_supervisor_bridge.supervisor.agent_execution import (
     AgentCompensationRequiredError,
     AgentExecutionCoordinator,
@@ -36,17 +37,21 @@ class BlockingAgent:
         *,
         block_plan: bool = False,
         block_execution: bool = False,
+        block_interrupt: bool = False,
         interrupt_status: str = "interrupted",
         interrupt_error: bool = False,
     ) -> None:
         self.block_plan = block_plan
         self.block_execution = block_execution
+        self.block_interrupt = block_interrupt
         self.interrupt_status = interrupt_status
         self.interrupt_error = interrupt_error
         self.plan_started = asyncio.Event()
         self.execution_started = asyncio.Event()
         self.release_plan = asyncio.Event()
         self.release_execution = asyncio.Event()
+        self.interrupt_started = asyncio.Event()
+        self.release_interrupt = asyncio.Event()
         self.interrupts: list[PlanHandle] = []
         self.execution_calls = 0
 
@@ -136,6 +141,9 @@ class BlockingAgent:
 
     async def interrupt(self, handle: PlanHandle) -> AgentSnapshot:
         self.interrupts.append(handle)
+        self.interrupt_started.set()
+        if self.block_interrupt:
+            await self.release_interrupt.wait()
         if self.interrupt_error:
             raise RuntimeError("interrupt transport failed")
         return AgentSnapshot(
@@ -173,6 +181,17 @@ async def _prepare_approved_execution(
     agent: BlockingAgent,
 ) -> tuple[AgentExecutionCoordinator, str, PlanHandle, WriterLeaseToken]:
     task = memory.create_task("AGENT-RACE", "Agent race", repository="C:/repo")
+    bind_workspace(
+        memory.store,
+        task.task_id,
+        task.revision,
+        backend_name="fake-devspace",
+        workspace_id="ws-race",
+        repository="C:/repo",
+        root="C:/repo",
+        workspace_mode="worktree",
+    )
+    task = memory.get_task(task.task_id)
     acquired = acquire_writer(
         memory.store,
         task.task_id,
@@ -324,11 +343,119 @@ def test_execution_writer_epoch_race_compensates_stale_lease() -> None:
         memory.close()
 
 
+def test_compensation_latch_blocks_all_writes_while_interrupt_is_in_flight() -> None:
+    memory = MemoryService()
+    agent = BlockingAgent(block_execution=True, block_interrupt=True)
+
+    async def scenario() -> None:
+        coordinator, plan_id, plan_handle, lease = await _prepare_approved_execution(memory, agent)
+        task = memory.get_task("AGENT-RACE")
+        pending = asyncio.create_task(
+            coordinator.start_execution(
+                task.task_id,
+                task.revision,
+                plan_id=plan_id,
+                plan_handle=plan_handle,
+                plan_result=PlanResult(content="1. Implement\n2. Test"),
+                context_pack="goal",
+                workspace=_workspace(),
+                lease=lease,
+            )
+        )
+        await agent.execution_started.wait()
+        handed = handoff_writer(
+            memory.store,
+            task.task_id,
+            memory.get_task(task.task_id).revision,
+            from_writer=ActiveWriter.CODEX,
+            to_writer=ActiveWriter.CHATGPT,
+            expected_writer_epoch=lease.writer_epoch,
+            reason="Return the worktree to ChatGPT while the remote start is pending",
+        )
+        agent.release_execution.set()
+        await agent.interrupt_started.wait()
+
+        safety = get_agent_safety(memory.store, task.task_id)
+        assert safety is not None
+        assert safety.state == AgentSafetyState.COMPENSATION_REQUIRED
+        assert safety.details["stage"] == "INTERRUPT_PENDING"
+
+        current = memory.get_task(task.task_id)
+        with pytest.raises(ConflictError, match="compensation requires reconciliation"):
+            prepare_direct_operation(
+                memory.store,
+                task.task_id,
+                current.revision,
+                handed.execution.writer_epoch,
+                operation_type="APPLY_PATCH",
+                request_digest="sha256:test",
+            )
+        with pytest.raises(ConflictError, match="compensation requires reconciliation"):
+            handoff_writer(
+                memory.store,
+                task.task_id,
+                current.revision,
+                from_writer=ActiveWriter.CHATGPT,
+                to_writer=ActiveWriter.CODEX,
+                expected_writer_epoch=handed.execution.writer_epoch,
+                reason="Attempt to reclaim Codex writer during compensation",
+                explicit_user_authorization=True,
+            )
+        with pytest.raises(ConflictError, match="compensation requires reconciliation"):
+            release_writer(
+                memory.store,
+                task.task_id,
+                current.revision,
+                ActiveWriter.CHATGPT,
+                handed.execution.writer_epoch,
+            )
+        with pytest.raises(ConflictError, match="compensation requires reconciliation"):
+            acquire_writer(
+                memory.store,
+                task.task_id,
+                current.revision,
+                ActiveWriter.CODEX,
+                explicit_user_authorization=True,
+            )
+        with pytest.raises(AgentPlanGateError, match="compensation requires reconciliation"):
+            await coordinator.start_plan(
+                task.task_id,
+                current.revision,
+                context_pack="goal",
+                workspace=_workspace(),
+            )
+        with pytest.raises(AgentPlanGateError, match="compensation requires reconciliation"):
+            await coordinator.start_execution(
+                task.task_id,
+                current.revision,
+                plan_id=plan_id,
+                plan_handle=plan_handle,
+                plan_result=PlanResult(content="1. Implement\n2. Test"),
+                context_pack="goal",
+                workspace=_workspace(),
+                lease=lease,
+            )
+
+        agent.release_interrupt.set()
+        with pytest.raises(AgentStaleContextError, match="STALE_CONTEXT"):
+            await pending
+        safety = get_agent_safety(memory.store, task.task_id)
+        assert safety is not None and safety.state == AgentSafetyState.NONE
+        runtime = get_codex_runtime(memory.store, task.task_id)
+        assert runtime is not None and runtime.remote_status == "planning"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        memory.close()
+
+
 @pytest.mark.parametrize("mode", ["unknown", "failure"])
 def test_failed_or_unknown_compensation_is_durable_and_blocks_follow_up_writes(mode: str) -> None:
     memory = MemoryService()
     agent = BlockingAgent(
         block_execution=True,
+        block_interrupt=True,
         interrupt_status="UNKNOWN" if mode == "unknown" else "interrupted",
         interrupt_error=mode == "failure",
     )
@@ -351,6 +478,12 @@ def test_failed_or_unknown_compensation_is_durable_and_blocks_follow_up_writes(m
         await agent.execution_started.wait()
         memory.record_user_override(task.task_id, task.revision, "Stop this execution")
         agent.release_execution.set()
+        await agent.interrupt_started.wait()
+        pending_safety = get_agent_safety(memory.store, task.task_id)
+        assert pending_safety is not None
+        assert pending_safety.state == AgentSafetyState.COMPENSATION_REQUIRED
+        assert pending_safety.details["stage"] == "INTERRUPT_PENDING"
+        agent.release_interrupt.set()
         with pytest.raises(AgentCompensationRequiredError, match="COMPENSATION_REQUIRED"):
             await pending
 

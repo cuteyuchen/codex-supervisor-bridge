@@ -303,7 +303,8 @@ The following behaviors are implemented and covered:
 - Local-Codex-Bridge `AgentBackend` with same-turn steer, observe, interrupt,
   pending interaction normalization, and UNKNOWN acknowledgement semantics;
 - backend-neutral external-call race compensation for plan/execution start,
-  with durable agent safety guards that fail closed on UNKNOWN or failed
+  with a durable `COMPENSATION_REQUIRED / INTERRUPT_PENDING` latch written
+  before interrupt, and guards that fail closed on UNKNOWN or failed
   interrupt compensation;
 - backend-neutral Supervisor Plan Gate carrying a read-only `PlanResult` through
   local DRAFT/import, explicit APPROVED review, writer-lease validation, and

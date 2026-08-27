@@ -12,6 +12,7 @@ from codex_supervisor_bridge.backends.models import (
 )
 from codex_supervisor_bridge.memory.agent_safety import (
     assert_agent_safety_clear,
+    latch_agent_compensation,
     record_agent_compensation_required,
     record_agent_compensation_succeeded,
 )
@@ -107,6 +108,20 @@ class AgentExecutionCoordinator:
         stale_reason: str,
     ) -> NoReturn:
         """Interrupt a stale remote request and persist failure when it is uncertain."""
+        latch_agent_compensation(
+            self.memory.store,
+            task_id,
+            operation=operation,
+            summary=(
+                f"{operation} became stale; all new writes are blocked while "
+                "remote compensation is pending."
+            ),
+            details={"stage": "INTERRUPT_PENDING", "stale_reason": stale_reason},
+            workflow_id=handle.workflow_id,
+            operation_id=handle.operation_id,
+            thread_id=handle.thread_id,
+            turn_id=handle.turn_id,
+        )
         try:
             snapshot = await self.agent_backend.interrupt(handle)
         except Exception as exc:

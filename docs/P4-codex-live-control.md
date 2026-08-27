@@ -158,6 +158,28 @@ A material architecture/scope change is not a soft steer. It should be handled b
 
 `interrupt_codex` targets the persisted workflow/operation/thread/turn identity. On successful upstream interruption the local task moves to `PAUSED` and an immutable `CODEX_INTERRUPTED` event is appended.
 
+## Revision-race compensation
+
+A remote Codex write and a user override can cross in flight:
+
+```text
+Supervisor checks revision 41
+  -> remote Plan / Execute / Steer starts
+  -> user override advances local task to revision 42
+  -> old remote response returns
+```
+
+The Bridge must not persist the old remote action as if revision 41 were still current, and it must not leave that remote action running silently.
+
+P4 therefore treats remote-write binding as fail-closed:
+
+1. every remote write is followed by the normal optimistic local revision check;
+2. if the bind reports `STALE_CONTEXT`, the Bridge immediately issues a compensating `codex_interrupt_turn` using the remote workflow/operation/thread/turn identifiers it just received;
+3. if compensation succeeds, the original `STALE_CONTEXT` is re-raised so the Supervisor must reload the newest user state;
+4. if compensation itself fails, the Bridge raises `CODEX_COMPENSATION_REQUIRED` rather than claiming the remote action was safely stopped.
+
+This compensation applies to Plan start, approved-plan execution, soft steer and interaction answers. A direct interrupt does not need a second compensation interrupt: if its local bind races, the remote side is already stopped and the caller simply receives stale-context recovery semantics.
+
 ## Pending interactions
 
 P4 exposes bounded tools to:
@@ -207,6 +229,7 @@ Important expected errors include:
 - `CODEX_CONTRACT_ERROR`
 - `CODEX_TOOL_ERROR`
 - `CODEX_PLAN_GATE`
+- `CODEX_COMPENSATION_REQUIRED`
 - existing `STALE_CONTEXT`
 
 ## Idempotency
@@ -242,6 +265,8 @@ Automated tests must prove:
 - pending interaction listing is read-only;
 - interaction answers are revision protected;
 - interrupt moves the task to `PAUSED`;
+- a user revision race after a remote write triggers compensation interrupt;
+- failed compensation is escalated and never reported as a safe stop;
 - raw upstream write tools and sandbox selection are absent from the ChatGPT-facing MCP surface;
 - Python 3.12 and 3.13 lint/tests are green.
 

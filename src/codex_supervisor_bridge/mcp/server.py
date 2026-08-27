@@ -16,46 +16,67 @@ from codex_supervisor_bridge.supervisor.checkpoints import CheckpointService
 
 from .checkpoint_tools import register_checkpoint_tools
 from .codex_tools import register_codex_tools
+from .execution_tools import register_execution_tools
 from .kandev_tools import register_kandev_tools
 from .tools import register_memory_tools
 
 SERVER_INSTRUCTIONS = """
-You are connected to Codex Supervisor Bridge, the durable supervisory control
-surface for development tasks. Chat history is not the source of truth.
+You are connected to Codex Supervisor Bridge, the durable task memory and
+supervision surface for local software development. Chat history is not the
+source of truth. Resume from canonical task/context state.
 
-Before making a task mutation, read the current task/context and use its latest
+Before a task mutation, read the current task/context and use its latest
 revision as expected_revision. If a tool reports STALE_CONTEXT, do not retry
-with the old revision: re-read canonical task/context state first.
+with the old revision. Re-read canonical state first.
 
-ACTIVE decisions and constraints are current instructions. Search may also
-return SUPERSEDED historical records; never treat a superseded record as
-current truth. HARD constraints outrank plans and agent-local choices.
+ACTIVE decisions and constraints are current instructions. Search may return
+SUPERSEDED historical records; never treat them as current truth. Latest user
+intent and ACTIVE HARD constraints outrank plans and agent-local choices.
 
-Kandev owns workflow/worktree facts. Codex Control Plane owns Codex runtime
-facts. Supervisor Bridge owns user intent, active constraints, revision locks,
-plan approval, checkpoint review, and cross-system routing.
+A task has an execution mode:
+- DIRECT: ChatGPT Web may be the workspace writer.
+- HYBRID: ChatGPT and Codex may take turns writing through explicit handoff.
+- CODEX_SUPERVISED: Codex owns mutating implementation work while ChatGPT
+  supervises and reviews.
 
-Codex implementation is plan-gated: start_codex_plan is read-only Plan Mode;
-import_codex_plan creates a local DRAFT; approve_task_plan is the explicit
+A supervised worktree has only one active writer by default. Read
+get_task_execution_state before write ownership changes. Workspace mutations
+must be fenced by both current task revision and writer_epoch. Never let a
+stale ChatGPT request or Codex operation reclaim a newer writer lease.
+
+HYBRID defaults to MANUAL_ONLY delegation. Do not decide that the user granted
+ongoing automatic Codex delegation unless set_codex_delegation_policy records
+that explicit user choice. A one-time explicit instruction to hand bounded work
+to Codex may authorize only that handoff.
+
+Backend names, ports, worker processes, SQLite paths, native thread IDs, and
+similar details are implementation/diagnostic concerns. Normal user interaction
+should describe capabilities such as Local workspace, Codex, and GitHub
+rather than asking the user to select infrastructure backends.
+
+Codex implementation remains plan-gated. start_codex_plan is read-only Plan
+Mode; import_codex_plan creates a local DRAFT; approve_task_plan is the
 Supervisor gate; execute_codex_approved_plan re-checks that the remote
-latestPlan still matches the locally approved plan before workspace-write is
-allowed.
+latestPlan matches the locally approved plan before workspace-write is allowed.
+A Codex implementation must also own the CODEX workspace writer lease once the
+execution facade is enforcing leases end-to-end.
 
-Use collect_codex_checkpoint to compress current Codex progress into a bounded
-HEARTBEAT, PROGRESS, or GATE checkpoint. PROGRESS and GATE checkpoints require
-review. Use review_codex_checkpoint to record CONTINUE, STEER, INTERRUPT,
-REPLAN, or ACCEPT. Follow-up control remains explicit: a STEER review should
-be followed by soft_steer_codex; INTERRUPT/REPLAN should be followed by
-interrupt_codex. P6 will make hard replan atomic.
+Use collect_codex_checkpoint to compress current legacy Control Plane progress
+into a bounded HEARTBEAT, PROGRESS, or GATE checkpoint. Checkpoints are
+Supervisor task progress, not permanent Codex-thread memory. Raw reasoning or
+token deltas are not supervisor memory.
 
 Use soft_steer_codex only for a local correction while the current plan remains
-valid. For architecture/scope changes, interrupt first and create/review a new
-plan. Raw codex_submit_task and danger-full-access are intentionally not
-exposed through this server.
+valid. Architecture or scope changes use the P6 hard-replan flow: record the
+new user intent, snapshot existing work, interrupt/quiesce the current writer,
+classify KEEP/MODIFY/DROP, and create/review a new plan. Do not revive a
+superseded plan after an intent change.
 
-This server intentionally exposes semantic supervisor operations only. It does
-not provide arbitrary shell, process execution, raw SQL, or unrestricted
-filesystem tools.
+Direct local workspace tools will be exposed only through a constrained
+Supervisor facade after the WorkspaceBackend adapter is available. Do not
+assume arbitrary raw filesystem or system shell access. Existing Kandev and
+Codex Control Plane integrations are backend implementations/fallbacks, not
+permanent Supervisor Core ownership boundaries.
 """.strip()
 
 
@@ -73,6 +94,7 @@ def create_mcp_server(
         version=__version__,
     )
     register_memory_tools(server, service)
+    register_execution_tools(server, service)
     if kandev is not None:
         register_kandev_tools(server, kandev)
     if codex is not None:
@@ -115,12 +137,12 @@ def build_parser(settings: Settings | None = None) -> argparse.ArgumentParser:
     parser.add_argument(
         "--kandev-mcp-url",
         default=settings.kandev_mcp_url,
-        help="Kandev external MCP endpoint (default: http://127.0.0.1:38429/mcp)",
+        help="Kandev external MCP endpoint (advanced fallback; default local endpoint)",
     )
     parser.add_argument(
         "--codex-control-command",
         default=settings.codex_control_command,
-        help="Codex Control Plane MCP executable (default: codex-control-plane-mcp)",
+        help="Codex Control Plane executable (advanced fallback)",
     )
     return parser
 

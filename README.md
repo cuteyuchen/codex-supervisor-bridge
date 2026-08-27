@@ -17,7 +17,8 @@ The bridge keeps durable supervisor state outside the browser chat:
 - explicit intent / plan / task revisions;
 - bounded Context Packs for cross-conversation recovery;
 - searchable historical evidence without re-injecting obsolete decisions as current truth;
-- durable Codex workflow / operation / thread / turn identity for restart-safe supervision.
+- durable Codex workflow / operation / thread / turn identity for restart-safe supervision;
+- bounded structured checkpoints instead of injecting raw Codex progress streams into every ChatGPT context.
 
 A new ChatGPT conversation can therefore resume a task from canonical external memory instead of depending on the old browser transcript.
 
@@ -34,7 +35,8 @@ ChatGPT Web Supervisor
 Codex Supervisor Bridge
   |-- Persistent Memory / Context Packs
   |-- Revision Guard / Plan Gate
-  |-- Checkpoint / Override policy (later phases)
+  |-- Checkpoint Aggregation / Review
+  |-- Override / Hard Replan (later phase)
   |
   +-------------------+
   |                   |
@@ -94,9 +96,9 @@ Implemented and merged:
 - safe integration error boundary;
 - provisioning hard gate: `start_agent=false`, `autopilot=false`.
 
-### P4 — Codex Live Control 🚧
+### P4 — Codex Live Control ✅
 
-Under development:
+Implemented and merged:
 
 - contract-verified `codex-control-plane-mcp` adapter;
 - schema v2 durable Codex workflow/operation/thread/turn state;
@@ -107,9 +109,23 @@ Under development:
 - current-turn soft steering through upstream `steer_turn`;
 - pending approval/question handling;
 - interrupt-to-PAUSED control path;
+- fail-closed compensation when a user revision races an in-flight remote Codex write;
 - raw `codex_submit_task` / sandbox escalation intentionally hidden from ChatGPT.
 
-See `docs/P1-memory-core.md`, `docs/P2-remote-mcp.md`, `docs/P3-kandev-adapter.md`, `docs/P4-codex-live-control.md`, and `docs/architecture.md`.
+### P5 — Checkpoints and Supervisor Review 🚧
+
+Under development:
+
+- schema v3 durable checkpoint/review records;
+- deterministic HEARTBEAT / PROGRESS / GATE classification;
+- filtering of high-frequency reasoning/token/text deltas;
+- source-fingerprint deduplication;
+- structured completion / file / validation / blocker / risk / next-step fields;
+- latest checkpoint rendered into Context Packs instead of raw Codex progress events;
+- optimistic-revision checkpoint review with CONTINUE / STEER / INTERRUPT / REPLAN / ACCEPT;
+- explicit follow-up control actions rather than hidden automatic steering.
+
+See `docs/P1-memory-core.md`, `docs/P2-remote-mcp.md`, `docs/P3-kandev-adapter.md`, `docs/P4-codex-live-control.md`, `docs/P5-checkpoints.md`, and `docs/architecture.md`.
 
 ## Local server targets
 
@@ -143,14 +159,16 @@ All local control services are expected to remain local. Supervisor MCP will lat
 - Kandev provisioning alone never starts an agent.
 - Codex execution is plan-gated: read-only plan → local approval → remote equality check → workspace-write.
 - Soft steering modifies the current active turn; architecture/scope changes require interrupt + replan.
+- Checkpoints summarize high-signal runtime facts; raw reasoning/token deltas are not supervisory context.
+- Heartbeats do not churn task revision; meaningful progress/gates do.
 
 ## Planned milestones
 
 1. P1 — Memory Core + Context Pack Builder ✅
 2. P2 — Remote MCP surface for ChatGPT ✅
 3. P3 — Kandev adapter ✅
-4. P4 — Codex live control and steering 🚧
-5. P5 — Checkpoints and supervisor review
+4. P4 — Codex live control and steering ✅
+5. P5 — Checkpoints and supervisor review 🚧
 6. P6 — Human override and hard replan
 7. P7 — Review / QA / PR / CI integration
 8. P8 — Automated supervised loop

@@ -12,7 +12,9 @@ from codex_supervisor_bridge.integrations.codex_coordinator import CodexCoordina
 from codex_supervisor_bridge.integrations.kandev_client import KandevAdapter
 from codex_supervisor_bridge.integrations.kandev_coordinator import KandevCoordinator
 from codex_supervisor_bridge.memory.service import MemoryService
+from codex_supervisor_bridge.supervisor.checkpoints import CheckpointService
 
+from .checkpoint_tools import register_checkpoint_tools
 from .codex_tools import register_codex_tools
 from .kandev_tools import register_kandev_tools
 from .tools import register_memory_tools
@@ -31,13 +33,20 @@ current truth. HARD constraints outrank plans and agent-local choices.
 
 Kandev owns workflow/worktree facts. Codex Control Plane owns Codex runtime
 facts. Supervisor Bridge owns user intent, active constraints, revision locks,
-plan approval, and cross-system routing.
+plan approval, checkpoint review, and cross-system routing.
 
 Codex implementation is plan-gated: start_codex_plan is read-only Plan Mode;
 import_codex_plan creates a local DRAFT; approve_task_plan is the explicit
 Supervisor gate; execute_codex_approved_plan re-checks that the remote
 latestPlan still matches the locally approved plan before workspace-write is
 allowed.
+
+Use collect_codex_checkpoint to compress current Codex progress into a bounded
+HEARTBEAT, PROGRESS, or GATE checkpoint. PROGRESS and GATE checkpoints require
+review. Use review_codex_checkpoint to record CONTINUE, STEER, INTERRUPT,
+REPLAN, or ACCEPT. Follow-up control remains explicit: a STEER review should
+be followed by soft_steer_codex; INTERRUPT/REPLAN should be followed by
+interrupt_codex. P6 will make hard replan atomic.
 
 Use soft_steer_codex only for a local correction while the current plan remains
 valid. For architecture/scope changes, interrupt first and create/review a new
@@ -68,6 +77,7 @@ def create_mcp_server(
         register_kandev_tools(server, kandev)
     if codex is not None:
         register_codex_tools(server, codex)
+        register_checkpoint_tools(server, service, CheckpointService(service, codex))
     return server
 
 

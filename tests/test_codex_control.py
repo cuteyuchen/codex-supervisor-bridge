@@ -15,7 +15,8 @@ from codex_supervisor_bridge.integrations.codex_control_errors import (
     CodexPlanGateError,
 )
 from codex_supervisor_bridge.integrations.codex_coordinator import CodexCoordinator
-from codex_supervisor_bridge.memory.models import EventType, TaskPhase
+from codex_supervisor_bridge.memory.execution import acquire_writer
+from codex_supervisor_bridge.memory.models import ActiveWriter, EventType, TaskPhase
 from codex_supervisor_bridge.memory.service import MemoryService
 
 
@@ -307,10 +308,17 @@ def test_plan_gate_execute_steer_interrupt_end_to_end() -> None:
         approved = memory.approve_plan(task.task_id, after_import.revision, draft["plan_id"])
         assert approved.status.value == "APPROVED"
         after_approval = memory.get_task(task.task_id)
+        acquired = acquire_writer(
+            memory.store,
+            task.task_id,
+            after_approval.revision,
+            ActiveWriter.CODEX,
+            explicit_user_authorization=True,
+        )
 
         executed = await coordinator.execute_approved_plan(
             task.task_id,
-            after_approval.revision,
+            acquired.task.revision,
         )
         after_execute = memory.get_task(task.task_id)
         assert after_execute.phase == TaskPhase.IMPLEMENTING
@@ -375,6 +383,14 @@ def test_execute_refuses_remote_plan_drift() -> None:
         current = memory.get_task(task.task_id)
         memory.approve_plan(task.task_id, current.revision, imported["plan"]["plan_id"])
         current = memory.get_task(task.task_id)
+        acquired = acquire_writer(
+            memory.store,
+            task.task_id,
+            current.revision,
+            ActiveWriter.CODEX,
+            explicit_user_authorization=True,
+        )
+        current = acquired.task
 
         state["plan_markdown"] = "# Plan\n\n1. Replace everything with a new subsystem."
         with pytest.raises(CodexPlanGateError, match="no longer matches"):
@@ -382,6 +398,26 @@ def test_execute_refuses_remote_plan_drift() -> None:
 
         assert not any(tool == "approve_plan" for tool, _ in state["calls"])
         assert memory.get_task(task.task_id).revision == current.revision
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        memory.close()
+
+
+def test_codex_mutations_require_active_codex_writer_lease() -> None:
+    server, state = build_fake_codex()
+    memory = MemoryService()
+    task = memory.create_task("GAME-WRITER", "Writer gate", goal="Implement safely")
+    coordinator = CodexCoordinator(memory, lambda: CodexControlAdapter(server))
+
+    async def scenario() -> None:
+        with pytest.raises(CodexPlanGateError, match="active CODEX writer lease"):
+            await coordinator.execute_approved_plan(task.task_id, task.revision)
+        with pytest.raises(CodexPlanGateError, match="active CODEX writer lease"):
+            await coordinator.soft_steer(task.task_id, task.revision, "Continue safely.")
+        assert state["calls"] == []
+        assert memory.get_task(task.task_id).revision == task.revision
 
     try:
         asyncio.run(scenario())

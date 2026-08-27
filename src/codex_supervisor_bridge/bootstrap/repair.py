@@ -58,9 +58,11 @@ class RepairService:
         actions.append(RepairAction(action="generate_mcp_config", status=HealthStatus.READY, message="Local connection settings are ready."))
 
         for process in self.process_manager.statuses():
-            if process.status in {"STALE", "UNKNOWN"}:
+            if process.status in {"STALE", "CRASHED"}:
                 repaired = self.process_manager.repair_stale(process.name)
                 actions.append(RepairAction(action=f"repair_process:{process.name}", status=HealthStatus.READY, message="Stopped process state was recovered.", advanced=repaired.as_dict()))
+            elif process.status == "UNKNOWN":
+                actions.append(RepairAction(action=f"repair_process:{process.name}", status=HealthStatus.DEGRADED, message="A process may still be running; inspect before restarting.", requires_user_action=True, advanced=process.as_dict()))
         project = project_directory or config.basic.project_directory
         if project is None:
             actions.append(RepairAction(action="select_project_directory", status=HealthStatus.DEGRADED, message="Select a project directory to continue.", requires_user_action=True))

@@ -16,6 +16,7 @@ from .configuration import AppConfig, ConfigStore
 from .models import ComponentHealth, DoctorStatus, HealthStatus
 from .paths import AppDataPaths
 from .ports import PortAllocator
+from .process import ProcessManager
 from .remote import SecureRemoteAccessConfig, SecureRemoteAccessValidator
 
 CommandRunner = Callable[[list[str]], subprocess.CompletedProcess[str]]
@@ -40,6 +41,7 @@ class Doctor:
         command_runner: CommandRunner | None = None,
         bind_checker: Callable[[str], bool] | None = None,
         port_allocator: PortAllocator | None = None,
+        process_manager: ProcessManager | None = None,
     ) -> None:
         self.paths = paths or AppDataPaths.from_environment()
         self.config_store = config_store or ConfigStore(paths=self.paths)
@@ -47,6 +49,7 @@ class Doctor:
         self._run = command_runner or self._run_command
         self._can_bind = bind_checker or self._check_bind
         self._ports = port_allocator or PortAllocator()
+        self._process_manager = process_manager
 
     def run(self, options: DoctorOptions | None = None) -> DoctorStatus:
         options = options or DoctorOptions()
@@ -115,11 +118,26 @@ class Doctor:
         )
 
     def _supervisor(self) -> ComponentHealth:
+        process = self._process_manager.health("supervisor") if self._process_manager else None
+        if process and process.status in {"CRASHED", "STALE", "UNKNOWN"}:
+            return ComponentHealth(
+                capability="Supervisor Bridge",
+                status=HealthStatus.DEGRADED,
+                repairable=True,
+                user_message="Development environment needs a restart.",
+                recommended_action="restart_supervisor",
+                advanced=process.as_dict(),
+            )
         return ComponentHealth(
             capability="Supervisor Bridge",
             status=HealthStatus.READY,
             user_message="Development environment is ready.",
-            advanced={"provider": "codex-supervisor-bridge", "version": __version__, "executable": sys.executable},
+            advanced={
+                "provider": "codex-supervisor-bridge",
+                "version": __version__,
+                "executable": sys.executable,
+                "process": process.as_dict() if process else None,
+            },
         )
 
     def _data_directory(self) -> ComponentHealth:

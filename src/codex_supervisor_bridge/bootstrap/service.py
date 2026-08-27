@@ -4,9 +4,12 @@ import shlex
 import sys
 from pathlib import Path
 
+from codex_supervisor_bridge.backends.models import BackendHealth, BackendHealthStatus
+from codex_supervisor_bridge.capabilities import CapabilityResolver
+
 from .configuration import AppConfig, ConfigStore
 from .doctor import Doctor, DoctorOptions
-from .models import BootstrapStatus, HealthStatus, RepairAction
+from .models import BootstrapStatus, DoctorStatus, HealthStatus, RepairAction
 from .paths import AppDataPaths
 from .process import ManagedProcessSpec, ProcessManager
 from .repair import RepairService
@@ -24,9 +27,18 @@ class BootstrapService:
     ) -> None:
         self.paths = paths or AppDataPaths.from_environment()
         self.config_store = config_store or ConfigStore(paths=self.paths)
-        self.doctor = doctor or Doctor(paths=self.paths, config_store=self.config_store)
-        self.repair = repair or RepairService(paths=self.paths, config_store=self.config_store, doctor=self.doctor)
-        self.process_manager = process_manager or self.repair.process_manager
+        self.process_manager = process_manager or ProcessManager(self.paths.runtime, self.paths.logs)
+        self.doctor = doctor or Doctor(
+            paths=self.paths,
+            config_store=self.config_store,
+            process_manager=self.process_manager,
+        )
+        self.repair = repair or RepairService(
+            paths=self.paths,
+            config_store=self.config_store,
+            doctor=self.doctor,
+            process_manager=self.process_manager,
+        )
 
     def status(self, *, project_directory: Path | None = None) -> BootstrapStatus:
         doctor = self.doctor.run(DoctorOptions(project_directory=project_directory))
@@ -36,7 +48,7 @@ class BootstrapService:
             status=doctor.status,
             summary=_summary(doctor.status),
             project_directory=str(project) if project else None,
-            selected_profile=_profile(config),
+            selected_profile=_profile(config, doctor),
             doctor=doctor,
         )
 
@@ -125,9 +137,35 @@ def _summary(status: HealthStatus) -> str:
     }[status]
 
 
-def _profile(config: AppConfig) -> str:
-    return {
-        "automatic": "hybrid",
-        "web_first": "direct",
-        "codex_first": "codex_supervised",
-    }[config.basic.development_style.value]
+def _profile(config: AppConfig, doctor: DoctorStatus) -> str:
+    style = config.basic.development_style.value
+    if style == "web_first":
+        return "direct"
+    if style == "codex_first":
+        return "codex_supervised"
+    health: dict[str, BackendHealth] = {}
+    aliases = {
+        "devspace": "Local workspace",
+        "local_codex_bridge": "Codex control",
+        "kandev": "Fallback workspace",
+        "control_plane": "Fallback control",
+        "github": "GitHub",
+    }
+    for name, label in aliases.items():
+        item = doctor.component(label)
+        if item is None:
+            continue
+        mapped = {
+            HealthStatus.READY: BackendHealthStatus.READY,
+            HealthStatus.DEGRADED: BackendHealthStatus.DEGRADED,
+            HealthStatus.UNAVAILABLE: BackendHealthStatus.UNAVAILABLE,
+            HealthStatus.REPAIRING: BackendHealthStatus.DEGRADED,
+        }[item.status]
+        health[name] = BackendHealth(
+            capability=name,
+            status=mapped,
+            user_message=item.user_message,
+            repairable=item.repairable,
+            technical_detail=str(item.advanced.get("technical_detail", "")),
+        )
+    return CapabilityResolver(health).resolve().profile

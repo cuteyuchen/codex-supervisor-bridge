@@ -344,6 +344,8 @@ The first implementation slice is intentionally backend-neutral and layered:
 - automatic loopback port allocation;
 - structured Doctor and Repair models suitable for CLI and future GUI use;
 - secret storage and secure remote access abstractions with redaction tests;
+- Codex readiness fields for executable/process/version/auth/workspace checks;
+- fail-closed runtime recovery for orphaned Codex writer ownership;
 - fake process/provider harnesses for Profile A/B semantic comparison.
 
 The current code-level work does not claim real Windows OAuth, ChatGPT Web

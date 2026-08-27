@@ -137,6 +137,8 @@ class ProcessManager:
         state = self.health(name)
         process = state._process
         if process is None or state.status != "RUNNING":
+            if state.status in {"CRASHED", "STALE"}:
+                self._lock_path(name).unlink(missing_ok=True)
             return self._record(state)
         process.terminate()
         try:
@@ -187,7 +189,7 @@ class ProcessManager:
 
     def repair_stale(self, name: str) -> ProcessState:
         state = self.health(name)
-        if state.status in {"STALE", "UNKNOWN"}:
+        if state.status in {"STALE", "CRASHED"}:
             state.status = "STOPPED"
             state.pid = None
             state.technical_detail = "stale runtime state cleared"

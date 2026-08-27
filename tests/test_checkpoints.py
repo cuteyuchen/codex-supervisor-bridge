@@ -134,7 +134,7 @@ def test_progress_checkpoint_advances_revision_and_context_hides_raw_delta() -> 
         assert checkpoint.validation["status"] == "passed"
 
         pack = ContextPackBuilder(memory.store).build("CP-1")
-        assert "LATEST CODEX CHECKPOINT" in pack.content
+        assert "LATEST SUPERVISOR CHECKPOINT" in pack.content
         assert "Implemented SaveManager" in pack.content
         assert "src/save_manager.py" in pack.content
         assert "RAW-SECRET-REASONING-DELTA" not in pack.content

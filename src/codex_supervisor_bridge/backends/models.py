@@ -63,6 +63,13 @@ class CommandResult(BaseModel):
 class PendingInteraction(BaseModel):
     interaction_id: str
     kind: str
+    # ``kind`` remains the compact compatibility field used by the existing
+    # Control Plane adapter.  The fields below make provider-neutral pending
+    # approvals/questions explicit for new AgentBackend implementations.
+    type: str | None = None
+    summary: str | None = None
+    options: list[str] = Field(default_factory=list)
+    runtime_reference: dict[str, Any] = Field(default_factory=dict)
     prompt: str | None = None
     thread_id: str | None = None
     turn_id: str | None = None
@@ -95,6 +102,8 @@ class PlanHandle(BaseModel):
     thread_id: str | None = None
     turn_id: str | None = None
     status: str
+    reconciliation_required: bool = False
+    message: str | None = None
 
 
 class DeliveryStatus(BaseModel):

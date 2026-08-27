@@ -3,7 +3,7 @@ from __future__ import annotations
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 
-from codex_supervisor_bridge.backends.models import GitState
+from codex_supervisor_bridge.backends.models import ChangeReview, GitState
 from codex_supervisor_bridge.supervisor.direct_models import (
     DirectWorkspaceOpenResult,
     DirectWorkspacePatchResult,
@@ -105,6 +105,22 @@ def register_direct_workspace_tools(
         supervised task revision.
         """
         return await coordinator.refresh_git_state(task_id)
+
+    @server.tool(annotations=READ_ONLY)
+    @expose_integration_errors
+    async def get_direct_git_state(task_id: str) -> GitState:
+        """Read current branch, HEAD, dirty state, and changed files."""
+        return await coordinator.refresh_git_state(task_id)
+
+    @server.tool(annotations=READ_ONLY)
+    @expose_integration_errors
+    async def get_direct_workspace_changes(task_id: str) -> ChangeReview:
+        """Read the current bounded change summary/review reference.
+
+        This is a semantic review operation. It does not expose DevSpace's raw
+        ``show_changes`` tool or permit model-supplied shell commands.
+        """
+        return await coordinator.show_changes(task_id)
 
     @server.tool(annotations=MUTATION)
     @expose_integration_errors

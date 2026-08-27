@@ -9,13 +9,17 @@ from codex_supervisor_bridge import __version__
 from codex_supervisor_bridge.config import Settings
 from codex_supervisor_bridge.integrations.codex_control_client import CodexControlAdapter
 from codex_supervisor_bridge.integrations.codex_coordinator import CodexCoordinator
+from codex_supervisor_bridge.integrations.control_plane_agent import ControlPlaneAgentBackend
+from codex_supervisor_bridge.integrations.devspace_client import DevSpaceWorkspaceAdapter
 from codex_supervisor_bridge.integrations.kandev_client import KandevAdapter
 from codex_supervisor_bridge.integrations.kandev_coordinator import KandevCoordinator
 from codex_supervisor_bridge.memory.service import MemoryService
 from codex_supervisor_bridge.supervisor.checkpoints import CheckpointService
+from codex_supervisor_bridge.supervisor.direct_workspace import DirectWorkspaceCoordinator
 
 from .checkpoint_tools import register_checkpoint_tools
 from .codex_tools import register_codex_tools
+from .direct_workspace_tools import register_direct_workspace_tools
 from .execution_tools import register_execution_tools
 from .kandev_tools import register_kandev_tools
 from .tools import register_memory_tools
@@ -85,6 +89,7 @@ def create_mcp_server(
     *,
     kandev: KandevCoordinator | None = None,
     codex: CodexCoordinator | None = None,
+    direct_workspace: DirectWorkspaceCoordinator | None = None,
 ) -> MCPServer:
     server = MCPServer(
         "codex-supervisor-bridge",
@@ -95,11 +100,25 @@ def create_mcp_server(
     )
     register_memory_tools(server, service)
     register_execution_tools(server, service)
+    if direct_workspace is None:
+        direct_workspace = DirectWorkspaceCoordinator(
+            service,
+            lambda: DevSpaceWorkspaceAdapter(),
+        )
+    register_direct_workspace_tools(server, direct_workspace)
     if kandev is not None:
         register_kandev_tools(server, kandev)
     if codex is not None:
         register_codex_tools(server, codex)
-        register_checkpoint_tools(server, service, CheckpointService(service, codex))
+        register_checkpoint_tools(
+            server,
+            service,
+            CheckpointService(
+                service,
+                codex,
+                agent_backend=ControlPlaneAgentBackend(codex.adapter_factory),
+            ),
+        )
     return server
 
 
@@ -140,6 +159,11 @@ def build_parser(settings: Settings | None = None) -> argparse.ArgumentParser:
         help="Kandev external MCP endpoint (advanced fallback; default local endpoint)",
     )
     parser.add_argument(
+        "--devspace-mcp-url",
+        default=settings.devspace_mcp_url,
+        help="DevSpace workspace MCP endpoint (advanced; default local endpoint)",
+    )
+    parser.add_argument(
         "--codex-control-command",
         default=settings.codex_control_command,
         help="Codex Control Plane executable (advanced fallback)",
@@ -156,6 +180,8 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("--mcp-path must start with '/'")
     if not args.kandev_mcp_url.strip():
         parser.error("--kandev-mcp-url must not be empty")
+    if not args.devspace_mcp_url.strip():
+        parser.error("--devspace-mcp-url must not be empty")
     if not args.codex_control_command.strip():
         parser.error("--codex-control-command must not be empty")
 
@@ -164,6 +190,10 @@ def main(argv: list[str] | None = None) -> None:
         service,
         lambda: KandevAdapter(args.kandev_mcp_url),
     )
+    direct_workspace = DirectWorkspaceCoordinator(
+        service,
+        lambda: DevSpaceWorkspaceAdapter(args.devspace_mcp_url),
+    )
     codex = CodexCoordinator(
         service,
         lambda: CodexControlAdapter.stdio(
@@ -171,7 +201,12 @@ def main(argv: list[str] | None = None) -> None:
             env={"CODEX_MCP_EXECUTION_MODE": "client"},
         ),
     )
-    server = create_mcp_server(service, kandev=kandev, codex=codex)
+    server = create_mcp_server(
+        service,
+        kandev=kandev,
+        codex=codex,
+        direct_workspace=direct_workspace,
+    )
     try:
         if args.transport == "stdio":
             server.run(transport="stdio")

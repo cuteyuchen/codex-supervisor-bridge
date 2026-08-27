@@ -114,6 +114,10 @@ def bind_workspace(
         ).fetchone()
         if existing_row is not None:
             existing = _binding_from_row(existing_row)
+            if existing.state == WorkspaceBindingStatus.RECONCILIATION_REQUIRED:
+                raise ConflictError(
+                    "Workspace requires reconciliation before replacing the supervised workspace"
+                )
             if (
                 existing.backend_name == backend_name
                 and existing.workspace_id == workspace_id

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from codex_supervisor_bridge.backends.agent import AgentBackend
+from codex_supervisor_bridge.backends.models import AgentSnapshot, PlanHandle
 from codex_supervisor_bridge.integrations.codex_coordinator import CodexCoordinator
 from codex_supervisor_bridge.memory.checkpoint_models import (
     CheckpointCreateResult,
@@ -169,6 +171,7 @@ def normalize_progress_snapshot(
     next_action = _string(operation, "nextRecommendedAction", "next_action") or _string(
         workflow, "nextRecommendedAction", "next_action"
     )
+
     last_error = _string(operation, "lastError", "last_error") or _string(
         workflow, "lastError", "last_error"
     )
@@ -298,10 +301,101 @@ def normalize_progress_snapshot(
     )
 
 
+def normalize_agent_snapshot(
+    snapshot: AgentSnapshot,
+    *,
+    previous: CodexCheckpoint | None,
+    force_heartbeat: bool,
+    now: datetime | None = None,
+) -> NormalizedProgress:
+    """Classify an already provider-neutral AgentSnapshot for checkpoint storage."""
+
+    status = snapshot.status or None
+    gate_reasons: list[str] = []
+    if snapshot.pending_interactions:
+        gate_reasons.append("Codex requires approval or user input")
+    if snapshot.blockers:
+        gate_reasons.append("Agent snapshot contains blockers")
+    if (status or "").lower() in _GATE_STATUS or (status or "").upper() == "UNKNOWN":
+        gate_reasons.append(f"runtime status is {status}")
+    validation_status = str(snapshot.validation.get("status") or "").lower()
+    if validation_status in {"failed", "failure", "error"}:
+        gate_reasons.append("validation failure detected")
+
+    previous_status = previous.remote_status if previous else None
+    material_progress = bool(
+        snapshot.completed
+        or snapshot.in_progress
+        or snapshot.files_changed
+        or snapshot.validation
+        or snapshot.assumptions
+        or snapshot.deviations
+        or snapshot.risks
+        or snapshot.next_steps
+        or (previous is not None and status and status != previous_status)
+    )
+    if gate_reasons:
+        checkpoint_type = CheckpointType.GATE
+        trigger = "; ".join(_unique(gate_reasons, 4))
+    elif material_progress:
+        checkpoint_type = CheckpointType.PROGRESS
+        trigger = "meaningful agent progress/state change"
+    else:
+        checkpoint_type = CheckpointType.HEARTBEAT
+        trigger = "forced heartbeat" if force_heartbeat else "no high-signal progress change"
+
+    normalized = {
+        "type": checkpoint_type.value,
+        "status": status,
+        "completed": snapshot.completed,
+        "in_progress": snapshot.in_progress,
+        "files": snapshot.files_changed,
+        "validation": snapshot.validation,
+        "assumptions": snapshot.assumptions,
+        "deviations": snapshot.deviations,
+        "blockers": snapshot.blockers,
+        "risks": snapshot.risks,
+        "next_steps": snapshot.next_steps,
+        "interaction_count": len(snapshot.pending_interactions),
+    }
+    if checkpoint_type == CheckpointType.HEARTBEAT:
+        instant = (now or datetime.now(timezone.utc)).timestamp()
+        normalized["heartbeat_bucket"] = int(instant // 180)
+    fingerprint = hashlib.sha256(
+        json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return NormalizedProgress(
+        checkpoint_type=checkpoint_type,
+        trigger_reason=trigger,
+        source_fingerprint=fingerprint,
+        remote_status=status,
+        next_action=snapshot.next_steps[0] if snapshot.next_steps else None,
+        completed=_unique(snapshot.completed),
+        in_progress=_unique(snapshot.in_progress),
+        files_changed=_unique(snapshot.files_changed),
+        validation=snapshot.validation,
+        assumptions=_unique(snapshot.assumptions),
+        deviations=_unique(snapshot.deviations),
+        blockers=_unique(snapshot.blockers),
+        risks=_unique(snapshot.risks),
+        next_steps=_unique(snapshot.next_steps),
+        raw_event_count=snapshot.raw_event_count,
+    )
+
+
 class CheckpointService:
-    def __init__(self, memory: MemoryService, codex: CodexCoordinator) -> None:
+    def __init__(
+        self,
+        memory: MemoryService,
+        codex: CodexCoordinator | None = None,
+        *,
+        agent_backend: AgentBackend | None = None,
+    ) -> None:
+        if codex is None and agent_backend is None:
+            raise ValueError("codex or agent_backend is required")
         self.memory = memory
         self.codex = codex
+        self.agent_backend = agent_backend
 
     async def collect(
         self,
@@ -314,7 +408,19 @@ class CheckpointService:
         operation: dict[str, Any] = {}
         workflow: dict[str, Any] | None = None
         pending: dict[str, Any] | None = None
-        if runtime is not None:
+        snapshot: AgentSnapshot | None = None
+        if runtime is not None and self.agent_backend is not None:
+            snapshot = await self.agent_backend.observe(
+                PlanHandle(
+                    operation_id=runtime.operation_id,
+                    workflow_id=runtime.workflow_id,
+                    thread_id=runtime.thread_id,
+                    turn_id=runtime.turn_id,
+                    status=runtime.remote_status or "unknown",
+                )
+            )
+        elif runtime is not None:
+            assert self.codex is not None
             async with self.codex.adapter_factory() as adapter:
                 if runtime.operation_id:
                     operation = await adapter.get_operation_status(runtime.operation_id)
@@ -327,22 +433,29 @@ class CheckpointService:
                     turn_id=runtime.turn_id,
                 )
         previous = latest_checkpoint(self.memory.store, task_id)
-        normalized = normalize_progress_snapshot(
-            operation,
-            workflow,
-            pending,
-            previous=previous,
-            force_heartbeat=force_heartbeat,
-        )
+        if snapshot is not None:
+            normalized = normalize_agent_snapshot(
+                snapshot,
+                previous=previous,
+                force_heartbeat=force_heartbeat,
+            )
+        else:
+            normalized = normalize_progress_snapshot(
+                operation,
+                workflow,
+                pending,
+                previous=previous,
+                force_heartbeat=force_heartbeat,
+            )
         runtime_values = {
-            "workflow_id": runtime.workflow_id if runtime else None,
-            "operation_id": runtime.operation_id if runtime else None,
-            "thread_id": runtime.thread_id if runtime else None,
-            "turn_id": runtime.turn_id if runtime else None,
+            "workflow_id": snapshot.workflow_id if snapshot else runtime.workflow_id if runtime else None,
+            "operation_id": snapshot.operation_id if snapshot else runtime.operation_id if runtime else None,
+            "thread_id": snapshot.thread_id if snapshot else runtime.thread_id if runtime else None,
+            "turn_id": snapshot.turn_id if snapshot else runtime.turn_id if runtime else None,
             "remote_status": normalized.remote_status,
             "next_action": normalized.next_action,
         }
-        evidence_refs = []
+        evidence_refs = list(snapshot.evidence_refs) if snapshot else []
         if runtime and runtime.operation_id:
             evidence_refs.append(f"codex-operation:{runtime.operation_id}")
         if runtime and runtime.workflow_id:

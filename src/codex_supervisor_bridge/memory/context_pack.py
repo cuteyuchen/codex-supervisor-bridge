@@ -18,6 +18,7 @@ from .models import (
     TaskMemory,
 )
 from .store import MemoryStore
+from .workspace import get_prepared_direct_operation, get_workspace_binding
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,8 @@ class ContextPackBuilder:
     ) -> BuiltContextPack:
         task = self.store.get_task(task_id)
         execution = get_execution_state(self.store, task_id)
+        workspace = get_workspace_binding(self.store, task_id)
+        prepared_operation = get_prepared_direct_operation(self.store, task_id)
         constraints = self.store.active_constraints(task_id)
         decisions = self.store.active_decisions(task_id)
         approved_plan = self.store.approved_plan(task_id)
@@ -66,6 +69,12 @@ class ContextPackBuilder:
 
         mandatory.append(("TASK", self._task_header(task, mode)))
         mandatory.append(("EXECUTION STATE", self._execution_state(execution)))
+        mandatory.append(
+            (
+                "WORKSPACE STATE",
+                self._workspace_state(workspace, prepared_operation),
+            )
+        )
         mandatory.append(("USER GOAL", task.current_goal or "No explicit goal recorded."))
 
         hard_constraints = [
@@ -105,6 +114,15 @@ class ContextPackBuilder:
         )
         mandatory.append(("CURRENT STATE", state_text))
 
+        checkpoint = latest_checkpoint(self.store, task_id)
+        review = get_checkpoint_review(self.store, checkpoint.checkpoint_id) if checkpoint else None
+        mandatory.append(
+            (
+                "LATEST SUPERVISOR CHECKPOINT",
+                self._checkpoint(checkpoint, review),
+            )
+        )
+
         soft_constraints = [
             item for item in constraints if item.severity != ConstraintSeverity.HARD
         ]
@@ -119,15 +137,6 @@ class ContextPackBuilder:
                     ],
                     empty="No active SOFT/PREFERENCE constraints.",
                 ),
-            )
-        )
-
-        checkpoint = latest_checkpoint(self.store, task_id)
-        review = get_checkpoint_review(self.store, checkpoint.checkpoint_id) if checkpoint else None
-        optional.append(
-            (
-                "LATEST SUPERVISOR CHECKPOINT",
-                self._checkpoint(checkpoint, review),
             )
         )
 
@@ -280,6 +289,33 @@ class ContextPackBuilder:
                 ),
             ]
         )
+
+    @staticmethod
+    def _workspace_state(workspace: object | None, prepared_operation: object | None) -> str:
+        if workspace is None:
+            return "No supervised workspace binding recorded."
+        rows = [
+            f"Backend: {workspace.backend_name}",
+            f"Workspace ID: {workspace.workspace_id}",
+            f"Repository: {workspace.repository}",
+            f"Workspace Mode: {workspace.workspace_mode}",
+            f"Git HEAD: {workspace.git_head or '-'}",
+            f"Dirty: {workspace.dirty}",
+            "Changed Files: " + (" | ".join(workspace.changed_files[:20]) or "-"),
+            f"Latest Review Ref: {workspace.last_review_ref or '-'}",
+            f"Binding State: {workspace.state.value}",
+        ]
+        if workspace.state.value == "RECONCILIATION_REQUIRED":
+            rows.insert(0, "RECONCILIATION REQUIRED: all writer transitions and new writes are blocked.")
+        if prepared_operation is not None:
+            rows.insert(
+                0,
+                "PREPARED DIRECT OPERATION: writer transition is blocked until it is finalized or reconciled.",
+            )
+            rows.append(
+                f"Prepared Operation: {prepared_operation.operation_id} / {prepared_operation.operation_type}"
+            )
+        return "\n".join(rows)
 
     @classmethod
     def _events(cls, events: list[TaskEvent], *, empty: str) -> str:

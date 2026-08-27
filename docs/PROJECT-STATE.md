@@ -276,9 +276,6 @@ Its task checkpoint is not a replacement for Supervisor Core because it is keyed
 - **P3 — Kandev Adapter**
 - **P4 — Codex Live Control / Plan Gate / Steer / Interrupt**
 - **P5 — Structured Checkpoints / Supervisor Review**
-
-### In progress
-
 - **P6 — Human hard override and hard replan**
   - Work Snapshot;
   - intent version bump;
@@ -288,9 +285,37 @@ Its task checkpoint is not a replacement for Supervisor Core because it is keyed
   - read-only replan transition;
   - stale-revision protection.
 
+### Current branch: P6.5 implementation status
+
+The `feat/p6-5-execution-backends` branch contains the P6.5 implementation and
+is ready for a Draft PR review. The following behaviors are implemented and
+covered by fake/protocol tests:
+
+- task-scoped `DIRECT` / `HYBRID` / `CODEX_SUPERVISED` modes;
+- `MANUAL_ONLY` / `SUPERVISOR_ALLOWED` delegation policy;
+- durable `active_writer` + `writer_epoch` single-writer fencing;
+- revision/epoch-fenced handoff and handback state;
+- two-phase direct mutation (`PREPARED` -> external change -> evidence -> final);
+- `RECONCILIATION_REQUIRED` fail-closed behavior;
+- semantic Direct Workspace MCP tools backed by `WorkspaceBackend` and DevSpace;
+- Local-Codex-Bridge `AgentBackend` with same-turn steer, observe, interrupt,
+  pending interaction normalization, and UNKNOWN acknowledgement semantics;
+- existing Control Plane wrapped by the same backend-neutral AgentSnapshot model;
+- CheckpointService consumption of normalized AgentSnapshot data;
+- automatic capability resolution with user-facing `READY` / `DEGRADED` /
+  `UNAVAILABLE` summaries that hide backend jargon;
+- Context Pack preservation of execution state, workspace identity, Git/review
+  evidence, checkpoints, and reconciliation warnings;
+- SQLite persistence/recovery for task, execution, workspace, direct operation,
+  handoff, review, and checkpoint state.
+
+P6.5 deliberately does **not** claim real Windows installation, Local-Codex-
+Bridge process startup, DevSpace OAuth, or ChatGPT Remote MCP tunnel proof.
+Those are P6.6 integration gates.
+
 ### Revised next phases
 
-#### P6.5 — Execution Modes + Backend Abstraction
+#### P6.5 — Execution Modes + Backend Abstraction (implemented on current branch)
 
 - task-scoped DIRECT / HYBRID / CODEX_SUPERVISED mode;
 - MANUAL_ONLY / SUPERVISOR_ALLOWED delegation policy;
@@ -301,7 +326,8 @@ Its task checkpoint is not a replacement for Supervisor Core because it is keyed
 - DevSpace direct-workspace adapter;
 - Local-Codex-Bridge agent adapter;
 - backend-neutral AgentSnapshot consumed by checkpoints;
-- capability/configuration resolver.
+- capability/configuration resolver;
+- low-learning-cost / zero-config normal workflow principle.
 
 #### P6.6 — Windows integration A/B proof
 
@@ -331,7 +357,9 @@ Automate recurring checkpoint collection, supervisor decisions, steer/replan/fix
 
 ## Configuration and capability resolver
 
-P6.5 must introduce an automatic resolver that detects available local capabilities and chooses/repairs backend components without requiring normal users to select backends manually.
+P6.5 introduces an automatic resolver that detects available local capabilities
+and chooses/repairs backend components without requiring normal users to select
+backends manually.
 
 Expected responsibilities:
 

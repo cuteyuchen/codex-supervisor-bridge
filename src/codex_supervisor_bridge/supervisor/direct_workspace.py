@@ -86,6 +86,10 @@ class DirectWorkspaceCoordinator:
             raise ValueError("Task has no repository/project path to open")
 
         existing = get_workspace_binding(self.memory.store, task_id)
+        if existing is not None and existing.state == WorkspaceBindingStatus.RECONCILIATION_REQUIRED:
+            raise ValueError(
+                "Workspace requires reconciliation before opening or replacing the supervised workspace"
+            )
         if (
             existing is not None
             and existing.state == WorkspaceBindingStatus.ACTIVE

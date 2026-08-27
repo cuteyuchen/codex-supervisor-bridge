@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, computed_field, model_validator
 
 
 class KandevCreateTaskRequest(BaseModel):
@@ -45,6 +45,7 @@ class KandevCapabilities(BaseModel):
     tools: list[str]
     missing_required_tools: list[str] = Field(default_factory=list)
 
+    @computed_field
     @property
     def compatible(self) -> bool:
         return not self.missing_required_tools

@@ -4,7 +4,15 @@ import json
 from typing import Any
 
 from .errors import ConflictError
-from .models import Actor, EventType, PlanStatus, TaskPhase, utcnow
+from .models import (
+    Actor,
+    Decision,
+    DecisionStatus,
+    EventType,
+    PlanStatus,
+    TaskPhase,
+    utcnow,
+)
 from .replan_models import (
     HardReplan,
     HardReplanBeginResult,
@@ -27,6 +35,30 @@ def _load_dict(value: str | None) -> dict[str, Any]:
         return {}
     decoded = json.loads(value)
     return decoded if isinstance(decoded, dict) else {}
+
+
+def _disposition_content(
+    *,
+    keep: list[str],
+    modify: list[str],
+    drop: list[str],
+    notes: str | None,
+) -> str:
+    def joined(values: list[str]) -> str:
+        return ", ".join(values) if values else "(none)"
+
+    rows = [
+        f"KEEP: {joined(keep)}",
+        f"MODIFY: {joined(modify)}",
+        f"DROP: {joined(drop)}",
+    ]
+    if notes and notes.strip():
+        rows.append(f"Notes: {notes.strip()}")
+    rows.append(
+        "This disposition is planning metadata only; it does not authorize file deletion, "
+        "code mutation, or reuse of a superseded implementation plan."
+    )
+    return "\n".join(rows)
 
 
 def snapshot_from_row(row: Any) -> WorkSnapshot:
@@ -156,14 +188,53 @@ def begin_hard_replan(
             (HardReplanStatus.SUPERSEDED.value, now_text, task_id),
         )
 
-        active_plan = conn.execute(
+        disposition_rows = conn.execute(
+            """
+            SELECT * FROM task_decisions
+            WHERE task_id = ? AND decision_type = ? AND status = ?
+            ORDER BY created_at, decision_id
+            """,
+            (
+                task_id,
+                "work_snapshot_classification",
+                DecisionStatus.ACTIVE.value,
+            ),
+        ).fetchall()
+        if disposition_rows:
+            conn.execute(
+                """
+                UPDATE task_decisions
+                SET status = ?, superseded_by = NULL, updated_at = ?
+                WHERE task_id = ? AND decision_type = ? AND status = ?
+                """,
+                (
+                    DecisionStatus.SUPERSEDED.value,
+                    now_text,
+                    task_id,
+                    "work_snapshot_classification",
+                    DecisionStatus.ACTIVE.value,
+                ),
+            )
+            for row in disposition_rows:
+                store._upsert_document(
+                    conn,
+                    task_id,
+                    "decision",
+                    row["decision_id"],
+                    row["title"],
+                    row["content"],
+                    DecisionStatus.SUPERSEDED.value,
+                )
+
+        active_plan_rows = conn.execute(
             """
             SELECT * FROM task_plans
             WHERE task_id = ? AND status IN (?, ?)
-            ORDER BY plan_version DESC LIMIT 1
+            ORDER BY plan_version DESC
             """,
             (task_id, PlanStatus.APPROVED.value, PlanStatus.DRAFT.value),
-        ).fetchone()
+        ).fetchall()
+        active_plan = active_plan_rows[0] if active_plan_rows else None
         checkpoint = conn.execute(
             "SELECT * FROM codex_checkpoints WHERE task_id = ? ORDER BY sequence DESC LIMIT 1",
             (task_id,),
@@ -209,25 +280,37 @@ def begin_hard_replan(
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                snapshot.snapshot_id, snapshot.task_id, snapshot.captured_revision,
-                snapshot.intent_version, snapshot.plan_version, snapshot.goal,
-                snapshot.phase, snapshot.approved_plan_id, snapshot.kandev_task_id,
-                snapshot.git_branch, snapshot.git_head, snapshot.checkpoint_id,
-                snapshot.codex_workflow_id, snapshot.operation_id, snapshot.thread_id,
-                snapshot.turn_id, snapshot.remote_status, _json(snapshot.changed_files),
-                _json(snapshot.validation), _json(snapshot.evidence_refs), "[]", "[]", "[]",
-                None, snapshot.classification_status.value, now_text, now_text,
+                snapshot.snapshot_id,
+                snapshot.task_id,
+                snapshot.captured_revision,
+                snapshot.intent_version,
+                snapshot.plan_version,
+                snapshot.goal,
+                snapshot.phase,
+                snapshot.approved_plan_id,
+                snapshot.kandev_task_id,
+                snapshot.git_branch,
+                snapshot.git_head,
+                snapshot.checkpoint_id,
+                snapshot.codex_workflow_id,
+                snapshot.operation_id,
+                snapshot.thread_id,
+                snapshot.turn_id,
+                snapshot.remote_status,
+                _json(snapshot.changed_files),
+                _json(snapshot.validation),
+                _json(snapshot.evidence_refs),
+                "[]",
+                "[]",
+                "[]",
+                None,
+                snapshot.classification_status.value,
+                now_text,
+                now_text,
             ),
         )
 
-        if active_plan is not None:
-            active_ids = [
-                row["plan_id"]
-                for row in conn.execute(
-                    "SELECT plan_id FROM task_plans WHERE task_id = ? AND status IN (?, ?)",
-                    (task_id, PlanStatus.APPROVED.value, PlanStatus.DRAFT.value),
-                ).fetchall()
-            ]
+        if active_plan_rows:
             conn.execute(
                 "UPDATE task_plans SET status = ?, updated_at = ? "
                 "WHERE task_id = ? AND status IN (?, ?)",
@@ -239,12 +322,14 @@ def begin_hard_replan(
                     PlanStatus.DRAFT.value,
                 ),
             )
-            for plan_id in active_ids:
-                store._sync_document_status(
+            for row in active_plan_rows:
+                store._upsert_document(
                     conn,
                     task_id,
                     "plan",
-                    plan_id,
+                    row["plan_id"],
+                    f"Plan V{row['plan_version']}",
+                    row["content"],
                     PlanStatus.SUPERSEDED.value,
                 )
 
@@ -281,10 +366,20 @@ def begin_hard_replan(
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                replan.replan_id, replan.task_id, replan.snapshot_id, replan.status.value,
-                replan.from_intent_version, replan.target_intent_version,
-                replan.previous_plan_id, None, replan.new_goal, replan.reason,
-                None, None, now_text, now_text,
+                replan.replan_id,
+                replan.task_id,
+                replan.snapshot_id,
+                replan.status.value,
+                replan.from_intent_version,
+                replan.target_intent_version,
+                replan.previous_plan_id,
+                None,
+                replan.new_goal,
+                replan.reason,
+                None,
+                None,
+                now_text,
+                now_text,
             ),
         )
         if runtime is not None:
@@ -317,7 +412,7 @@ def begin_hard_replan(
                 "replan_id": replan.replan_id,
             },
         )
-        if active_plan is not None:
+        if active_plan_rows:
             store._insert_event(
                 conn,
                 task,
@@ -326,6 +421,19 @@ def begin_hard_replan(
                 {
                     "reason": "hard_replan",
                     "previous_plan_id": snapshot.approved_plan_id,
+                    "replan_id": replan.replan_id,
+                    "superseded_plan_ids": [row["plan_id"] for row in active_plan_rows],
+                },
+            )
+        for row in disposition_rows:
+            store._insert_event(
+                conn,
+                task,
+                Actor.SUPERVISOR,
+                EventType.DECISION_SUPERSEDED,
+                {
+                    "decision_id": row["decision_id"],
+                    "reason": "new_hard_replan",
                     "replan_id": replan.replan_id,
                 },
             )
@@ -399,7 +507,10 @@ def finalize_interrupt(
             },
         )
         updated_replan = replan_from_row(
-            conn.execute("SELECT * FROM hard_replans WHERE replan_id = ?", (replan_id,)).fetchone()
+            conn.execute(
+                "SELECT * FROM hard_replans WHERE replan_id = ?",
+                (replan_id,),
+            ).fetchone()
         )
         snapshot = snapshot_from_row(
             conn.execute(
@@ -449,15 +560,21 @@ def classify_work_snapshot(
             WHERE snapshot_id = ? AND task_id = ?
             """,
             (
-                _json(keep), _json(modify), _json(drop), (notes or "").strip() or None,
-                SnapshotClassificationStatus.CLASSIFIED.value, now_text, snapshot_id, task_id,
+                _json(keep),
+                _json(modify),
+                _json(drop),
+                (notes or "").strip() or None,
+                SnapshotClassificationStatus.CLASSIFIED.value,
+                now_text,
+                snapshot_id,
+                task_id,
             ),
         )
         conn.execute(
             "UPDATE hard_replans SET status = ?, updated_at = ? WHERE replan_id = ?",
             (HardReplanStatus.READY_TO_PLAN.value, now_text, replan.replan_id),
         )
-        task = store._update_task(
+        classified_task = store._update_task(
             conn,
             task_id,
             expected_revision,
@@ -468,7 +585,7 @@ def classify_work_snapshot(
         )
         store._insert_event(
             conn,
-            task,
+            classified_task,
             Actor.SUPERVISOR,
             EventType.STATE_RECONCILED,
             {
@@ -480,6 +597,74 @@ def classify_work_snapshot(
                 "drop": drop,
             },
         )
+
+        decision_task = store._update_task(
+            conn,
+            task_id,
+            classified_task.revision,
+        )
+        event_id = _id("ev")
+        decision = Decision(
+            decision_id=_id("dec"),
+            task_id=task_id,
+            decision_type="work_snapshot_classification",
+            title="Hard replan work disposition",
+            content=_disposition_content(
+                keep=keep,
+                modify=modify,
+                drop=drop,
+                notes=notes,
+            ),
+            source_event_id=event_id,
+            created_intent_version=decision_task.intent_version,
+        )
+        conn.execute(
+            """
+            INSERT INTO task_decisions(
+                decision_id, task_id, decision_type, status, title, content,
+                source_event_id, created_intent_version, superseded_by,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                decision.decision_id,
+                decision.task_id,
+                decision.decision_type,
+                decision.status.value,
+                decision.title,
+                decision.content,
+                decision.source_event_id,
+                decision.created_intent_version,
+                None,
+                _iso(decision.created_at),
+                _iso(decision.updated_at),
+            ),
+        )
+        store._insert_event(
+            conn,
+            decision_task,
+            Actor.SUPERVISOR,
+            EventType.DECISION_ADDED,
+            {
+                "decision_id": decision.decision_id,
+                "decision_type": decision.decision_type,
+                "title": decision.title,
+                "content": decision.content,
+                "snapshot_id": snapshot_id,
+                "replan_id": replan.replan_id,
+            },
+            event_id=event_id,
+        )
+        store._upsert_document(
+            conn,
+            task_id,
+            "decision",
+            decision.decision_id,
+            decision.title,
+            decision.content,
+            decision.status.value,
+        )
+
         snapshot = snapshot_from_row(
             conn.execute(
                 "SELECT * FROM work_snapshots WHERE snapshot_id = ?",
@@ -492,7 +677,12 @@ def classify_work_snapshot(
                 (replan.replan_id,),
             ).fetchone()
         )
-        return HardReplanBeginResult(task=task, snapshot=snapshot, replan=updated_replan)
+        return HardReplanBeginResult(
+            task=decision_task,
+            snapshot=snapshot,
+            replan=updated_replan,
+            classification_decision=decision,
+        )
 
 
 def bind_replan_workflow(

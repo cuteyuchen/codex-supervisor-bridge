@@ -25,7 +25,15 @@ from .configuration import (
     DevelopmentStyle,
 )
 from .doctor import Doctor, DoctorOptions
-from .harness import HarnessComparison, HarnessStep, HarnessTrace, ProfileABHarness
+from .harness import (
+    HarnessComparison,
+    HarnessStep,
+    HarnessTrace,
+    ProfileABHarness,
+    ProfileScenarioDriver,
+    ProfileScenarioRunner,
+    ScenarioObservation,
+)
 from .models import (
     BootstrapStatus,
     ComponentHealth,
@@ -93,6 +101,9 @@ __all__ = [
     "SecureRemoteAccessController",
     "SecureRemoteAccessValidator",
     "ProfileABHarness",
+    "ProfileScenarioDriver",
+    "ProfileScenarioRunner",
+    "ScenarioObservation",
     "WindowsDpapiSecretStore",
     "authorize_command",
     "FirstAuthorizationFlow",

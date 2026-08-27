@@ -49,6 +49,16 @@ class SecureRemoteAccessController:
     def stop(self) -> None:
         self._active = False
 
+    def reconnect(self) -> dict[str, str]:
+        if self._config is None:
+            raise RuntimeError("secure remote access has not been configured")
+        self._active = False
+        return self.start(self._config)
+
+    def rotate(self, config: SecureRemoteAccessConfig) -> dict[str, str]:
+        self.stop()
+        return self.start(config)
+
     def health(self) -> dict[str, str | bool | None]:
         return {
             "active": self._active,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Callable
+from typing import Callable, Protocol
 
 from pydantic import BaseModel, Field
 
@@ -44,6 +44,46 @@ class HarnessTrace(BaseModel):
             tuple(self.revisions),
             tuple(self.writer_history),
             tuple(self.evidence),
+        )
+
+
+class ScenarioObservation(BaseModel):
+    """Provider-neutral observation emitted by a fake or real profile driver."""
+
+    task_id: str
+    workspace_identity: str
+    status: str = "ok"
+    revision: int = Field(ge=0)
+    writer: str = "NONE"
+    evidence: list[str] = Field(default_factory=list)
+
+
+class ProfileScenarioDriver(Protocol):
+    def execute(self, step: HarnessStep, *, task_id: str) -> ScenarioObservation: ...
+
+
+class ProfileScenarioRunner:
+    def run(self, *, profile: str, task_id: str, driver: ProfileScenarioDriver) -> HarnessTrace:
+        observations: list[ScenarioObservation] = [
+            driver.execute(step, task_id=task_id) for step in HarnessStep
+        ]
+        if any(observation.task_id != task_id for observation in observations):
+            raise ValueError("scenario driver changed the canonical task identity")
+        failed = next((observation for observation in observations if observation.status != "ok"), None)
+        if failed is not None:
+            raise RuntimeError(f"profile scenario failed at revision {failed.revision}")
+        return HarnessTrace(
+            profile=profile,
+            task_id=task_id,
+            workspace_identity=observations[0].workspace_identity,
+            steps=list(HarnessStep),
+            revisions=[observation.revision for observation in observations],
+            writer_history=[observation.writer for observation in observations],
+            evidence=[
+                evidence
+                for observation in observations
+                for evidence in observation.evidence
+            ],
         )
 
 

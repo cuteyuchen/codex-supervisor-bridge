@@ -25,6 +25,8 @@ from codex_supervisor_bridge.bootstrap import (
     PortAllocator,
     ProcessManager,
     ProfileABHarness,
+    ProfileScenarioRunner,
+    ScenarioObservation,
     SecureRemoteAccessConfig,
     SecureRemoteAccessController,
     SecureRemoteAccessValidator,
@@ -205,6 +207,14 @@ def test_secret_store_round_trip_and_remote_access_security_gate() -> None:
     assert connected["status"] == "connected"
     remote.stop()
     assert remote.health()["active"] is False
+    assert remote.reconnect()["status"] == "connected"
+    assert remote.rotate(
+        SecureRemoteAccessConfig(
+            public_url="https://example.invalid/rotated",
+            auth_secret_ref="chatgpt",
+            session_identity="session-2",
+        )
+    )["session_identity"] == "session-2"
 
 
 def test_first_authorization_flow_keeps_credentials_out_of_result() -> None:
@@ -293,3 +303,20 @@ def test_profile_ab_harness_compares_normalized_supervisor_semantics() -> None:
     comparison = ProfileABHarness(lambda: trace("A"), lambda: trace("B")).run()
     assert comparison.equivalent is True
     assert comparison.differences == []
+
+
+def test_profile_scenario_runner_executes_all_required_steps_without_raw_payloads() -> None:
+    class FakeDriver:
+        def execute(self, step: HarnessStep, *, task_id: str) -> ScenarioObservation:
+            return ScenarioObservation(
+                task_id=task_id,
+                workspace_identity=f"workspace-{step.value}",
+                revision=list(HarnessStep).index(step),
+                writer="CODEX" if step in {HarnessStep.CODEX_EXECUTION, HarnessStep.OBSERVE} else "CHATGPT",
+                evidence=[step.value],
+            )
+
+    trace = ProfileScenarioRunner().run(profile="A", task_id="task-1", driver=FakeDriver())
+    assert trace.steps == list(HarnessStep)
+    assert len(trace.evidence) == len(HarnessStep)
+    assert not hasattr(trace, "raw_payload")

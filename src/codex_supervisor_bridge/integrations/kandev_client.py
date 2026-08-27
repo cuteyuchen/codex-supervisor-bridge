@@ -5,7 +5,7 @@ from typing import Any
 
 from mcp import Client
 
-from . import kandev_errors, kandev_models
+from codex_supervisor_bridge.integrations import kandev_errors, kandev_models
 
 
 REQUIRED_EXTERNAL_TOOLS = {

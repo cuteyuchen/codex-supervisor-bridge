@@ -4,7 +4,7 @@ import json
 from typing import Any
 
 from .errors import ConflictError
-from .models import Actor, EventType, PlanStatus, TaskMemory, TaskPhase, utcnow
+from .models import Actor, EventType, PlanStatus, TaskPhase, utcnow
 from .replan_models import (
     HardReplan,
     HardReplanBeginResult,

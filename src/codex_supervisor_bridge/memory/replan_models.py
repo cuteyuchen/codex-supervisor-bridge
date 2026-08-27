@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from .models import TaskMemory, utcnow
+from .models import Decision, TaskMemory, utcnow
 
 
 class SnapshotClassificationStatus(str, Enum):
@@ -76,3 +76,4 @@ class HardReplanBeginResult(BaseModel):
     task: TaskMemory
     snapshot: WorkSnapshot
     replan: HardReplan
+    classification_decision: Decision | None = None

@@ -6,6 +6,8 @@ from math import ceil
 
 from .checkpoint_reviews import get_checkpoint_review
 from .checkpoint_store import latest_checkpoint
+from .execution import get_execution_state
+from .execution_models import ExecutionState
 from .models import (
     Actor,
     ConstraintSeverity,
@@ -52,6 +54,7 @@ class ContextPackBuilder:
         persist_snapshot: bool = False,
     ) -> BuiltContextPack:
         task = self.store.get_task(task_id)
+        execution = get_execution_state(self.store, task_id)
         constraints = self.store.active_constraints(task_id)
         decisions = self.store.active_decisions(task_id)
         approved_plan = self.store.approved_plan(task_id)
@@ -62,6 +65,7 @@ class ContextPackBuilder:
         optional: list[tuple[str, str]] = []
 
         mandatory.append(("TASK", self._task_header(task, mode)))
+        mandatory.append(("EXECUTION STATE", self._execution_state(execution)))
         mandatory.append(("USER GOAL", task.current_goal or "No explicit goal recorded."))
 
         hard_constraints = [
@@ -122,7 +126,7 @@ class ContextPackBuilder:
         review = get_checkpoint_review(self.store, checkpoint.checkpoint_id) if checkpoint else None
         optional.append(
             (
-                "LATEST CODEX CHECKPOINT",
+                "LATEST SUPERVISOR CHECKPOINT",
                 self._checkpoint(checkpoint, review),
             )
         )
@@ -130,7 +134,13 @@ class ContextPackBuilder:
         user_overrides = self.store.recent_events(
             task_id,
             actors={Actor.USER},
-            event_types={EventType.USER_OVERRIDE, EventType.INTENT_UPDATED},
+            event_types={
+                EventType.USER_OVERRIDE,
+                EventType.INTENT_UPDATED,
+                EventType.EXECUTION_MODE_CHANGED,
+                EventType.EXECUTION_HANDOFF,
+                EventType.EXECUTION_HANDBACK,
+            },
             limit=5,
         )
         optional.append(
@@ -150,6 +160,10 @@ class ContextPackBuilder:
                 EventType.DECISION_SUPERSEDED,
                 EventType.CODEX_STEERED,
                 EventType.CHECKPOINT_REVIEWED,
+                EventType.WRITER_ACQUIRED,
+                EventType.WRITER_RELEASED,
+                EventType.EXECUTION_HANDOFF,
+                EventType.EXECUTION_HANDBACK,
             },
             limit=10,
         )
@@ -242,11 +256,28 @@ class ContextPackBuilder:
                 f"Task ID: {task.task_id}",
                 f"Title: {task.title}",
                 f"Repository: {task.repository or '-'}",
-                f"Mode: {mode.value}",
+                f"Context Mode: {mode.value}",
                 f"Revision: {task.revision}",
                 f"Intent Version: {task.intent_version}",
                 f"Plan Version: {task.plan_version}",
                 f"Phase: {task.phase.value}",
+            ]
+        )
+
+    @staticmethod
+    def _execution_state(state: ExecutionState) -> str:
+        return "\n".join(
+            [
+                f"Execution Mode: {state.execution_mode.value}",
+                f"Active Writer: {state.active_writer.value}",
+                f"Handoff Policy: {state.handoff_policy.value}",
+                f"Writer Epoch: {state.writer_epoch}",
+                "Writer Acquired Revision: "
+                + (
+                    str(state.writer_acquired_revision)
+                    if state.writer_acquired_revision is not None
+                    else "-"
+                ),
             ]
         )
 

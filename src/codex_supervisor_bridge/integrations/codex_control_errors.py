@@ -35,3 +35,13 @@ class CodexToolError(CodexControlError):
 class CodexPlanGateError(CodexControlError):
     def __init__(self, message: str) -> None:
         super().__init__(f"CODEX_PLAN_GATE: {message}")
+
+
+class CodexCompensationError(CodexControlError):
+    """A stale local decision was detected after a remote write and stop compensation failed."""
+
+    def __init__(self, stale_context: str) -> None:
+        super().__init__(
+            "CODEX_COMPENSATION_REQUIRED: "
+            f"{stale_context}; remote action may still be active because compensation interrupt failed"
+        )

@@ -39,7 +39,7 @@ def test_windows_paths_follow_local_app_data(tmp_path: Path) -> None:
         environ={"LOCALAPPDATA": r"C:\Users\Test\AppData\Local"},
         system="Windows",
     )
-    assert str(paths.root).endswith(r"AppData\Local\CodexSupervisorBridge")
+    assert str(paths.root).replace("/", "\\").endswith(r"AppData\Local\CodexSupervisorBridge")
     assert paths.database == paths.data / "supervisor.db"
     assert paths.settings == paths.config / "settings.json"
 

@@ -69,6 +69,11 @@ def register_kandev_tools(server: MCPServer, coordinator: KandevCoordinator) -> 
         local binding because a newer user override arrived during the remote
         call. P3 always forces start_agent=false and autopilot=false.
         """
+        repository_locators = [repository_id, local_path, repository_url]
+        if sum(bool(value) for value in repository_locators) > 1:
+            raise tool_argument_error(
+                "Pass at most one of repository_id, local_path, or repository_url"
+            )
         options = KandevProvisionOptions(
             parent_id=parent_id,
             workspace_id=workspace_id,

@@ -5,13 +5,7 @@ from typing import Any
 
 from mcp import Client
 
-from .kandev_errors import (
-    KandevCapabilityError,
-    KandevError,
-    KandevProtocolError,
-    KandevToolError,
-)
-from .kandev_models import KandevCapabilities, KandevCreateTaskRequest
+from . import kandev_errors, kandev_models
 
 
 REQUIRED_EXTERNAL_TOOLS = {
@@ -29,15 +23,9 @@ REQUIRED_EXTERNAL_TOOLS = {
 
 
 class KandevAdapter:
-    """Typed client for Kandev's external Streamable HTTP MCP endpoint.
-
-    Production normally passes ``http://127.0.0.1:38429/mcp``. Tests may pass
-    an in-process MCPServer object so the exact MCP protocol path is exercised
-    without opening a local port.
-    """
+    """Typed client for Kandev's external Streamable HTTP MCP endpoint."""
 
     def __init__(self, target: Any = "http://127.0.0.1:38429/mcp") -> None:
-        self.target = target
         self._client = Client(target)
         self._entered = False
         self._tool_names: set[str] | None = None
@@ -46,16 +34,11 @@ class KandevAdapter:
         try:
             await self._client.__aenter__()
         except Exception as exc:
-            raise KandevError("Kandev external MCP is unavailable") from exc
+            raise kandev_errors.KandevError("Kandev external MCP is unavailable") from exc
         self._entered = True
         return self
 
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: object | None,
-    ) -> None:
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
         try:
             await self._client.__aexit__(exc_type, exc, tb)
         finally:
@@ -66,18 +49,20 @@ class KandevAdapter:
         if not self._entered:
             raise RuntimeError("KandevAdapter must be used inside 'async with'")
 
-    async def capabilities(self) -> KandevCapabilities:
+    async def capabilities(self) -> kandev_models.KandevCapabilities:
         self._require_connected()
         listed = await self._client.list_tools()
         tools = sorted(tool.name for tool in listed.tools)
         self._tool_names = set(tools)
-        missing = sorted(REQUIRED_EXTERNAL_TOOLS - self._tool_names)
-        return KandevCapabilities(tools=tools, missing_required_tools=missing)
+        return kandev_models.KandevCapabilities(
+            tools=tools,
+            missing_required_tools=sorted(REQUIRED_EXTERNAL_TOOLS - self._tool_names),
+        )
 
-    async def require_compatible(self) -> KandevCapabilities:
+    async def require_compatible(self) -> kandev_models.KandevCapabilities:
         capabilities = await self.capabilities()
         if not capabilities.compatible:
-            raise KandevCapabilityError(capabilities.missing_required_tools)
+            raise kandev_errors.KandevCapabilityError(capabilities.missing_required_tools)
         return capabilities
 
     async def _ensure_tool(self, tool: str) -> None:
@@ -85,50 +70,53 @@ class KandevAdapter:
             await self.capabilities()
         assert self._tool_names is not None
         if tool not in self._tool_names:
-            raise KandevCapabilityError([tool])
+            raise kandev_errors.KandevCapabilityError([tool])
 
     @staticmethod
-    def _text_content(result: Any) -> str:
+    def _text(result: Any) -> str:
         return "\n".join(
-            getattr(item, "text", "")
+            item.text
             for item in result.content
-            if getattr(item, "text", None) is not None
+            if isinstance(getattr(item, "text", None), str)
         ).strip()
 
     @classmethod
-    def _payload_from_result(cls, tool: str, result: Any) -> dict[str, Any]:
+    def _payload(cls, tool: str, result: Any) -> dict[str, Any]:
         if result.is_error:
-            message = cls._text_content(result) or "unknown Kandev MCP error"
-            raise KandevToolError(tool, message)
-
+            raise kandev_errors.KandevToolError(
+                tool,
+                cls._text(result) or "unknown Kandev MCP error",
+            )
         structured = result.structured_content
         if isinstance(structured, dict) and structured:
-            # MCP Python servers can provide structured_content. Kandev's Go
-            # external server currently returns JSON TextContent, but accepting
-            # both shapes keeps this adapter protocol-oriented rather than
-            # coupled to one server implementation detail.
+            if set(structured) == {"result"} and isinstance(structured["result"], str):
+                try:
+                    nested = json.loads(structured["result"])
+                except json.JSONDecodeError:
+                    return structured
+                if isinstance(nested, dict):
+                    return nested
             return structured
-
-        text = cls._text_content(result)
+        text = cls._text(result)
         if not text:
             return {}
         try:
-            decoded = json.loads(text)
+            payload = json.loads(text)
         except json.JSONDecodeError as exc:
-            raise KandevProtocolError(
+            raise kandev_errors.KandevProtocolError(
                 f"Kandev tool {tool} returned non-JSON text content"
             ) from exc
-        if not isinstance(decoded, dict):
-            raise KandevProtocolError(
-                f"Kandev tool {tool} returned JSON {type(decoded).__name__}; expected object"
+        if not isinstance(payload, dict):
+            raise kandev_errors.KandevProtocolError(
+                f"Kandev tool {tool} returned JSON {type(payload).__name__}; expected object"
             )
-        return decoded
+        return payload
 
     async def call(self, tool: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         self._require_connected()
         await self._ensure_tool(tool)
         result = await self._client.call_tool(tool, arguments or {})
-        return self._payload_from_result(tool, result)
+        return self._payload(tool, result)
 
     async def list_workspaces(self) -> dict[str, Any]:
         return await self.call("list_workspaces_kandev")
@@ -145,7 +133,7 @@ class KandevAdapter:
     async def list_tasks(self, workflow_id: str) -> dict[str, Any]:
         return await self.call("list_tasks_kandev", {"workflow_id": workflow_id})
 
-    async def create_task(self, request: KandevCreateTaskRequest) -> dict[str, Any]:
+    async def create_task(self, request: kandev_models.KandevCreateTaskRequest) -> dict[str, Any]:
         return await self.call("create_task_kandev", request.to_tool_arguments())
 
     async def list_task_sessions(self, task_id: str) -> dict[str, Any]:
@@ -158,12 +146,12 @@ class KandevAdapter:
         session_id: str | None = None,
         limit: int | None = None,
     ) -> dict[str, Any]:
-        arguments: dict[str, Any] = {"task_id": task_id}
+        args: dict[str, Any] = {"task_id": task_id}
         if session_id:
-            arguments["session_id"] = session_id
+            args["session_id"] = session_id
         if limit is not None:
-            arguments["limit"] = limit
-        return await self.call("get_task_conversation_kandev", arguments)
+            args["limit"] = limit
+        return await self.call("get_task_conversation_kandev", args)
 
     async def move_task(
         self,
@@ -174,34 +162,33 @@ class KandevAdapter:
         position: int | None = None,
         prompt: str | None = None,
     ) -> dict[str, Any]:
-        arguments: dict[str, Any] = {
+        args: dict[str, Any] = {
             "task_id": task_id,
             "workflow_id": workflow_id,
             "workflow_step_id": workflow_step_id,
         }
         if position is not None:
-            arguments["position"] = position
+            args["position"] = position
         if prompt:
-            arguments["prompt"] = prompt
-        return await self.call("move_task_kandev", arguments)
+            args["prompt"] = prompt
+        return await self.call("move_task_kandev", args)
 
     async def update_task_state(self, task_id: str, state: str) -> dict[str, Any]:
-        return await self.call(
-            "update_task_state_kandev",
-            {"task_id": task_id, "state": state},
-        )
+        return await self.call("update_task_state_kandev", {"task_id": task_id, "state": state})
 
 
 def extract_kandev_task_id(payload: dict[str, Any]) -> str:
-    """Extract a task ID from known Kandev response shapes without guessing text."""
+    """Extract a task ID from known Kandev response shapes without text guessing."""
     for key in ("task_id", "id"):
         value = payload.get(key)
         if isinstance(value, str) and value:
             return value
-    task = payload.get("task")
-    if isinstance(task, dict):
+    nested = payload.get("task")
+    if isinstance(nested, dict):
         for key in ("task_id", "id"):
-            value = task.get(key)
+            value = nested.get(key)
             if isinstance(value, str) and value:
                 return value
-    raise KandevProtocolError("Kandev create_task response did not contain a task ID")
+    raise kandev_errors.KandevProtocolError(
+        "Kandev create_task response did not contain a task ID"
+    )

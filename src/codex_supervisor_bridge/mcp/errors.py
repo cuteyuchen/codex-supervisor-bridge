@@ -7,6 +7,7 @@ from typing import ParamSpec, TypeVar
 from mcp.server.mcpserver.exceptions import ToolError
 
 from codex_supervisor_bridge.integrations.codex_control_errors import CodexControlError
+from codex_supervisor_bridge.integrations.devspace_errors import DevSpaceError
 from codex_supervisor_bridge.integrations.kandev_errors import KandevError
 from codex_supervisor_bridge.memory.errors import MemoryErrorBase
 
@@ -43,7 +44,7 @@ def expose_integration_errors(
     async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
         try:
             return await fn(*args, **kwargs)
-        except (MemoryErrorBase, KandevError, CodexControlError) as exc:
+        except (MemoryErrorBase, KandevError, CodexControlError, DevSpaceError) as exc:
             raise ToolError(str(exc)) from exc
 
     return wrapped

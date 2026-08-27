@@ -14,6 +14,7 @@ def test_settings_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     monkeypatch.setenv("SUPERVISOR_HOST", "127.0.0.1")
     monkeypatch.setenv("SUPERVISOR_PORT", "9876")
     monkeypatch.setenv("KANDEV_MCP_URL", "http://127.0.0.1:39000/mcp")
+    monkeypatch.setenv("CODEX_CONTROL_PLANE_COMMAND", "python -m custom_control_plane")
 
     settings = Settings.from_env()
 
@@ -21,6 +22,7 @@ def test_settings_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     assert settings.host == "127.0.0.1"
     assert settings.port == 9876
     assert settings.kandev_mcp_url == "http://127.0.0.1:39000/mcp"
+    assert settings.codex_control_command == "python -m custom_control_plane"
 
 
 def test_settings_reject_invalid_port(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -39,6 +41,12 @@ def test_settings_reject_empty_kandev_url(monkeypatch: pytest.MonkeyPatch) -> No
         Settings.from_env()
 
 
+def test_settings_reject_empty_codex_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CODEX_CONTROL_PLANE_COMMAND", "   ")
+    with pytest.raises(ValueError, match="must not be empty"):
+        Settings.from_env()
+
+
 def test_cli_defaults_to_local_streamable_http(tmp_path: Path) -> None:
     settings = Settings(database_path=tmp_path / "server.db")
     parser = build_parser(settings)
@@ -50,3 +58,4 @@ def test_cli_defaults_to_local_streamable_http(tmp_path: Path) -> None:
     assert args.port == 8765
     assert args.mcp_path == "/mcp"
     assert args.kandev_mcp_url == "http://127.0.0.1:38429/mcp"
+    assert args.codex_control_command == "codex-control-plane-mcp"

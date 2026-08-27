@@ -7,10 +7,13 @@ from mcp.server import MCPServer
 
 from codex_supervisor_bridge import __version__
 from codex_supervisor_bridge.config import Settings
+from codex_supervisor_bridge.integrations.codex_control_client import CodexControlAdapter
+from codex_supervisor_bridge.integrations.codex_coordinator import CodexCoordinator
 from codex_supervisor_bridge.integrations.kandev_client import KandevAdapter
 from codex_supervisor_bridge.integrations.kandev_coordinator import KandevCoordinator
 from codex_supervisor_bridge.memory.service import MemoryService
 
+from .codex_tools import register_codex_tools
 from .kandev_tools import register_kandev_tools
 from .tools import register_memory_tools
 
@@ -26,9 +29,20 @@ ACTIVE decisions and constraints are current instructions. Search may also
 return SUPERSEDED historical records; never treat a superseded record as
 current truth. HARD constraints outrank plans and agent-local choices.
 
-Kandev integration is a workflow/worktree boundary, not the owner of user
-intent. During P3, provisioning a Kandev task never starts an agent or enables
-autopilot; Codex startup and live steering remain gated for P4.
+Kandev owns workflow/worktree facts. Codex Control Plane owns Codex runtime
+facts. Supervisor Bridge owns user intent, active constraints, revision locks,
+plan approval, and cross-system routing.
+
+Codex implementation is plan-gated: start_codex_plan is read-only Plan Mode;
+import_codex_plan creates a local DRAFT; approve_task_plan is the explicit
+Supervisor gate; execute_codex_approved_plan re-checks that the remote
+latestPlan still matches the locally approved plan before workspace-write is
+allowed.
+
+Use soft_steer_codex only for a local correction while the current plan remains
+valid. For architecture/scope changes, interrupt first and create/review a new
+plan. Raw codex_submit_task and danger-full-access are intentionally not
+exposed through this server.
 
 This server intentionally exposes semantic supervisor operations only. It does
 not provide arbitrary shell, process execution, raw SQL, or unrestricted
@@ -40,6 +54,7 @@ def create_mcp_server(
     service: MemoryService,
     *,
     kandev: KandevCoordinator | None = None,
+    codex: CodexCoordinator | None = None,
 ) -> MCPServer:
     server = MCPServer(
         "codex-supervisor-bridge",
@@ -51,6 +66,8 @@ def create_mcp_server(
     register_memory_tools(server, service)
     if kandev is not None:
         register_kandev_tools(server, kandev)
+    if codex is not None:
+        register_codex_tools(server, codex)
     return server
 
 
@@ -90,6 +107,11 @@ def build_parser(settings: Settings | None = None) -> argparse.ArgumentParser:
         default=settings.kandev_mcp_url,
         help="Kandev external MCP endpoint (default: http://127.0.0.1:38429/mcp)",
     )
+    parser.add_argument(
+        "--codex-control-command",
+        default=settings.codex_control_command,
+        help="Codex Control Plane MCP executable (default: codex-control-plane-mcp)",
+    )
     return parser
 
 
@@ -102,13 +124,22 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("--mcp-path must start with '/'")
     if not args.kandev_mcp_url.strip():
         parser.error("--kandev-mcp-url must not be empty")
+    if not args.codex_control_command.strip():
+        parser.error("--codex-control-command must not be empty")
 
     service = MemoryService(args.database)
     kandev = KandevCoordinator(
         service,
         lambda: KandevAdapter(args.kandev_mcp_url),
     )
-    server = create_mcp_server(service, kandev=kandev)
+    codex = CodexCoordinator(
+        service,
+        lambda: CodexControlAdapter.stdio(
+            args.codex_control_command,
+            env={"CODEX_MCP_EXECUTION_MODE": "client"},
+        ),
+    )
+    server = create_mcp_server(service, kandev=kandev, codex=codex)
     try:
         if args.transport == "stdio":
             server.run(transport="stdio")

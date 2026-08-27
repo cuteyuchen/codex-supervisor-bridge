@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = r"""
 PRAGMA foreign_keys = ON;
@@ -294,6 +294,146 @@ WHERE status IN (
 
 CREATE INDEX IF NOT EXISTS idx_hard_replans_task_created
 ON hard_replans(task_id, created_at DESC);
+"""
+
+EXECUTION_STATE_MIGRATION_SQL = r"""
+CREATE TABLE IF NOT EXISTS task_execution_state (
+    task_id TEXT PRIMARY KEY REFERENCES supervised_tasks(task_id) ON DELETE CASCADE,
+    execution_mode TEXT NOT NULL DEFAULT 'HYBRID'
+        CHECK (execution_mode IN ('DIRECT', 'HYBRID', 'CODEX_SUPERVISED')),
+    active_writer TEXT NOT NULL DEFAULT 'NONE'
+        CHECK (active_writer IN ('NONE', 'CHATGPT', 'CODEX')),
+    handoff_policy TEXT NOT NULL DEFAULT 'MANUAL_ONLY'
+        CHECK (handoff_policy IN ('MANUAL_ONLY', 'SUPERVISOR_ALLOWED')),
+    writer_epoch INTEGER NOT NULL DEFAULT 0 CHECK (writer_epoch >= 0),
+    writer_acquired_revision INTEGER CHECK (writer_acquired_revision >= 0),
+    updated_at TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO task_execution_state(
+    task_id, execution_mode, active_writer, handoff_policy,
+    writer_epoch, writer_acquired_revision, updated_at
+)
+SELECT
+    task_id, 'CODEX_SUPERVISED', 'NONE', 'MANUAL_ONLY',
+    0, NULL, updated_at
+FROM supervised_tasks;
+
+CREATE TRIGGER IF NOT EXISTS trg_supervised_task_execution_state
+AFTER INSERT ON supervised_tasks
+BEGIN
+    INSERT OR IGNORE INTO task_execution_state(
+        task_id, execution_mode, active_writer, handoff_policy,
+        writer_epoch, writer_acquired_revision, updated_at
+    ) VALUES (
+        NEW.task_id, 'HYBRID', 'NONE', 'MANUAL_ONLY',
+        0, NULL, NEW.created_at
+    );
+END;
+
+CREATE TABLE IF NOT EXISTS execution_handoffs (
+    handoff_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES supervised_tasks(task_id) ON DELETE CASCADE,
+    from_writer TEXT NOT NULL CHECK (from_writer IN ('CHATGPT', 'CODEX')),
+    to_writer TEXT NOT NULL CHECK (to_writer IN ('CHATGPT', 'CODEX')),
+    from_revision INTEGER NOT NULL CHECK (from_revision >= 0),
+    to_revision INTEGER NOT NULL CHECK (to_revision >= 0),
+    intent_version INTEGER NOT NULL CHECK (intent_version >= 1),
+    plan_version INTEGER NOT NULL CHECK (plan_version >= 0),
+    writer_epoch INTEGER NOT NULL CHECK (writer_epoch >= 1),
+    git_head TEXT,
+    change_ref TEXT,
+    validation_json TEXT NOT NULL DEFAULT '{}',
+    reason TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_execution_handoffs_task_created
+ON execution_handoffs(task_id, created_at DESC);
+"""
+
+WORKSPACE_STATE_MIGRATION_SQL = r"""
+CREATE TABLE IF NOT EXISTS task_workspace_state (
+    task_id TEXT PRIMARY KEY REFERENCES supervised_tasks(task_id) ON DELETE CASCADE,
+    backend_name TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    repository TEXT NOT NULL,
+    root TEXT,
+    workspace_mode TEXT NOT NULL CHECK (workspace_mode IN ('checkout', 'worktree')),
+    base_ref TEXT,
+    git_branch TEXT,
+    git_head TEXT,
+    dirty INTEGER NOT NULL DEFAULT 0 CHECK (dirty IN (0, 1)),
+    changed_files_json TEXT NOT NULL DEFAULT '[]',
+    last_review_ref TEXT,
+    state TEXT NOT NULL DEFAULT 'ACTIVE'
+        CHECK (state IN ('ACTIVE', 'RECONCILIATION_REQUIRED', 'CLOSED')),
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_workspace_backend
+ON task_workspace_state(backend_name, workspace_id);
+
+CREATE TABLE IF NOT EXISTS direct_workspace_operations (
+    operation_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES supervised_tasks(task_id) ON DELETE CASCADE,
+    operation_type TEXT NOT NULL,
+    status TEXT NOT NULL
+        CHECK (status IN ('PREPARED', 'SUCCEEDED', 'FAILED', 'RECONCILIATION_REQUIRED')),
+    writer_epoch INTEGER NOT NULL CHECK (writer_epoch >= 1),
+    prepared_revision INTEGER NOT NULL CHECK (prepared_revision >= 0),
+    completed_revision INTEGER CHECK (completed_revision >= 0),
+    request_digest TEXT NOT NULL,
+    summary TEXT,
+    change_ref TEXT,
+    git_head_before TEXT,
+    git_head_after TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_direct_workspace_one_prepared
+ON direct_workspace_operations(task_id)
+WHERE status = 'PREPARED';
+
+CREATE INDEX IF NOT EXISTS idx_direct_workspace_task_created
+ON direct_workspace_operations(task_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS direct_command_sessions (
+    task_id TEXT NOT NULL REFERENCES supervised_tasks(task_id) ON DELETE CASCADE,
+    command_id TEXT NOT NULL,
+    writer_epoch INTEGER NOT NULL CHECK (writer_epoch >= 1),
+    status TEXT NOT NULL CHECK (status IN ('RUNNING', 'COMPLETED', 'INTERRUPTED', 'UNKNOWN')),
+    started_revision INTEGER NOT NULL CHECK (started_revision >= 0),
+    completed_revision INTEGER CHECK (completed_revision >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(task_id, command_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_direct_command_running
+ON direct_command_sessions(task_id, status, created_at DESC);
+"""
+
+AGENT_SAFETY_MIGRATION_SQL = r"""
+CREATE TABLE IF NOT EXISTS task_agent_safety (
+    task_id TEXT PRIMARY KEY REFERENCES supervised_tasks(task_id) ON DELETE CASCADE,
+    state TEXT NOT NULL DEFAULT 'NONE'
+        CHECK (state IN ('NONE', 'COMPENSATION_REQUIRED', 'RECONCILIATION_REQUIRED')),
+    operation TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    workflow_id TEXT,
+    operation_id TEXT,
+    thread_id TEXT,
+    turn_id TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_agent_safety_state
+ON task_agent_safety(state, updated_at DESC);
 """
 
 OPTIONAL_FTS_SQL = r"""

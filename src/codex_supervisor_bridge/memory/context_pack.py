@@ -4,8 +4,11 @@ import json
 from dataclasses import dataclass, field
 from math import ceil
 
+from .agent_safety import AgentSafetyState, get_agent_safety
 from .checkpoint_reviews import get_checkpoint_review
 from .checkpoint_store import latest_checkpoint
+from .execution import get_execution_state
+from .execution_models import ExecutionState
 from .models import (
     Actor,
     ConstraintSeverity,
@@ -16,6 +19,7 @@ from .models import (
     TaskMemory,
 )
 from .store import MemoryStore
+from .workspace import get_prepared_direct_operation, get_workspace_binding
 
 
 @dataclass(frozen=True)
@@ -52,6 +56,10 @@ class ContextPackBuilder:
         persist_snapshot: bool = False,
     ) -> BuiltContextPack:
         task = self.store.get_task(task_id)
+        execution = get_execution_state(self.store, task_id)
+        workspace = get_workspace_binding(self.store, task_id)
+        prepared_operation = get_prepared_direct_operation(self.store, task_id)
+        agent_safety = get_agent_safety(self.store, task_id)
         constraints = self.store.active_constraints(task_id)
         decisions = self.store.active_decisions(task_id)
         approved_plan = self.store.approved_plan(task_id)
@@ -62,6 +70,14 @@ class ContextPackBuilder:
         optional: list[tuple[str, str]] = []
 
         mandatory.append(("TASK", self._task_header(task, mode)))
+        mandatory.append(("EXECUTION STATE", self._execution_state(execution)))
+        mandatory.append(
+            (
+                "WORKSPACE STATE",
+                self._workspace_state(workspace, prepared_operation),
+            )
+        )
+        mandatory.append(("AGENT SAFETY", self._agent_safety(agent_safety)))
         mandatory.append(("USER GOAL", task.current_goal or "No explicit goal recorded."))
 
         hard_constraints = [
@@ -101,6 +117,15 @@ class ContextPackBuilder:
         )
         mandatory.append(("CURRENT STATE", state_text))
 
+        checkpoint = latest_checkpoint(self.store, task_id)
+        review = get_checkpoint_review(self.store, checkpoint.checkpoint_id) if checkpoint else None
+        mandatory.append(
+            (
+                "LATEST SUPERVISOR CHECKPOINT",
+                self._checkpoint(checkpoint, review),
+            )
+        )
+
         soft_constraints = [
             item for item in constraints if item.severity != ConstraintSeverity.HARD
         ]
@@ -118,19 +143,16 @@ class ContextPackBuilder:
             )
         )
 
-        checkpoint = latest_checkpoint(self.store, task_id)
-        review = get_checkpoint_review(self.store, checkpoint.checkpoint_id) if checkpoint else None
-        optional.append(
-            (
-                "LATEST CODEX CHECKPOINT",
-                self._checkpoint(checkpoint, review),
-            )
-        )
-
         user_overrides = self.store.recent_events(
             task_id,
             actors={Actor.USER},
-            event_types={EventType.USER_OVERRIDE, EventType.INTENT_UPDATED},
+            event_types={
+                EventType.USER_OVERRIDE,
+                EventType.INTENT_UPDATED,
+                EventType.EXECUTION_MODE_CHANGED,
+                EventType.EXECUTION_HANDOFF,
+                EventType.EXECUTION_HANDBACK,
+            },
             limit=5,
         )
         optional.append(
@@ -150,6 +172,10 @@ class ContextPackBuilder:
                 EventType.DECISION_SUPERSEDED,
                 EventType.CODEX_STEERED,
                 EventType.CHECKPOINT_REVIEWED,
+                EventType.WRITER_ACQUIRED,
+                EventType.WRITER_RELEASED,
+                EventType.EXECUTION_HANDOFF,
+                EventType.EXECUTION_HANDBACK,
             },
             limit=10,
         )
@@ -242,13 +268,83 @@ class ContextPackBuilder:
                 f"Task ID: {task.task_id}",
                 f"Title: {task.title}",
                 f"Repository: {task.repository or '-'}",
-                f"Mode: {mode.value}",
+                f"Context Mode: {mode.value}",
                 f"Revision: {task.revision}",
                 f"Intent Version: {task.intent_version}",
                 f"Plan Version: {task.plan_version}",
                 f"Phase: {task.phase.value}",
             ]
         )
+
+    @staticmethod
+    def _execution_state(state: ExecutionState) -> str:
+        return "\n".join(
+            [
+                f"Execution Mode: {state.execution_mode.value}",
+                f"Active Writer: {state.active_writer.value}",
+                f"Handoff Policy: {state.handoff_policy.value}",
+                f"Writer Epoch: {state.writer_epoch}",
+                "Writer Acquired Revision: "
+                + (
+                    str(state.writer_acquired_revision)
+                    if state.writer_acquired_revision is not None
+                    else "-"
+                ),
+            ]
+        )
+
+    @staticmethod
+    def _workspace_state(workspace: object | None, prepared_operation: object | None) -> str:
+        if workspace is None:
+            return "No supervised workspace binding recorded."
+        rows = [
+            f"Backend: {workspace.backend_name}",
+            f"Workspace ID: {workspace.workspace_id}",
+            f"Repository: {workspace.repository}",
+            f"Workspace Mode: {workspace.workspace_mode}",
+            f"Git HEAD: {workspace.git_head or '-'}",
+            f"Dirty: {workspace.dirty}",
+            "Changed Files: " + (" | ".join(workspace.changed_files[:20]) or "-"),
+            f"Latest Review Ref: {workspace.last_review_ref or '-'}",
+            f"Binding State: {workspace.state.value}",
+        ]
+        if workspace.state.value == "RECONCILIATION_REQUIRED":
+            rows.insert(0, "RECONCILIATION REQUIRED: all writer transitions and new writes are blocked.")
+        if prepared_operation is not None:
+            rows.insert(
+                0,
+                "PREPARED DIRECT OPERATION: writer transition is blocked until it is finalized or reconciled.",
+            )
+            rows.append(
+                f"Prepared Operation: {prepared_operation.operation_id} / {prepared_operation.operation_type}"
+            )
+        return "\n".join(rows)
+
+    @staticmethod
+    def _agent_safety(safety: object | None) -> str:
+        if safety is None or safety.state == AgentSafetyState.NONE:
+            return "No pending agent compensation or reconciliation requirement."
+        rows = [
+            "RECONCILIATION REQUIRED: agent compensation is incomplete; writer transitions, "
+            "direct mutation, and new Codex execution are blocked.",
+            f"State: {safety.state}",
+            f"Operation: {safety.operation}",
+            f"Summary: {safety.summary}",
+        ]
+        if safety.workflow_id or safety.operation_id or safety.thread_id or safety.turn_id:
+            rows.append(
+                "Runtime: "
+                + " / ".join(
+                    value or "-"
+                    for value in (
+                        safety.workflow_id,
+                        safety.operation_id,
+                        safety.thread_id,
+                        safety.turn_id,
+                    )
+                )
+            )
+        return "\n".join(rows)
 
     @classmethod
     def _events(cls, events: list[TaskEvent], *, empty: str) -> str:

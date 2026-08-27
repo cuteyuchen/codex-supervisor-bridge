@@ -10,7 +10,9 @@ from codex_supervisor_bridge.memory.codex_runtime import (
     get_codex_runtime,
 )
 from codex_supervisor_bridge.memory.errors import StaleRevisionError
+from codex_supervisor_bridge.memory.execution import get_execution_state
 from codex_supervisor_bridge.memory.models import (
+    ActiveWriter,
     Actor,
     ContextPackMode,
     EventType,
@@ -300,6 +302,11 @@ class CodexCoordinator:
         sandbox: str = "workspace-write",
     ) -> dict[str, Any]:
         self.memory.assert_revision(task_id, expected_revision)
+        execution = get_execution_state(self.memory.store, task_id)
+        if execution.active_writer != ActiveWriter.CODEX:
+            raise CodexPlanGateError(
+                "Codex workspace mutation requires an active CODEX writer lease; hand off first"
+            )
         approved = self.memory.approved_plan(task_id)
         if approved is None or approved.status != PlanStatus.APPROVED:
             raise CodexPlanGateError("No locally APPROVED plan exists")
@@ -364,6 +371,11 @@ class CodexCoordinator:
         if not instruction.strip():
             raise ValueError("instruction must not be empty")
         self.memory.assert_revision(task_id, expected_revision)
+        execution = get_execution_state(self.memory.store, task_id)
+        if execution.active_writer != ActiveWriter.CODEX:
+            raise CodexPlanGateError(
+                "Codex steering requires an active CODEX writer lease; hand off first"
+            )
         runtime = get_codex_runtime(self.memory.store, task_id)
         if runtime is None:
             raise CodexPlanGateError("Task has no active Codex runtime")

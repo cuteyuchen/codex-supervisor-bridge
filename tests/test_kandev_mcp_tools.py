@@ -129,7 +129,23 @@ def test_supervisor_mcp_exposes_four_safe_kandev_tools() -> None:
                 "get_kandev_sessions",
                 "get_kandev_conversation",
             } <= names
-            assert len(names) == 20
+
+            # Supervisor exposes only bounded Kandev semantics. Raw upstream
+            # creation/movement/state tools stay hidden even as unrelated
+            # Supervisor capabilities are added later.
+            for forbidden in {
+                "list_workspaces_kandev",
+                "list_workflows_kandev",
+                "list_workflow_steps_kandev",
+                "list_repositories_kandev",
+                "list_tasks_kandev",
+                "create_task_kandev",
+                "list_task_sessions_kandev",
+                "get_task_conversation_kandev",
+                "move_task_kandev",
+                "update_task_state_kandev",
+            }:
+                assert forbidden not in names
 
             tools = {tool.name: tool for tool in listed.tools}
             assert tools["get_kandev_capabilities"].annotations is not None

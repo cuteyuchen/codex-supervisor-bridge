@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+from .agent_safety import (
+    AgentSafety,
+    AgentSafetyState,
+    assert_agent_safety_clear,
+    get_agent_safety,
+    latch_agent_compensation,
+    reconcile_agent_safety,
+    record_agent_compensation_required,
+    record_agent_compensation_succeeded,
+)
 from .context_pack import BuiltContextPack, ContextPackBuilder
 from .errors import (
     ConflictError,
@@ -34,6 +44,8 @@ from .store import MemoryStore
 
 __all__ = [
     "Actor",
+    "AgentSafety",
+    "AgentSafetyState",
     "BuiltContextPack",
     "ConflictError",
     "Constraint",
@@ -47,6 +59,9 @@ __all__ = [
     "EventType",
     "Evidence",
     "EvidenceType",
+    "assert_agent_safety_clear",
+    "get_agent_safety",
+    "latch_agent_compensation",
     "InvalidTransitionError",
     "MemoryErrorBase",
     "MemorySearchHit",
@@ -61,4 +76,7 @@ __all__ = [
     "TaskNotFoundError",
     "TaskPhase",
     "TaskSummary",
+    "record_agent_compensation_required",
+    "record_agent_compensation_succeeded",
+    "reconcile_agent_safety",
 ]

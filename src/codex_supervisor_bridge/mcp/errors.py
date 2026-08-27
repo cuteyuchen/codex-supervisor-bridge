@@ -7,11 +7,42 @@ from typing import ParamSpec, TypeVar
 from mcp.server.mcpserver.exceptions import ToolError
 
 from codex_supervisor_bridge.integrations.codex_control_errors import CodexControlError
+from codex_supervisor_bridge.integrations.devspace_errors import DevSpaceError
 from codex_supervisor_bridge.integrations.kandev_errors import KandevError
+from codex_supervisor_bridge.integrations.local_codex_bridge_errors import (
+    LocalCodexBridgeError,
+)
 from codex_supervisor_bridge.memory.errors import MemoryErrorBase
 
 P = ParamSpec("P")
 R = TypeVar("R")
+
+
+def _integration_message(exc: Exception) -> str:
+    """Return a bounded, provider-safe message for expected integration errors.
+
+    Provider responses may contain local paths, tool arguments, request payloads,
+    or authentication material.  Those details are useful in diagnostics but
+    must never become part of the normal MCP tool result.
+    """
+
+    if isinstance(exc, DevSpaceError):
+        if exc.__class__.__name__ == "DevSpaceUnavailableError":
+            return "Local workspace is unavailable. Check local workspace health or repair it."
+        if exc.__class__.__name__ == "DevSpaceCapabilityError":
+            return "Local workspace needs repair before this operation can continue."
+        if exc.__class__.__name__ == "DevSpaceProtocolError":
+            return "Local workspace returned an invalid response."
+        return "Local workspace operation failed."
+    if isinstance(exc, LocalCodexBridgeError):
+        if exc.__class__.__name__ == "LocalCodexBridgeUnavailableError":
+            return "Codex is unavailable. Check Codex health or repair the local connection."
+        if exc.__class__.__name__ == "LocalCodexBridgeCapabilityError":
+            return "Codex needs repair before this operation can continue."
+        if exc.__class__.__name__ == "LocalCodexBridgeProtocolError":
+            return "Codex returned an invalid response."
+        return "Codex operation failed."
+    return str(exc)
 
 
 def expose_memory_errors(fn: Callable[P, R]) -> Callable[P, R]:
@@ -43,8 +74,14 @@ def expose_integration_errors(
     async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
         try:
             return await fn(*args, **kwargs)
-        except (MemoryErrorBase, KandevError, CodexControlError) as exc:
-            raise ToolError(str(exc)) from exc
+        except (
+            MemoryErrorBase,
+            KandevError,
+            CodexControlError,
+            DevSpaceError,
+            LocalCodexBridgeError,
+        ) as exc:
+            raise ToolError(_integration_message(exc)) from exc
 
     return wrapped
 

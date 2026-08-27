@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from mcp.server import MCPServer
+from mcp.types import ToolAnnotations
 
 from codex_supervisor_bridge.memory.models import ConstraintSeverity, ContextPackMode
 from codex_supervisor_bridge.memory.service import MemoryService
@@ -16,6 +17,20 @@ from .models import (
     TimelineResponse,
 )
 
+READ_ONLY = ToolAnnotations(
+    read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=False,
+)
+
+MUTATION = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=False,
+    idempotent_hint=False,
+    open_world_hint=False,
+)
+
 
 def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
     """Register the ChatGPT-facing P2 tool surface.
@@ -24,7 +39,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
     process execution, or raw SQL capability is exposed to the MCP caller.
     """
 
-    @server.tool()
+    @server.tool(annotations=MUTATION)
     def create_supervised_task(
         task_id: str,
         title: str,
@@ -47,24 +62,27 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         )
         return TaskResponse(task=task)
 
-    @server.tool()
+    @server.tool(annotations=READ_ONLY)
     def get_supervised_task(task_id: str) -> TaskResponse:
         """Read canonical lightweight task state and current version counters."""
         return TaskResponse(task=service.get_task(task_id))
 
-    @server.tool()
+    @server.tool(annotations=READ_ONLY)
     def resume_supervised_task(
         task_id: str,
         mode: ContextPackMode = ContextPackMode.RESUME,
     ) -> ContextPackResponse:
         """Resume supervision from durable memory without relying on prior chat history.
 
-        This persists a Context Snapshot for audit/debug purposes but does not
-        advance the task revision.
+        This is intentionally read-only. Audit snapshots, when needed later,
+        are created by explicit supervisor workflow operations rather than by
+        merely reopening or inspecting a task.
         """
-        return ContextPackResponse.from_pack(service.resume_task(task_id, mode=mode))
+        return ContextPackResponse.from_pack(
+            service.resume_task(task_id, mode=mode, persist_snapshot=False)
+        )
 
-    @server.tool()
+    @server.tool(annotations=READ_ONLY)
     def get_context_pack(
         task_id: str,
         mode: ContextPackMode = ContextPackMode.RESUME,
@@ -72,7 +90,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         """Build the current bounded Context Pack without persisting a snapshot."""
         return ContextPackResponse.from_pack(service.get_context_pack(task_id, mode=mode))
 
-    @server.tool()
+    @server.tool(annotations=READ_ONLY)
     def search_task_memory(
         task_id: str,
         query: str,
@@ -88,7 +106,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         hits = service.search_task_memory(task_id, query, limit=limit)
         return SearchResponse(task_id=task_id, query=query, hits=hits)
 
-    @server.tool()
+    @server.tool(annotations=READ_ONLY)
     def get_task_timeline(task_id: str, limit: int = 100) -> TimelineResponse:
         """Read the append-only supervisory event timeline for a task."""
         if not 1 <= limit <= 500:
@@ -98,7 +116,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
             events=service.timeline(task_id, limit=limit),
         )
 
-    @server.tool()
+    @server.tool(annotations=MUTATION)
     def record_user_override(
         task_id: str,
         expected_revision: int,
@@ -113,7 +131,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         event = service.record_user_override(task_id, expected_revision, instruction)
         return EventResponse(task=service.get_task(task_id), event=event)
 
-    @server.tool()
+    @server.tool(annotations=MUTATION)
     def update_task_intent(
         task_id: str,
         expected_revision: int,
@@ -127,7 +145,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         task = service.update_intent(task_id, expected_revision, goal)
         return TaskResponse(task=task)
 
-    @server.tool()
+    @server.tool(annotations=MUTATION)
     def add_task_decision(
         task_id: str,
         expected_revision: int,
@@ -145,7 +163,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         )
         return DecisionResponse(task=service.get_task(task_id), decision=decision)
 
-    @server.tool()
+    @server.tool(annotations=MUTATION)
     def supersede_task_decision(
         task_id: str,
         expected_revision: int,
@@ -161,7 +179,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         )
         return DecisionResponse(task=service.get_task(task_id), decision=decision)
 
-    @server.tool()
+    @server.tool(annotations=MUTATION)
     def add_task_constraint(
         task_id: str,
         expected_revision: int,
@@ -183,7 +201,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         )
         return ConstraintResponse(task=service.get_task(task_id), constraint=constraint)
 
-    @server.tool()
+    @server.tool(annotations=MUTATION)
     def supersede_task_constraint(
         task_id: str,
         expected_revision: int,
@@ -199,7 +217,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         )
         return ConstraintResponse(task=service.get_task(task_id), constraint=constraint)
 
-    @server.tool()
+    @server.tool(annotations=MUTATION)
     def create_task_plan(
         task_id: str,
         expected_revision: int,
@@ -209,13 +227,13 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         plan = service.create_plan(task_id, expected_revision, content)
         return PlanResponse(task=service.get_task(task_id), plan=plan)
 
-    @server.tool()
+    @server.tool(annotations=READ_ONLY)
     def get_current_plan(task_id: str, approved_only: bool = False) -> PlanResponse:
         """Read the latest plan or only the currently approved plan."""
         plan = service.approved_plan(task_id) if approved_only else service.latest_plan(task_id)
         return PlanResponse(task=service.get_task(task_id), plan=plan)
 
-    @server.tool()
+    @server.tool(annotations=MUTATION)
     def approve_task_plan(
         task_id: str,
         expected_revision: int,
@@ -225,7 +243,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         plan = service.approve_plan(task_id, expected_revision, plan_id)
         return PlanResponse(task=service.get_task(task_id), plan=plan)
 
-    @server.tool()
+    @server.tool(annotations=MUTATION)
     def reject_task_plan(
         task_id: str,
         expected_revision: int,

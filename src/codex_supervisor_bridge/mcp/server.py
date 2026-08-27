@@ -7,8 +7,11 @@ from mcp.server import MCPServer
 
 from codex_supervisor_bridge import __version__
 from codex_supervisor_bridge.config import Settings
+from codex_supervisor_bridge.integrations.kandev_client import KandevAdapter
+from codex_supervisor_bridge.integrations.kandev_coordinator import KandevCoordinator
 from codex_supervisor_bridge.memory.service import MemoryService
 
+from .kandev_tools import register_kandev_tools
 from .tools import register_memory_tools
 
 SERVER_INSTRUCTIONS = """
@@ -23,13 +26,21 @@ ACTIVE decisions and constraints are current instructions. Search may also
 return SUPERSEDED historical records; never treat a superseded record as
 current truth. HARD constraints outrank plans and agent-local choices.
 
+Kandev integration is a workflow/worktree boundary, not the owner of user
+intent. During P3, provisioning a Kandev task never starts an agent or enables
+autopilot; Codex startup and live steering remain gated for P4.
+
 This server intentionally exposes semantic supervisor operations only. It does
 not provide arbitrary shell, process execution, raw SQL, or unrestricted
 filesystem tools.
 """.strip()
 
 
-def create_mcp_server(service: MemoryService) -> MCPServer:
+def create_mcp_server(
+    service: MemoryService,
+    *,
+    kandev: KandevCoordinator | None = None,
+) -> MCPServer:
     server = MCPServer(
         "codex-supervisor-bridge",
         title="Codex Supervisor Bridge",
@@ -38,6 +49,8 @@ def create_mcp_server(service: MemoryService) -> MCPServer:
         version=__version__,
     )
     register_memory_tools(server, service)
+    if kandev is not None:
+        register_kandev_tools(server, kandev)
     return server
 
 
@@ -72,6 +85,11 @@ def build_parser(settings: Settings | None = None) -> argparse.ArgumentParser:
         default="/mcp",
         help="Streamable HTTP endpoint path (default: /mcp)",
     )
+    parser.add_argument(
+        "--kandev-mcp-url",
+        default=settings.kandev_mcp_url,
+        help="Kandev external MCP endpoint (default: http://127.0.0.1:38429/mcp)",
+    )
     return parser
 
 
@@ -82,9 +100,15 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("--port must be between 1 and 65535")
     if not args.mcp_path.startswith("/"):
         parser.error("--mcp-path must start with '/'")
+    if not args.kandev_mcp_url.strip():
+        parser.error("--kandev-mcp-url must not be empty")
 
     service = MemoryService(args.database)
-    server = create_mcp_server(service)
+    kandev = KandevCoordinator(
+        service,
+        lambda: KandevAdapter(args.kandev_mcp_url),
+    )
+    server = create_mcp_server(service, kandev=kandev)
     try:
         if args.transport == "stdio":
             server.run(transport="stdio")

@@ -65,28 +65,49 @@ Implemented and merged:
 - deterministic bounded Context Packs;
 - process-restart / cross-conversation recovery tests.
 
-### P2 — ChatGPT MCP Surface 🚧
+### P2 — ChatGPT MCP Surface ✅
 
-Under development:
+Implemented and merged:
 
 - official MCP Python SDK v2;
 - semantic supervisor tools only;
 - Streamable HTTP endpoint on loopback by default;
 - structured task/context/search/plan responses;
-- model-readable stale-revision and domain errors;
-- in-process protocol tests before real ChatGPT/tunnel integration.
+- safe model-readable stale-revision and domain errors;
+- in-process MCP protocol tests;
+- cross-process task resume without previous ChatGPT history.
 
-See `docs/P1-memory-core.md`, `docs/P2-remote-mcp.md`, and `docs/architecture.md`.
+Real ChatGPT Web + Secure MCP Tunnel connectivity is intentionally deferred until the local integration boundary.
 
-## Local server target
+### P3 — Kandev Adapter 🚧
 
-Once P2 is complete, the default local endpoint will be:
+Under development:
+
+- typed client for Kandev external MCP;
+- runtime capability discovery;
+- revision-safe Supervisor Task ↔ Kandev Task binding;
+- stable Kandev `external_id` for idempotent provisioning;
+- Kandev session/conversation observation through Supervisor MCP;
+- safe integration error boundary;
+- `start_agent=false` and `autopilot=false` hard gate until P4.
+
+See `docs/P1-memory-core.md`, `docs/P2-remote-mcp.md`, `docs/P3-kandev-adapter.md`, and `docs/architecture.md`.
+
+## Local server targets
+
+Supervisor MCP:
 
 ```text
 http://127.0.0.1:8765/mcp
 ```
 
-The server is intended to remain bound to localhost and be exposed to ChatGPT through an authenticated Secure MCP Tunnel rather than directly to the public internet.
+Kandev external MCP default:
+
+```text
+http://127.0.0.1:38429/mcp
+```
+
+Both are expected to remain local. Supervisor MCP will later be exposed to ChatGPT through an authenticated Secure MCP Tunnel rather than opening the local service directly to the public internet.
 
 ## Design principles
 
@@ -99,12 +120,13 @@ The server is intended to remain bound to localhost and be exposed to ChatGPT th
 - Raw evidence is retrieved progressively instead of injected into every model context.
 - Kandev owns development workflow/worktrees; Codex Control Plane owns Codex runtime state; GitHub owns code/PR/CI facts.
 - The ChatGPT-facing MCP surface exposes semantic operations, not unrestricted local execution.
+- Kandev provisioning alone never starts an agent; Codex execution must pass the later supervised plan/control gate.
 
 ## Planned milestones
 
 1. P1 — Memory Core + Context Pack Builder ✅
-2. P2 — Remote MCP surface for ChatGPT 🚧
-3. P3 — Kandev adapter
+2. P2 — Remote MCP surface for ChatGPT ✅
+3. P3 — Kandev adapter 🚧
 4. P4 — Codex live control and steering
 5. P5 — Checkpoints and supervisor review
 6. P6 — Human override and hard replan

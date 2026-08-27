@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from codex_supervisor_bridge.integrations.kandev_models import KandevTaskBinding
 from codex_supervisor_bridge.memory.context_pack import BuiltContextPack
 from codex_supervisor_bridge.memory.models import (
     Constraint,
@@ -66,3 +67,8 @@ class PlanResponse(BaseModel):
 class EventResponse(BaseModel):
     task: TaskMemory
     event: TaskEvent
+
+
+class KandevProvisionResponse(BaseModel):
+    task: TaskMemory
+    binding: KandevTaskBinding

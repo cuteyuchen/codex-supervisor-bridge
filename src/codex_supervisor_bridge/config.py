@@ -14,6 +14,7 @@ class Settings:
     database_path: Path
     host: str = "127.0.0.1"
     port: int = 8765
+    kandev_mcp_url: str = "http://127.0.0.1:38429/mcp"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -22,10 +23,18 @@ class Settings:
         ).expanduser()
         host = os.getenv("SUPERVISOR_HOST", "127.0.0.1")
         port_text = os.getenv("SUPERVISOR_PORT", "8765")
+        kandev_mcp_url = os.getenv("KANDEV_MCP_URL", "http://127.0.0.1:38429/mcp").strip()
         try:
             port = int(port_text)
         except ValueError as exc:
             raise ValueError("SUPERVISOR_PORT must be an integer") from exc
         if not 1 <= port <= 65535:
             raise ValueError("SUPERVISOR_PORT must be between 1 and 65535")
-        return cls(database_path=database_path, host=host, port=port)
+        if not kandev_mcp_url:
+            raise ValueError("KANDEV_MCP_URL must not be empty")
+        return cls(
+            database_path=database_path,
+            host=host,
+            port=port,
+            kandev_mcp_url=kandev_mcp_url,
+        )

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from functools import wraps
 from typing import ParamSpec, TypeVar
 
 from mcp.server.mcpserver.exceptions import ToolError
 
+from codex_supervisor_bridge.integrations.kandev_errors import KandevError
 from codex_supervisor_bridge.memory.errors import MemoryErrorBase
 
 P = ParamSpec("P")
@@ -27,6 +28,21 @@ def expose_memory_errors(fn: Callable[P, R]) -> Callable[P, R]:
         try:
             return fn(*args, **kwargs)
         except MemoryErrorBase as exc:
+            raise ToolError(str(exc)) from exc
+
+    return wrapped
+
+
+def expose_integration_errors(
+    fn: Callable[P, Awaitable[R]],
+) -> Callable[P, Awaitable[R]]:
+    """Expose only anticipated cross-system domain failures to the model."""
+
+    @wraps(fn)
+    async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+        try:
+            return await fn(*args, **kwargs)
+        except (MemoryErrorBase, KandevError) as exc:
             raise ToolError(str(exc)) from exc
 
     return wrapped

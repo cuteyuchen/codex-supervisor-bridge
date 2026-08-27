@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from .errors import ConflictError
@@ -43,7 +44,7 @@ def _handoff_from_row(row: Any) -> ExecutionHandoff:
         writer_epoch=row["writer_epoch"],
         git_head=row["git_head"],
         change_ref=row["change_ref"],
-        validation={} if not row["validation_json"] else __import__("json").loads(row["validation_json"]),
+        validation={} if not row["validation_json"] else json.loads(row["validation_json"]),
         reason=row["reason"],
         actor=row["actor"],
         created_at=_dt(row["created_at"]),
@@ -83,6 +84,27 @@ def list_execution_handoffs(
 def _assert_task_can_write(phase: TaskPhase) -> None:
     if phase in _TERMINAL_PHASES:
         raise ConflictError(f"Task phase does not allow a writer: {phase.value}")
+
+
+def _assert_workspace_transition_safe(conn: Any, task_id: str) -> None:
+    prepared = conn.execute(
+        "SELECT operation_id, operation_type FROM direct_workspace_operations "
+        "WHERE task_id = ? AND status = 'PREPARED' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if prepared is not None:
+        raise ConflictError(
+            "Direct workspace operation is still in progress; finish, interrupt, or reconcile it "
+            f"before changing writer ownership ({prepared['operation_type']}:{prepared['operation_id']})"
+        )
+    workspace = conn.execute(
+        "SELECT state FROM task_workspace_state WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    if workspace is not None and workspace["state"] == "RECONCILIATION_REQUIRED":
+        raise ConflictError(
+            "Workspace requires reconciliation before changing execution mode or writer ownership"
+        )
 
 
 def _assert_writer_allowed(
@@ -132,6 +154,7 @@ def set_execution_mode(
         state_before = _state_from_row(state_row)
         if state_before.execution_mode == mode:
             return ExecutionMutationResult(task=task_before, execution=state_before)
+        _assert_workspace_transition_safe(conn, task_id)
         if state_before.active_writer == ActiveWriter.CHATGPT and mode == ExecutionMode.CODEX_SUPERVISED:
             raise ConflictError("Release or hand off the ChatGPT writer before switching to CODEX_SUPERVISED")
         if state_before.active_writer == ActiveWriter.CODEX and mode == ExecutionMode.DIRECT:
@@ -225,6 +248,7 @@ def acquire_writer(
         store._assert_revision(task_row, expected_revision)
         task_before = store._task_from_row(task_row)
         _assert_task_can_write(task_before.phase)
+        _assert_workspace_transition_safe(conn, task_id)
         state_row = conn.execute(
             "SELECT * FROM task_execution_state WHERE task_id = ?",
             (task_id,),
@@ -297,6 +321,7 @@ def release_writer(
             raise ConflictError(
                 f"Writer epoch mismatch: expected={expected_writer_epoch}, current={state_before.writer_epoch}"
             )
+        _assert_workspace_transition_safe(conn, task_id)
         task = store._update_task(conn, task_id, expected_revision)
         conn.execute(
             """
@@ -366,6 +391,7 @@ def handoff_writer(
             raise ConflictError(
                 f"Writer epoch mismatch: expected={expected_writer_epoch}, current={state_before.writer_epoch}"
             )
+        _assert_workspace_transition_safe(conn, task_id)
         _assert_writer_allowed(
             state_before,
             to_writer,

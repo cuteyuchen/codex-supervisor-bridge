@@ -19,8 +19,13 @@ from codex_supervisor_bridge.memory.agent_safety import (
 )
 from codex_supervisor_bridge.memory.codex_runtime import get_codex_runtime
 from codex_supervisor_bridge.memory.errors import ConflictError
-from codex_supervisor_bridge.memory.execution import acquire_writer, handoff_writer, release_writer
-from codex_supervisor_bridge.memory.models import ActiveWriter
+from codex_supervisor_bridge.memory.execution import (
+    acquire_writer,
+    handoff_writer,
+    release_writer,
+    set_execution_mode,
+)
+from codex_supervisor_bridge.memory.models import ActiveWriter, ExecutionMode
 from codex_supervisor_bridge.memory.service import MemoryService
 from codex_supervisor_bridge.memory.workspace import bind_workspace, prepare_direct_operation
 from codex_supervisor_bridge.supervisor.agent_execution import (
@@ -416,6 +421,13 @@ def test_compensation_latch_blocks_all_writes_while_interrupt_is_in_flight() -> 
                 current.revision,
                 ActiveWriter.CODEX,
                 explicit_user_authorization=True,
+            )
+        with pytest.raises(ConflictError, match="compensation requires reconciliation"):
+            set_execution_mode(
+                memory.store,
+                task.task_id,
+                current.revision,
+                ExecutionMode.DIRECT,
             )
         with pytest.raises(AgentPlanGateError, match="compensation requires reconciliation"):
             await coordinator.start_plan(

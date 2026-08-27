@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from codex_supervisor_bridge.integrations import kandev_errors, kandev_models
 from mcp import Client
+
+from codex_supervisor_bridge.integrations import kandev_errors, kandev_models
 
 
 REQUIRED_EXTERNAL_TOOLS = {

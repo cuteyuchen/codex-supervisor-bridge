@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from types import TracebackType
 from typing import Any
 
 from mcp import Client
@@ -55,7 +54,7 @@ class KandevAdapter:
         self,
         exc_type: type[BaseException] | None,
         exc: BaseException | None,
-        tb: TracebackType | None,
+        tb: object | None,
     ) -> None:
         try:
             await self._client.__aexit__(exc_type, exc, tb)

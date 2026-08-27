@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = r"""
 PRAGMA foreign_keys = ON;
@@ -177,6 +177,61 @@ ON codex_runtime_state(workflow_id);
 
 CREATE INDEX IF NOT EXISTS idx_codex_runtime_operation
 ON codex_runtime_state(operation_id);
+"""
+
+CHECKPOINT_MIGRATION_SQL = r"""
+CREATE TABLE IF NOT EXISTS codex_checkpoints (
+    checkpoint_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES supervised_tasks(task_id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence >= 1),
+    checkpoint_type TEXT NOT NULL,
+    task_revision INTEGER NOT NULL CHECK (task_revision >= 0),
+    intent_version INTEGER NOT NULL CHECK (intent_version >= 1),
+    plan_version INTEGER NOT NULL CHECK (plan_version >= 0),
+    workflow_id TEXT,
+    operation_id TEXT,
+    thread_id TEXT,
+    turn_id TEXT,
+    remote_status TEXT,
+    next_action TEXT,
+    trigger_reason TEXT NOT NULL,
+    completed_json TEXT NOT NULL DEFAULT '[]',
+    in_progress_json TEXT NOT NULL DEFAULT '[]',
+    files_changed_json TEXT NOT NULL DEFAULT '[]',
+    validation_json TEXT NOT NULL DEFAULT '{}',
+    assumptions_json TEXT NOT NULL DEFAULT '[]',
+    deviations_json TEXT NOT NULL DEFAULT '[]',
+    blockers_json TEXT NOT NULL DEFAULT '[]',
+    risks_json TEXT NOT NULL DEFAULT '[]',
+    next_steps_json TEXT NOT NULL DEFAULT '[]',
+    evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+    source_fingerprint TEXT NOT NULL,
+    raw_event_count INTEGER NOT NULL DEFAULT 0 CHECK (raw_event_count >= 0),
+    requires_review INTEGER NOT NULL DEFAULT 0 CHECK (requires_review IN (0, 1)),
+    created_at TEXT NOT NULL,
+    UNIQUE(task_id, sequence),
+    UNIQUE(task_id, source_fingerprint)
+);
+
+CREATE INDEX IF NOT EXISTS idx_codex_checkpoints_task_sequence
+ON codex_checkpoints(task_id, sequence DESC);
+
+CREATE INDEX IF NOT EXISTS idx_codex_checkpoints_review
+ON codex_checkpoints(task_id, requires_review, sequence DESC);
+
+CREATE TABLE IF NOT EXISTS checkpoint_reviews (
+    review_id TEXT PRIMARY KEY,
+    checkpoint_id TEXT NOT NULL REFERENCES codex_checkpoints(checkpoint_id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES supervised_tasks(task_id) ON DELETE CASCADE,
+    decision TEXT NOT NULL,
+    instruction TEXT,
+    reviewed_revision INTEGER NOT NULL CHECK (reviewed_revision >= 0),
+    created_at TEXT NOT NULL,
+    UNIQUE(checkpoint_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_checkpoint_reviews_task
+ON checkpoint_reviews(task_id, created_at DESC);
 """
 
 OPTIONAL_FTS_SQL = r"""

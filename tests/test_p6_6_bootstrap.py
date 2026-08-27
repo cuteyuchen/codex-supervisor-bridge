@@ -161,6 +161,26 @@ def test_process_manager_does_not_clear_ambiguous_live_pid(tmp_path: Path, monke
     assert manager.repair_stale("bridge").status == "UNKNOWN"
 
 
+def test_process_manager_does_not_start_duplicate_for_ambiguous_live_pid(tmp_path: Path, monkeypatch) -> None:
+    launched: list[object] = []
+
+    manager = ProcessManager(
+        tmp_path / "runtime",
+        tmp_path / "logs",
+        launcher=lambda *args, **kwargs: launched.append((args, kwargs)),
+    )
+    (tmp_path / "runtime" / "processes.json").write_text(
+        json.dumps({"bridge": {"status": "RUNNING", "pid": 42, "restart_count": 0}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("codex_supervisor_bridge.bootstrap.process._pid_exists", lambda pid: pid == 42)
+
+    state = manager.start(ManagedProcessSpec(name="bridge", command=["dummy"]), restart=True)
+
+    assert state.status == "UNKNOWN"
+    assert launched == []
+
+
 def test_doctor_user_view_does_not_leak_provider_details(tmp_path: Path) -> None:
     paths = AppDataPaths.from_environment(
         environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},

@@ -7,6 +7,8 @@ from .errors import ConflictError
 from .models import ActiveWriter, Actor, EventType, ExecutionMode, TaskMemory, utcnow
 from .store import MemoryStore, _dt, _id, _iso, _json
 from .workspace_models import (
+    DirectCommandSession,
+    DirectCommandSessionStatus,
     DirectOperationCompleteResult,
     DirectOperationPrepareResult,
     DirectOperationStatus,
@@ -55,6 +57,19 @@ def _operation_from_row(row: Any) -> DirectWorkspaceOperation:
     )
 
 
+def _command_session_from_row(row: Any) -> DirectCommandSession:
+    return DirectCommandSession(
+        task_id=row["task_id"],
+        command_id=row["command_id"],
+        writer_epoch=row["writer_epoch"],
+        status=DirectCommandSessionStatus(row["status"]),
+        started_revision=row["started_revision"],
+        completed_revision=row["completed_revision"],
+        created_at=_dt(row["created_at"]),
+        updated_at=_dt(row["updated_at"]),
+    )
+
+
 def get_workspace_binding(store: MemoryStore, task_id: str) -> WorkspaceBinding | None:
     store.get_task(task_id)
     with store._lock:
@@ -77,6 +92,133 @@ def get_prepared_direct_operation(
             (task_id,),
         ).fetchone()
     return _operation_from_row(row) if row is not None else None
+
+
+def get_active_direct_command_session(
+    store: MemoryStore,
+    task_id: str,
+) -> DirectCommandSession | None:
+    store.get_task(task_id)
+    with store._lock:
+        row = store._conn.execute(
+            "SELECT * FROM direct_command_sessions "
+            "WHERE task_id = ? AND status = 'RUNNING' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    return _command_session_from_row(row) if row is not None else None
+
+
+def get_direct_command_session(
+    store: MemoryStore,
+    task_id: str,
+    command_id: str,
+) -> DirectCommandSession | None:
+    store.get_task(task_id)
+    with store._lock:
+        row = store._conn.execute(
+            "SELECT * FROM direct_command_sessions WHERE task_id = ? AND command_id = ?",
+            (task_id, command_id),
+        ).fetchone()
+    return _command_session_from_row(row) if row is not None else None
+
+
+def record_direct_command_session(
+    store: MemoryStore,
+    task_id: str,
+    command_id: str,
+    *,
+    writer_epoch: int,
+    status: DirectCommandSessionStatus,
+    started_revision: int,
+) -> DirectCommandSession:
+    if not command_id.strip():
+        raise ValueError("command_id must not be empty")
+    now_text = _iso()
+    with store._write() as conn:
+        task = store._task_from_row(store._task_row(conn, task_id))
+        existing = conn.execute(
+            "SELECT * FROM direct_command_sessions WHERE task_id = ? AND command_id = ?",
+            (task_id, command_id),
+        ).fetchone()
+        if existing is not None:
+            session = _command_session_from_row(existing)
+            if session.writer_epoch != writer_epoch or session.started_revision != started_revision:
+                raise ConflictError("Direct command session identity changed")
+            conn.execute(
+                "UPDATE direct_command_sessions SET status = ?, updated_at = ? "
+                "WHERE task_id = ? AND command_id = ?",
+                (status.value, now_text, task_id, command_id),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO direct_command_sessions(
+                    task_id, command_id, writer_epoch, status, started_revision,
+                    completed_revision, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (task_id, command_id, writer_epoch, status.value, started_revision, now_text, now_text),
+            )
+        updated = conn.execute(
+            "SELECT * FROM direct_command_sessions WHERE task_id = ? AND command_id = ?",
+            (task_id, command_id),
+        ).fetchone()
+        store._insert_event(
+            conn,
+            task,
+            Actor.SUPERVISOR,
+            EventType.DIRECT_COMMAND_RECORDED,
+            {
+                "kind": "DIRECT_COMMAND_SESSION_RECORDED",
+                "command_id": command_id,
+                "status": status.value,
+                "writer_epoch": writer_epoch,
+                "started_revision": started_revision,
+            },
+        )
+        return _command_session_from_row(updated)
+
+
+def complete_direct_command_session(
+    store: MemoryStore,
+    task_id: str,
+    command_id: str,
+    *,
+    status: DirectCommandSessionStatus,
+    completed_revision: int | None,
+) -> DirectCommandSession:
+    now_text = _iso()
+    with store._write() as conn:
+        task = store._task_from_row(store._task_row(conn, task_id))
+        row = conn.execute(
+            "SELECT * FROM direct_command_sessions WHERE task_id = ? AND command_id = ?",
+            (task_id, command_id),
+        ).fetchone()
+        if row is None:
+            raise ConflictError(f"Unknown direct command session: {command_id}")
+        conn.execute(
+            "UPDATE direct_command_sessions SET status = ?, completed_revision = ?, updated_at = ? "
+            "WHERE task_id = ? AND command_id = ?",
+            (status.value, completed_revision, now_text, task_id, command_id),
+        )
+        updated = conn.execute(
+            "SELECT * FROM direct_command_sessions WHERE task_id = ? AND command_id = ?",
+            (task_id, command_id),
+        ).fetchone()
+        store._insert_event(
+            conn,
+            task,
+            Actor.SUPERVISOR,
+            EventType.DIRECT_COMMAND_RECORDED,
+            {
+                "kind": "DIRECT_COMMAND_SESSION_COMPLETED",
+                "command_id": command_id,
+                "status": status.value,
+                "completed_revision": completed_revision,
+            },
+        )
+        return _command_session_from_row(updated)
 
 
 def bind_workspace(
@@ -335,11 +477,16 @@ def prepare_direct_operation(
                 now_text,
             ),
         )
+        event_type = (
+            EventType.DIRECT_COMMAND_RECORDED
+            if operation.operation_type == "RUN_COMMAND"
+            else EventType.STATE_RECONCILED
+        )
         store._insert_event(
             conn,
             task,
             Actor.SUPERVISOR,
-            EventType.STATE_RECONCILED,
+            event_type,
             {
                 "kind": "DIRECT_WORKSPACE_OPERATION_PREPARED",
                 "operation_id": operation.operation_id,

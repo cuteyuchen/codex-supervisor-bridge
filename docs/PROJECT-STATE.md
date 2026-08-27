@@ -348,6 +348,10 @@ The first implementation slice is intentionally backend-neutral and layered:
 - fail-closed runtime recovery for orphaned Codex writer ownership;
 - controlled Direct Workspace command authorization with bounded sessions and
   command evidence;
+- durable Direct Workspace command-session identity/status with restart resume
+  and UNKNOWN-outcome reconciliation;
+- fail-closed ambiguous process-PID handling and loopback-only local MCP HTTP
+  binding;
 - fake process/provider harnesses for Profile A/B semantic comparison.
 
 The current code-level work does not claim real Windows OAuth, ChatGPT Web

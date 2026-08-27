@@ -32,6 +32,8 @@ def test_execution_tools_are_semantic_bounded_and_annotated() -> None:
                 "acquire_codex_workspace_writer",
                 "release_workspace_writer",
                 "handoff_workspace_writer",
+                "run_direct_workspace_command",
+                "poll_direct_workspace_command",
             }
             assert expected <= set(tools)
 

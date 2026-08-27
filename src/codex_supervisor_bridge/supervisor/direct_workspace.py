@@ -25,15 +25,22 @@ from codex_supervisor_bridge.memory.models import ActiveWriter, EvidenceType
 from codex_supervisor_bridge.memory.service import MemoryService
 from codex_supervisor_bridge.memory.workspace import (
     bind_workspace,
+    complete_direct_command_session,
     complete_direct_operation,
+    get_active_direct_command_session,
+    get_direct_command_session,
     get_prepared_direct_operation,
     get_workspace_binding,
     mark_direct_operation_reconciliation_required,
     prepare_direct_operation,
+    record_direct_command_session,
     update_prepared_operation_details,
     update_workspace_derived,
 )
-from codex_supervisor_bridge.memory.workspace_models import WorkspaceBindingStatus
+from codex_supervisor_bridge.memory.workspace_models import (
+    DirectCommandSessionStatus,
+    WorkspaceBindingStatus,
+)
 
 from .direct_models import (
     DirectWorkspaceCommandResult,
@@ -44,6 +51,7 @@ from .direct_models import (
 )
 
 WorkspaceAdapterFactory = Callable[[], AbstractAsyncContextManager[WorkspaceBackend]]
+MAX_COMMAND_OUTPUT_CHARS = 20_000
 
 
 def _digest(value: str) -> str:
@@ -81,6 +89,7 @@ class DirectWorkspaceCoordinator:
             execution=get_execution_state(self.memory.store, task_id),
             workspace=get_workspace_binding(self.memory.store, task_id),
             prepared_operation=get_prepared_direct_operation(self.memory.store, task_id),
+            command_session=get_active_direct_command_session(self.memory.store, task_id),
         )
 
     async def open(
@@ -349,11 +358,11 @@ class DirectWorkspaceCoordinator:
         )
         try:
             async with self.adapter_factory() as adapter:
-                result = await adapter.run_command(
+                result = _bound_command_result(await adapter.run_command(
                     prepared.workspace.workspace_id,
                     command,
                     lease=lease,
-                )
+                ))
         except Exception as exc:
             mark_direct_operation_reconciliation_required(
                 self.memory.store,
@@ -374,11 +383,43 @@ class DirectWorkspaceCoordinator:
             },
         )
         if result.status == "running":
+            if not result.command_id:
+                unresolved = mark_direct_operation_reconciliation_required(
+                    self.memory.store,
+                    task_id,
+                    operation.operation_id,
+                    summary="Running command returned no resumable session ID.",
+                    details={"command_status": result.status},
+                )
+                return DirectWorkspaceCommandResult(
+                    task=unresolved.task,
+                    authorization=authorization,
+                    command=result.model_copy(update={"status": "unknown"}),
+                    operation=unresolved.operation,
+                    reconciliation_required=True,
+                )
+            record_direct_command_session(
+                self.memory.store,
+                task_id,
+                result.command_id,
+                writer_epoch=expected_writer_epoch,
+                status=DirectCommandSessionStatus.RUNNING,
+                started_revision=prepared.task.revision,
+            )
             return DirectWorkspaceCommandResult(
                 task=self.memory.get_task(task_id),
                 authorization=authorization,
                 command=result,
                 operation=operation,
+            )
+        if result.command_id:
+            record_direct_command_session(
+                self.memory.store,
+                task_id,
+                result.command_id,
+                writer_epoch=expected_writer_epoch,
+                status=_session_status(result.status),
+                started_revision=prepared.task.revision,
             )
         return await self._finish_command(
             task_id,
@@ -403,24 +444,68 @@ class DirectWorkspaceCoordinator:
             raise ValueError("No active direct command session is available")
         if operation.operation_type != "RUN_COMMAND" or operation.details.get("command_id") != command_id:
             raise ValueError("Unknown direct command session")
-        async with self.adapter_factory() as adapter:
-            result = await adapter.poll_command(
-                binding.workspace_id,
-                command_id,
-                input_text=input_text,
-                interrupt=interrupt,
+        session = get_direct_command_session(self.memory.store, task_id, command_id)
+        if session is not None and session.status != DirectCommandSessionStatus.RUNNING:
+            raise ValueError(f"Direct command session is already {session.status.value.lower()}")
+        try:
+            async with self.adapter_factory() as adapter:
+                result = _bound_command_result(await adapter.poll_command(
+                    binding.workspace_id,
+                    command_id,
+                    input_text=input_text,
+                    interrupt=interrupt,
+                ))
+        except Exception as exc:
+            mark_direct_operation_reconciliation_required(
+                self.memory.store,
+                task_id,
+                operation.operation_id,
+                summary="Command session outcome could not be confirmed after polling.",
+                details={"error_type": type(exc).__name__},
             )
+            if session is not None:
+                complete_direct_command_session(
+                    self.memory.store,
+                    task_id,
+                    command_id,
+                    status=DirectCommandSessionStatus.UNKNOWN,
+                    completed_revision=None,
+                )
+            raise
         authorization = CommandAuthorization(
             verdict=CommandVerdict.ALLOW,
             user_message="Command session is authorized for the supervised project.",
             reason="existing_authorized_session",
         )
         if result.status == "running":
+            if not result.command_id:
+                unresolved = mark_direct_operation_reconciliation_required(
+                    self.memory.store,
+                    task_id,
+                    operation.operation_id,
+                    summary="Running command poll returned no resumable session ID.",
+                    details={"command_status": result.status},
+                )
+                return DirectWorkspaceCommandResult(
+                    task=unresolved.task,
+                    authorization=authorization,
+                    command=result.model_copy(update={"status": "unknown"}),
+                    operation=unresolved.operation,
+                    reconciliation_required=True,
+                )
             operation = update_prepared_operation_details(
                 self.memory.store,
                 task_id,
                 operation.operation_id,
                 details={"command_status": result.status},
+            )
+            record_direct_command_session(
+                self.memory.store,
+                task_id,
+                command_id,
+                writer_epoch=operation.writer_epoch,
+                status=DirectCommandSessionStatus.RUNNING,
+                started_revision=operation.prepared_revision,
             )
             return DirectWorkspaceCommandResult(
                 task=self.memory.get_task(task_id),
@@ -444,6 +529,31 @@ class DirectWorkspaceCoordinator:
         result: CommandResult,
         writer_epoch: int,
     ) -> DirectWorkspaceCommandResult:
+        if result.status.lower() == "unknown":
+            unresolved = mark_direct_operation_reconciliation_required(
+                self.memory.store,
+                task_id,
+                operation_id,
+                summary="Command outcome is unknown; reconcile the workspace before another mutation.",
+                details={"command_status": result.status},
+            )
+            if result.command_id is not None and get_direct_command_session(
+                self.memory.store, task_id, result.command_id
+            ) is not None:
+                complete_direct_command_session(
+                    self.memory.store,
+                    task_id,
+                    result.command_id,
+                    status=DirectCommandSessionStatus.UNKNOWN,
+                    completed_revision=None,
+                )
+            return DirectWorkspaceCommandResult(
+                task=unresolved.task,
+                authorization=authorization,
+                command=result,
+                operation=unresolved.operation,
+                reconciliation_required=True,
+            )
         binding = get_workspace_binding(self.memory.store, task_id)
         if binding is None:
             raise ValueError("No active supervised workspace is bound to this task")
@@ -468,6 +578,16 @@ class DirectWorkspaceCoordinator:
                 "stderr_chars": len(result.stderr),
             },
         )
+        if result.command_id is not None and get_direct_command_session(
+            self.memory.store, task_id, result.command_id
+        ) is not None:
+            complete_direct_command_session(
+                self.memory.store,
+                task_id,
+                result.command_id,
+                status=_session_status(result.status),
+                completed_revision=completed.task.revision,
+            )
         self.memory.store.add_evidence(
             task_id,
             EvidenceType.TEST_LOG,
@@ -491,3 +611,28 @@ class DirectWorkspaceCoordinator:
             review=review,
             reconciliation_required=completed.reconciliation_required,
         )
+
+
+def _bound_command_result(result: CommandResult) -> CommandResult:
+    stdout = result.stdout[:MAX_COMMAND_OUTPUT_CHARS]
+    stderr = result.stderr[:MAX_COMMAND_OUTPUT_CHARS]
+    return result.model_copy(
+        update={
+            "stdout": stdout,
+            "stderr": stderr,
+            "truncated": result.truncated
+            or len(stdout) != len(result.stdout)
+            or len(stderr) != len(result.stderr),
+        }
+    )
+
+
+def _session_status(status: str) -> DirectCommandSessionStatus:
+    normalized = status.upper()
+    if normalized == "RUNNING":
+        return DirectCommandSessionStatus.RUNNING
+    if normalized == "INTERRUPTED":
+        return DirectCommandSessionStatus.INTERRUPTED
+    if normalized == "UNKNOWN":
+        return DirectCommandSessionStatus.UNKNOWN
+    return DirectCommandSessionStatus.COMPLETED

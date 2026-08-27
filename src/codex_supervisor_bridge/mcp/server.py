@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 from pathlib import Path
 
@@ -83,6 +84,11 @@ Supervisor facade after the WorkspaceBackend adapter is available. Do not
 assume arbitrary raw filesystem or system shell access. Existing Kandev and
 Codex Control Plane integrations are backend implementations/fallbacks, not
 permanent Supervisor Core ownership boundaries.
+
+Direct command execution is also constrained by the Supervisor facade. It is
+workspace-bound, revision/writer fenced, bounded in output and duration, and
+defaults to ASK. Dangerous commands fail closed; an UNKNOWN command outcome
+requires reconciliation before another mutation.
 """.strip()
 
 
@@ -211,6 +217,8 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("--devspace-mcp-url must not be empty")
     if not args.codex_control_command.strip():
         parser.error("--codex-control-command must not be empty")
+    if args.transport != "stdio" and not _is_loopback_host(args.host):
+        parser.error("HTTP MCP must bind to loopback; use a secure HTTPS tunnel for remote access")
 
     service = MemoryService(args.database)
     kandev = KandevCoordinator(
@@ -248,6 +256,16 @@ def main(argv: list[str] | None = None) -> None:
             )
     finally:
         service.close()
+
+
+def _is_loopback_host(host: str) -> bool:
+    normalized = host.strip().lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 
 if __name__ == "__main__":

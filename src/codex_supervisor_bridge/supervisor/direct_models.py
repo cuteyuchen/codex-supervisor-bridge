@@ -7,6 +7,7 @@ from codex_supervisor_bridge.bootstrap.command_auth import CommandAuthorization
 from codex_supervisor_bridge.memory.execution_models import ExecutionState
 from codex_supervisor_bridge.memory.models import TaskMemory
 from codex_supervisor_bridge.memory.workspace_models import (
+    DirectCommandSession,
     DirectWorkspaceOperation,
     WorkspaceBinding,
 )
@@ -49,3 +50,4 @@ class DirectWorkspaceStatus(BaseModel):
     execution: ExecutionState
     workspace: WorkspaceBinding | None = None
     prepared_operation: DirectWorkspaceOperation | None = None
+    command_session: DirectCommandSession | None = None

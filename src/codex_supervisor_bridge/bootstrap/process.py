@@ -80,6 +80,18 @@ class ProcessManager:
                     technical_detail="restart limit reached",
                 )
             )
+        if current.status == "UNKNOWN":
+            return self._record(
+                ProcessState(
+                    spec.name,
+                    "UNKNOWN",
+                    pid=current.pid,
+                    last_exit=current.last_exit,
+                    log_path=current.log_path,
+                    restart_count=current.restart_count,
+                    technical_detail="persisted PID is alive without an attached process handle",
+                )
+            )
         if current.status == "RUNNING":
             self.stop(spec.name, timeout=spec.shutdown_timeout)
         log_path = self.logs_dir / f"{_safe_name(spec.name)}.log"
@@ -88,7 +100,7 @@ class ProcessManager:
             lock_path.open("x", encoding="utf-8").close()
         except FileExistsError:
             lock_state = self.health(spec.name)
-            if lock_state.status in {"STALE", "UNKNOWN", "STOPPED", "CRASHED"}:
+            if lock_state.status in {"STALE", "STOPPED", "CRASHED"}:
                 lock_path.unlink(missing_ok=True)
                 lock_path.open("x", encoding="utf-8").close()
             else:
@@ -250,6 +262,8 @@ def _pid_exists(pid: int) -> bool:
         return False
     try:
         os.kill(pid, 0)
+    except PermissionError:
+        return True
     except (OSError, ProcessLookupError):
         return False
     return True

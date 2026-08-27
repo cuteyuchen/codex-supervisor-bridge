@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-from codex_supervisor_bridge.backends.models import ChangeReview, GitState
+from codex_supervisor_bridge.backends.models import ChangeReview, CommandResult, GitState
+from codex_supervisor_bridge.bootstrap.command_auth import CommandAuthorization
 from codex_supervisor_bridge.memory.execution_models import ExecutionState
 from codex_supervisor_bridge.memory.models import TaskMemory
 from codex_supervisor_bridge.memory.workspace_models import (
@@ -30,6 +31,16 @@ class DirectWorkspacePatchResult(BaseModel):
     operation: DirectWorkspaceOperation
     review: ChangeReview
     git: GitState
+    reconciliation_required: bool = False
+
+
+class DirectWorkspaceCommandResult(BaseModel):
+    task: TaskMemory
+    authorization: CommandAuthorization
+    command: CommandResult | None = None
+    operation: DirectWorkspaceOperation | None = None
+    git: GitState | None = None
+    review: ChangeReview | None = None
     reconciliation_required: bool = False
 
 

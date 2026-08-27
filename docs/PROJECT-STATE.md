@@ -346,6 +346,8 @@ The first implementation slice is intentionally backend-neutral and layered:
 - secret storage and secure remote access abstractions with redaction tests;
 - Codex readiness fields for executable/process/version/auth/workspace checks;
 - fail-closed runtime recovery for orphaned Codex writer ownership;
+- controlled Direct Workspace command authorization with bounded sessions and
+  command evidence;
 - fake process/provider harnesses for Profile A/B semantic comparison.
 
 The current code-level work does not claim real Windows OAuth, ChatGPT Web

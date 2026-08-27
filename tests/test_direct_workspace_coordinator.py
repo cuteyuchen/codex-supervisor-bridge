@@ -15,6 +15,7 @@ from codex_supervisor_bridge.backends.models import (
     WorkspaceState,
     WriterLeaseToken,
 )
+from codex_supervisor_bridge.bootstrap.command_auth import CommandAuthorizationPolicy
 from codex_supervisor_bridge.memory.execution import acquire_writer, get_execution_state
 from codex_supervisor_bridge.memory.models import ActiveWriter, Actor
 from codex_supervisor_bridge.memory.service import MemoryService
@@ -37,6 +38,19 @@ class FakeWorkspaceAdapter:
         self.patch_error = patch_error
         self.open_calls = 0
         self.patch_calls = 0
+        self.command_calls = 0
+        self.command_result = CommandResult(
+            command_id="17",
+            status="completed",
+            exit_code=0,
+            stdout="ok",
+        )
+        self.poll_result = CommandResult(
+            command_id="17",
+            status="completed",
+            exit_code=0,
+            stdout="done",
+        )
         self.git = GitState(
             branch="main",
             head="a" * 40,
@@ -113,7 +127,8 @@ class FakeWorkspaceAdapter:
         yield_time_ms: int = 10_000,
         tty: bool = False,
     ) -> CommandResult:
-        raise NotImplementedError
+        self.command_calls += 1
+        return self.command_result
 
     async def poll_command(
         self,
@@ -123,7 +138,7 @@ class FakeWorkspaceAdapter:
         input_text: str | None = None,
         interrupt: bool = False,
     ) -> CommandResult:
-        raise NotImplementedError
+        return self.poll_result
 
     async def show_changes(self, workspace_id: str) -> ChangeReview:
         return ChangeReview(
@@ -208,6 +223,71 @@ def test_open_read_and_patch_are_durable_and_revision_fenced(tmp_path: Path) -> 
         assert get_execution_state(reopened.store, "DIRECT-COORD").active_writer == ActiveWriter.CHATGPT
     finally:
         reopened.close()
+
+
+def test_direct_command_defaults_to_ask_and_records_completed_evidence() -> None:
+    memory = MemoryService()
+    adapter = FakeWorkspaceAdapter()
+    coordinator, revision, epoch = setup_direct(memory, adapter)
+
+    async def scenario() -> None:
+        pending = await coordinator.run_command(
+            "DIRECT-COORD",
+            revision,
+            epoch,
+            "pytest",
+        )
+        assert pending.authorization.verdict.value == "ASK"
+        assert pending.command is None
+        assert adapter.command_calls == 0
+
+        completed = await coordinator.run_command(
+            "DIRECT-COORD",
+            revision,
+            epoch,
+            "pytest",
+            approved=True,
+            policy=CommandAuthorizationPolicy.ASK,
+        )
+        assert completed.authorization.verdict.value == "ALLOW"
+        assert completed.command is not None
+        assert completed.command.exit_code == 0
+        assert completed.operation is not None
+        assert completed.operation.status == DirectOperationStatus.SUCCEEDED
+        assert adapter.command_calls == 1
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        memory.close()
+
+
+def test_direct_command_long_session_can_be_polled_and_interrupted() -> None:
+    memory = MemoryService()
+    adapter = FakeWorkspaceAdapter()
+    adapter.command_result = CommandResult(command_id="18", status="running")
+    adapter.poll_result = CommandResult(command_id="18", status="completed", exit_code=0, stdout="done")
+    coordinator, revision, epoch = setup_direct(memory, adapter)
+
+    async def scenario() -> None:
+        started = await coordinator.run_command(
+            "DIRECT-COORD",
+            revision,
+            epoch,
+            "python -c pass",
+            approved=True,
+            policy=CommandAuthorizationPolicy.ALLOW,
+        )
+        assert started.command is not None and started.command.status == "running"
+        assert started.operation is not None and started.operation.status == DirectOperationStatus.PREPARED
+        finished = await coordinator.poll_command("DIRECT-COORD", "18", interrupt=True)
+        assert finished.command is not None and finished.command.status == "completed"
+        assert finished.operation is not None and finished.operation.status == DirectOperationStatus.SUCCEEDED
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        memory.close()
 
 
 def test_user_intent_change_while_patch_is_in_flight_requires_reconciliation() -> None:

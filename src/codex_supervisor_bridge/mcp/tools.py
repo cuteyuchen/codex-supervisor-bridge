@@ -6,6 +6,7 @@ from mcp.types import ToolAnnotations
 from codex_supervisor_bridge.memory.models import ConstraintSeverity, ContextPackMode
 from codex_supervisor_bridge.memory.service import MemoryService
 
+from .errors import expose_memory_errors, tool_argument_error
 from .models import (
     ConstraintResponse,
     ContextPackResponse,
@@ -40,6 +41,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
     """
 
     @server.tool(annotations=MUTATION)
+    @expose_memory_errors
     def create_supervised_task(
         task_id: str,
         title: str,
@@ -63,11 +65,13 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         return TaskResponse(task=task)
 
     @server.tool(annotations=READ_ONLY)
+    @expose_memory_errors
     def get_supervised_task(task_id: str) -> TaskResponse:
         """Read canonical lightweight task state and current version counters."""
         return TaskResponse(task=service.get_task(task_id))
 
     @server.tool(annotations=READ_ONLY)
+    @expose_memory_errors
     def resume_supervised_task(
         task_id: str,
         mode: ContextPackMode = ContextPackMode.RESUME,
@@ -83,6 +87,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         )
 
     @server.tool(annotations=READ_ONLY)
+    @expose_memory_errors
     def get_context_pack(
         task_id: str,
         mode: ContextPackMode = ContextPackMode.RESUME,
@@ -91,6 +96,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         return ContextPackResponse.from_pack(service.get_context_pack(task_id, mode=mode))
 
     @server.tool(annotations=READ_ONLY)
+    @expose_memory_errors
     def search_task_memory(
         task_id: str,
         query: str,
@@ -102,21 +108,23 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         decisions/plans can be inspected without treating them as current truth.
         """
         if not 1 <= limit <= 50:
-            raise ValueError("limit must be between 1 and 50")
+            raise tool_argument_error("limit must be between 1 and 50")
         hits = service.search_task_memory(task_id, query, limit=limit)
         return SearchResponse(task_id=task_id, query=query, hits=hits)
 
     @server.tool(annotations=READ_ONLY)
+    @expose_memory_errors
     def get_task_timeline(task_id: str, limit: int = 100) -> TimelineResponse:
         """Read the append-only supervisory event timeline for a task."""
         if not 1 <= limit <= 500:
-            raise ValueError("limit must be between 1 and 500")
+            raise tool_argument_error("limit must be between 1 and 500")
         return TimelineResponse(
             task=service.get_task(task_id),
             events=service.timeline(task_id, limit=limit),
         )
 
     @server.tool(annotations=MUTATION)
+    @expose_memory_errors
     def record_user_override(
         task_id: str,
         expected_revision: int,
@@ -132,6 +140,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         return EventResponse(task=service.get_task(task_id), event=event)
 
     @server.tool(annotations=MUTATION)
+    @expose_memory_errors
     def update_task_intent(
         task_id: str,
         expected_revision: int,
@@ -146,6 +155,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         return TaskResponse(task=task)
 
     @server.tool(annotations=MUTATION)
+    @expose_memory_errors
     def add_task_decision(
         task_id: str,
         expected_revision: int,
@@ -164,6 +174,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         return DecisionResponse(task=service.get_task(task_id), decision=decision)
 
     @server.tool(annotations=MUTATION)
+    @expose_memory_errors
     def supersede_task_decision(
         task_id: str,
         expected_revision: int,
@@ -180,6 +191,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         return DecisionResponse(task=service.get_task(task_id), decision=decision)
 
     @server.tool(annotations=MUTATION)
+    @expose_memory_errors
     def add_task_constraint(
         task_id: str,
         expected_revision: int,
@@ -202,6 +214,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         return ConstraintResponse(task=service.get_task(task_id), constraint=constraint)
 
     @server.tool(annotations=MUTATION)
+    @expose_memory_errors
     def supersede_task_constraint(
         task_id: str,
         expected_revision: int,
@@ -218,6 +231,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         return ConstraintResponse(task=service.get_task(task_id), constraint=constraint)
 
     @server.tool(annotations=MUTATION)
+    @expose_memory_errors
     def create_task_plan(
         task_id: str,
         expected_revision: int,
@@ -228,12 +242,14 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         return PlanResponse(task=service.get_task(task_id), plan=plan)
 
     @server.tool(annotations=READ_ONLY)
+    @expose_memory_errors
     def get_current_plan(task_id: str, approved_only: bool = False) -> PlanResponse:
         """Read the latest plan or only the currently approved plan."""
         plan = service.approved_plan(task_id) if approved_only else service.latest_plan(task_id)
         return PlanResponse(task=service.get_task(task_id), plan=plan)
 
     @server.tool(annotations=MUTATION)
+    @expose_memory_errors
     def approve_task_plan(
         task_id: str,
         expected_revision: int,
@@ -244,6 +260,7 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
         return PlanResponse(task=service.get_task(task_id), plan=plan)
 
     @server.tool(annotations=MUTATION)
+    @expose_memory_errors
     def reject_task_plan(
         task_id: str,
         expected_revision: int,

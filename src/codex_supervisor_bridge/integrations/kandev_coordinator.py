@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from codex_supervisor_bridge.memory.service import MemoryService
 
@@ -27,7 +27,7 @@ class KandevProvisionOptions(BaseModel):
     local_path: str | None = None
     repository_url: str | None = None
     base_branch: str | None = None
-    blocked_by: list[str] = []
+    blocked_by: list[str] = Field(default_factory=list)
     start_when_unblocked: bool | None = None
 
 

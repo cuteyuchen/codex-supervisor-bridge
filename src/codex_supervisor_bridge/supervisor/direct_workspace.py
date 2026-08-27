@@ -3,12 +3,10 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
-from typing import Any
 
 from codex_supervisor_bridge.backends.models import (
     ChangeReview,
     GitState,
-    WorkspaceState,
     WriterLeaseToken,
 )
 from codex_supervisor_bridge.backends.workspace import WorkspaceBackend
@@ -118,9 +116,6 @@ class DirectWorkspaceCoordinator:
                     git_head=remote.git.head,
                 )
             except Exception:
-                # Current DevSpace public MCP has no explicit close-workspace.
-                # Keep cleanup best-effort so an isolated orphan worktree never
-                # hides a stale Supervisor revision failure.
                 try:
                     await adapter.close_workspace(remote.workspace_id)
                 finally:

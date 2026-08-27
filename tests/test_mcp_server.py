@@ -6,8 +6,8 @@ from typing import Any
 
 from mcp import Client
 
-from codex_supervisor_bridge.memory.service import MemoryService
 from codex_supervisor_bridge.mcp.server import create_mcp_server
+from codex_supervisor_bridge.memory.service import MemoryService
 
 
 def run(coro: Any) -> Any:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA_SQL = r"""
 PRAGMA foreign_keys = ON;
@@ -351,6 +351,70 @@ CREATE TABLE IF NOT EXISTS execution_handoffs (
 
 CREATE INDEX IF NOT EXISTS idx_execution_handoffs_task_created
 ON execution_handoffs(task_id, created_at DESC);
+"""
+
+WORKSPACE_STATE_MIGRATION_SQL = r"""
+CREATE TABLE IF NOT EXISTS task_workspace_state (
+    task_id TEXT PRIMARY KEY REFERENCES supervised_tasks(task_id) ON DELETE CASCADE,
+    backend_name TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    repository TEXT NOT NULL,
+    root TEXT,
+    workspace_mode TEXT NOT NULL CHECK (workspace_mode IN ('checkout', 'worktree')),
+    base_ref TEXT,
+    git_branch TEXT,
+    git_head TEXT,
+    dirty INTEGER NOT NULL DEFAULT 0 CHECK (dirty IN (0, 1)),
+    changed_files_json TEXT NOT NULL DEFAULT '[]',
+    last_review_ref TEXT,
+    state TEXT NOT NULL DEFAULT 'ACTIVE'
+        CHECK (state IN ('ACTIVE', 'RECONCILIATION_REQUIRED', 'CLOSED')),
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_workspace_backend
+ON task_workspace_state(backend_name, workspace_id);
+
+CREATE TABLE IF NOT EXISTS direct_workspace_operations (
+    operation_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES supervised_tasks(task_id) ON DELETE CASCADE,
+    operation_type TEXT NOT NULL,
+    status TEXT NOT NULL
+        CHECK (status IN ('PREPARED', 'SUCCEEDED', 'FAILED', 'RECONCILIATION_REQUIRED')),
+    writer_epoch INTEGER NOT NULL CHECK (writer_epoch >= 1),
+    prepared_revision INTEGER NOT NULL CHECK (prepared_revision >= 0),
+    completed_revision INTEGER CHECK (completed_revision >= 0),
+    request_digest TEXT NOT NULL,
+    summary TEXT,
+    change_ref TEXT,
+    git_head_before TEXT,
+    git_head_after TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_direct_workspace_one_prepared
+ON direct_workspace_operations(task_id)
+WHERE status = 'PREPARED';
+
+CREATE INDEX IF NOT EXISTS idx_direct_workspace_task_created
+ON direct_workspace_operations(task_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS direct_command_sessions (
+    task_id TEXT NOT NULL REFERENCES supervised_tasks(task_id) ON DELETE CASCADE,
+    command_id TEXT NOT NULL,
+    writer_epoch INTEGER NOT NULL CHECK (writer_epoch >= 1),
+    status TEXT NOT NULL CHECK (status IN ('RUNNING', 'COMPLETED', 'INTERRUPTED', 'UNKNOWN')),
+    started_revision INTEGER NOT NULL CHECK (started_revision >= 0),
+    completed_revision INTEGER CHECK (completed_revision >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(task_id, command_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_direct_command_running
+ON direct_command_sessions(task_id, status, created_at DESC);
 """
 
 OPTIONAL_FTS_SQL = r"""

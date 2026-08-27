@@ -13,7 +13,6 @@ from codex_supervisor_bridge.memory.models import (
     Actor,
     ContextPackMode,
     EventType,
-    Plan,
     PlanStatus,
     TaskPhase,
 )
@@ -232,7 +231,7 @@ class CodexCoordinator:
         *,
         sandbox: str = "workspace-write",
     ) -> dict[str, Any]:
-        task = self.memory.assert_revision(task_id, expected_revision)
+        self.memory.assert_revision(task_id, expected_revision)
         approved = self.memory.approved_plan(task_id)
         if approved is None or approved.status != PlanStatus.APPROVED:
             raise CodexPlanGateError("No locally APPROVED plan exists")

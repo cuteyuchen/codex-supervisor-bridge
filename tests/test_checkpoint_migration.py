@@ -5,7 +5,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from codex_supervisor_bridge.db import current_schema_version
-from codex_supervisor_bridge.db.schema import CODEX_RUNTIME_MIGRATION_SQL, SCHEMA_SQL
+from codex_supervisor_bridge.db.schema import (
+    CODEX_RUNTIME_MIGRATION_SQL,
+    SCHEMA_SQL,
+    SCHEMA_VERSION,
+)
 from codex_supervisor_bridge.memory.checkpoint_models import CheckpointType
 from codex_supervisor_bridge.memory.checkpoint_store import create_checkpoint, latest_checkpoint
 from codex_supervisor_bridge.memory.service import MemoryService
@@ -37,7 +41,7 @@ def test_v2_database_migrates_forward_and_persists_checkpoint(tmp_path: Path) ->
 
     memory = MemoryService(database)
     try:
-        assert current_schema_version(memory.store._conn) == 3
+        assert current_schema_version(memory.store._conn) == SCHEMA_VERSION
         result = create_checkpoint(
             memory.store,
             "MIGRATE-CP",

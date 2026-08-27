@@ -11,6 +11,7 @@ from codex_supervisor_bridge.capabilities import CapabilityResolver
 from .configuration import AppConfig, ConfigStore
 from .devspace import DevSpaceBootstrap
 from .doctor import Doctor, DoctorOptions
+from .local_codex import LocalCodexBridgeBootstrap, LocalCodexBridgeBootstrapConfig
 from .models import BootstrapStatus, DoctorStatus, HealthStatus, RepairAction
 from .paths import AppDataPaths
 from .process import ManagedProcessSpec, ProcessManager
@@ -137,7 +138,41 @@ class BootstrapService:
                         advanced={"technical_detail": str(exc)},
                     )
                 )
+        local_codex_command = config.advanced.process_commands.get("local_codex_bridge")
+        if local_codex_command and local_codex_command.strip():
+            try:
+                local_codex = LocalCodexBridgeBootstrap(
+                    LocalCodexBridgeBootstrapConfig(
+                        launch_command=shlex.split(local_codex_command, posix=False)
+                    )
+                )
+                component = self.process_manager.start(
+                    local_codex.process_spec(
+                        startup_timeout=config.advanced.startup_timeout_seconds,
+                        shutdown_timeout=config.advanced.shutdown_timeout_seconds,
+                    )
+                )
+            except (OSError, ValueError) as exc:
+                result.repairs.append(
+                    RepairAction(
+                        action="start_process:local_codex_bridge",
+                        status=HealthStatus.UNAVAILABLE,
+                        message="Codex control could not start.",
+                        advanced={"technical_detail": str(exc)},
+                    )
+                )
+            else:
+                result.repairs.append(
+                    RepairAction(
+                        action="start_process:local_codex_bridge",
+                        status=HealthStatus.READY if component.status == "RUNNING" else HealthStatus.UNAVAILABLE,
+                        message="Codex control started." if component.status == "RUNNING" else "Codex control could not start.",
+                        advanced=component.as_dict(),
+                    )
+                )
         for name, command in config.advanced.process_commands.items():
+            if name == "local_codex_bridge":
+                continue
             if name == "supervisor" or not command.strip():
                 continue
             try:

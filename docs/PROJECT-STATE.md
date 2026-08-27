@@ -341,6 +341,8 @@ The first implementation slice is intentionally backend-neutral and layered:
   portable test overrides;
 - platform, executable, runtime, project, GitHub, port, and local bind probes;
 - bounded process lifecycle management with stale PID/lock recovery;
+- optional process readiness probes with bounded startup timeout and graceful
+  timeout cleanup;
 - automatic loopback port allocation;
 - structured Doctor and Repair models suitable for CLI and future GUI use;
 - secret storage and secure remote access abstractions with redaction tests;

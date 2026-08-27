@@ -153,6 +153,30 @@ def test_process_manager_tracks_lifecycle_and_stale_pid(tmp_path: Path) -> None:
     assert recovered.health("old").status == "STALE"
 
 
+def test_process_manager_honors_startup_readiness_timeout(tmp_path: Path) -> None:
+    launched: list[DummyProcess] = []
+
+    def launch(*args: object, **kwargs: object) -> DummyProcess:
+        del args, kwargs
+        process = DummyProcess()
+        launched.append(process)
+        return process
+
+    manager = ProcessManager(tmp_path / "runtime", tmp_path / "logs", launcher=launch)
+    state = manager.start(
+        ManagedProcessSpec(
+            name="slow",
+            command=["dummy"],
+            startup_timeout=0.01,
+            readiness_probe=lambda: False,
+        )
+    )
+
+    assert state.status == "UNAVAILABLE"
+    assert state.technical_detail == "startup timeout"
+    assert launched[0].returncode == 0
+
+
 def test_process_manager_does_not_clear_ambiguous_live_pid(tmp_path: Path, monkeypatch) -> None:
     manager = ProcessManager(tmp_path / "runtime", tmp_path / "logs")
     (tmp_path / "runtime" / "processes.json").write_text(
@@ -213,6 +237,45 @@ def test_bootstrap_start_reports_supervisor_launch_failure(tmp_path: Path) -> No
 
     assert result.repairs[-1].action == "start_supervisor"
     assert result.repairs[-1].status == HealthStatus.UNAVAILABLE
+
+
+def test_bootstrap_start_uses_local_codex_protocol_bootstrap(tmp_path: Path) -> None:
+    from codex_supervisor_bridge.bootstrap import BootstrapService
+
+    class RecordingProcessManager:
+        def __init__(self) -> None:
+            self.started: list[ManagedProcessSpec] = []
+
+        def statuses(self) -> list[ProcessState]:
+            return []
+
+        def health(self, name: str) -> ProcessState:
+            return ProcessState(name, "STOPPED")
+
+        def start(self, spec: ManagedProcessSpec, *, restart: bool = False) -> ProcessState:
+            del restart
+            self.started.append(spec)
+            return ProcessState(spec.name, "RUNNING", pid=50000)
+
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    config_store = ConfigStore(paths=paths)
+    config = AppConfig.safe_defaults(paths)
+    config.advanced.process_commands["local_codex_bridge"] = "node bridge.js"
+    config_store.save(config)
+    process_manager = RecordingProcessManager()
+
+    result = BootstrapService(
+        paths=paths,
+        config_store=config_store,
+        process_manager=process_manager,
+    ).start(project_directory=tmp_path)
+
+    local = next(item for item in process_manager.started if item.name == "local_codex_bridge")
+    assert list(local.command) == ["node", "bridge.js"]
+    assert any(item.action == "start_process:local_codex_bridge" for item in result.repairs)
 
 
 def test_http_mcp_bind_must_be_loopback() -> None:

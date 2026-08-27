@@ -18,6 +18,7 @@ class ManagedProcessSpec:
     startup_timeout: float = 15.0
     shutdown_timeout: float = 10.0
     max_restarts: int = 3
+    readiness_probe: Callable[[], bool] | None = None
 
 
 @dataclass
@@ -143,6 +144,8 @@ class ProcessManager:
             state.last_exit = process.returncode
             state._process = None
             lock_path.unlink(missing_ok=True)
+        elif spec.readiness_probe is not None:
+            state = self._wait_for_readiness(state, spec, lock_path)
         return self._record(state)
 
     def stop(self, name: str, *, timeout: float = 10.0) -> ProcessState:
@@ -255,6 +258,50 @@ class ProcessManager:
 
     def _lock_path(self, name: str) -> Path:
         return self.runtime_dir / f"{_safe_name(name)}.lock"
+
+    def _wait_for_readiness(
+        self,
+        state: ProcessState,
+        spec: ManagedProcessSpec,
+        lock_path: Path,
+    ) -> ProcessState:
+        process = state._process
+        if process is None or spec.readiness_probe is None:
+            return state
+        deadline = self._clock() + max(0.0, spec.startup_timeout)
+        while True:
+            returncode = process.poll()
+            if returncode is not None:
+                state.status = "CRASHED" if returncode else "STOPPED"
+                state.last_exit = returncode
+                state._process = None
+                lock_path.unlink(missing_ok=True)
+                return state
+            try:
+                ready = spec.readiness_probe()
+            except Exception as exc:
+                ready = False
+                state.technical_detail = f"readiness probe failed: {type(exc).__name__}"
+            if ready:
+                return state
+            if self._clock() >= deadline:
+                self._terminate(process, spec.shutdown_timeout)
+                state.status = "UNAVAILABLE"
+                state.last_exit = process.returncode
+                state._process = None
+                state.technical_detail = "startup timeout"
+                lock_path.unlink(missing_ok=True)
+                return state
+            time.sleep(min(0.05, max(0.001, deadline - self._clock())))
+
+    @staticmethod
+    def _terminate(process: Any, timeout: float) -> None:
+        process.terminate()
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
 
 
 def _pid_exists(pid: int) -> bool:

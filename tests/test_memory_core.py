@@ -8,9 +8,11 @@ from codex_supervisor_bridge.db import current_schema_version
 from codex_supervisor_bridge.memory.context_pack import ContextPackBuilder
 from codex_supervisor_bridge.memory.errors import StaleRevisionError
 from codex_supervisor_bridge.memory.models import (
+    Actor,
     ConstraintSeverity,
     ContextPackMode,
     DecisionStatus,
+    EventType,
     EvidenceType,
     PlanStatus,
     SummaryType,
@@ -66,6 +68,34 @@ def test_stale_revision_is_rejected_without_partial_write() -> None:
         assert error.value.current_revision == 1
         assert store.active_constraints(task.task_id) == []
         assert store.get_task(task.task_id).revision == 1
+
+
+def test_public_event_append_advances_revision_and_is_auditable() -> None:
+    with MemoryStore() as store:
+        task = store.create_task("TASK-EVENT", "Event API")
+        event = store.record_event(
+            task.task_id,
+            task.revision,
+            Actor.USER,
+            EventType.USER_OVERRIDE,
+            {"instruction": "Reuse the existing panel."},
+        )
+
+        assert event.revision == 1
+        assert event.event_type == EventType.USER_OVERRIDE
+        assert store.get_task(task.task_id).revision == 1
+        assert store.list_events(task.task_id)[-1].payload["instruction"] == (
+            "Reuse the existing panel."
+        )
+
+        with pytest.raises(StaleRevisionError):
+            store.record_event(
+                task.task_id,
+                0,
+                Actor.SUPERVISOR,
+                EventType.CODEX_STEERED,
+                {},
+            )
 
 
 def test_superseded_decision_is_excluded_from_context_pack() -> None:
@@ -133,6 +163,33 @@ def test_plan_lifecycle_and_context_mode() -> None:
 
         resume_pack = ContextPackBuilder(store).build(task.task_id)
         assert "Plan V1 / APPROVED" in resume_pack.content
+
+
+def test_approving_new_plan_supersedes_old_plan_in_search_index() -> None:
+    with MemoryStore() as store:
+        task = store.create_task("TASK-PLAN-SEARCH", "Plan search")
+        first = store.create_plan(task.task_id, task.revision, "Legacy three-slot design")
+        task = store.get_task(task.task_id)
+        store.approve_plan(task.task_id, task.revision, first.plan_id)
+        task = store.get_task(task.task_id)
+
+        second = store.create_plan(task.task_id, task.revision, "New single-save design")
+        task = store.get_task(task.task_id)
+        store.approve_plan(task.task_id, task.revision, second.plan_id)
+
+        old_hits = [
+            hit
+            for hit in store.search(task.task_id, "Legacy three-slot")
+            if hit.source_id == first.plan_id
+        ]
+        new_hits = [
+            hit
+            for hit in store.search(task.task_id, "single-save")
+            if hit.source_id == second.plan_id
+        ]
+
+        assert old_hits and old_hits[0].status == PlanStatus.SUPERSEDED.value
+        assert new_hits and new_hits[0].status == PlanStatus.APPROVED.value
 
 
 def test_summary_evidence_and_context_snapshot_do_not_advance_revision() -> None:

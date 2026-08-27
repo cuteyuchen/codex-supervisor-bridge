@@ -324,6 +324,34 @@ P6.5 deliberately does **not** claim real Windows installation, Local-Codex-
 Bridge process startup, DevSpace OAuth, ChatGPT Remote MCP tunnel proof, or
 real Profile A/B runtime validation. Those are P6.6 integration gates.
 
+### P6.5 — merged
+
+PR #8 was merged into `main` on 2026-08-27 with merge commit
+`5fa3ca7a6d2ce91c5a55629f9882945e908963c2`. The merge preserved the P6.5
+history and schema version 7. The P6.6 implementation branch is
+`feat/p6-6-windows-bootstrap`.
+
+### P6.6 — active
+
+P6.6 is the active phase: Windows Integration / Bootstrap / Real A-B Proof.
+The first implementation slice is intentionally backend-neutral and layered:
+
+- persistent versioned user configuration with Basic / Advanced projections;
+- Windows-aware application data directories under `%LOCALAPPDATA%` with
+  portable test overrides;
+- platform, executable, runtime, project, GitHub, port, and local bind probes;
+- bounded process lifecycle management with stale PID/lock recovery;
+- automatic loopback port allocation;
+- structured Doctor and Repair models suitable for CLI and future GUI use;
+- secret storage and secure remote access abstractions with redaction tests;
+- fake process/provider harnesses for Profile A/B semantic comparison.
+
+The current code-level work does not claim real Windows OAuth, ChatGPT Web
+Remote MCP attachment, tunnel-provider login, or authenticated Codex runtime
+proof. Those remain opt-in/manual gates after the fake and protocol coverage is
+complete. Profile A remains the fallback until Profile B passes the documented
+real Windows scenario.
+
 ### Revised next phases
 
 #### P6.5 — Execution Modes + Backend Abstraction (code complete; PR #8)

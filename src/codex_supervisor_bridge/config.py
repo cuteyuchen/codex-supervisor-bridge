@@ -4,9 +4,11 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from codex_supervisor_bridge.bootstrap.paths import AppDataPaths
+
 
 def default_data_dir() -> Path:
-    return Path.home() / ".codex-supervisor-bridge"
+    return AppDataPaths.from_environment().data
 
 
 @dataclass(frozen=True)

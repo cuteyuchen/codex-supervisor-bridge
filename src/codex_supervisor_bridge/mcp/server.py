@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from mcp.server import MCPServer
 
 from codex_supervisor_bridge import __version__
+from codex_supervisor_bridge.bootstrap import BootstrapService
 from codex_supervisor_bridge.config import Settings
 from codex_supervisor_bridge.integrations.codex_control_client import CodexControlAdapter
 from codex_supervisor_bridge.integrations.codex_coordinator import CodexCoordinator
@@ -126,6 +128,15 @@ def build_parser(settings: Settings | None = None) -> argparse.ArgumentParser:
     settings = settings or Settings.from_env()
     parser = argparse.ArgumentParser(description="Run Codex Supervisor Bridge MCP server")
     parser.add_argument(
+        "command",
+        nargs="?",
+        choices=("doctor", "start", "status", "repair"),
+        help="Bootstrap command; omit to run the MCP server",
+    )
+    parser.add_argument("--json", action="store_true", dest="json_output", help="Render structured output")
+    parser.add_argument("--advanced", action="store_true", help="Include technical diagnostics")
+    parser.add_argument("--project", type=Path, default=None, help="Project directory for bootstrap commands")
+    parser.add_argument(
         "--database",
         type=Path,
         default=settings.database_path,
@@ -174,6 +185,22 @@ def build_parser(settings: Settings | None = None) -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command is not None:
+        bootstrap = BootstrapService()
+        if args.command in {"doctor", "status"}:
+            result = bootstrap.status(project_directory=args.project)
+        elif args.command == "repair":
+            result = bootstrap.repair_and_status(project_directory=args.project)
+        else:
+            result = bootstrap.start(project_directory=args.project)
+        payload = result.advanced_view() if args.advanced else result.user_view()
+        if args.json_output:
+            print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+        else:
+            print(result.summary)
+            for item in result.doctor.components:
+                print(f"{item.status.value:11} {item.capability}: {item.user_message}")
+        return
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
     if not args.mcp_path.startswith("/"):

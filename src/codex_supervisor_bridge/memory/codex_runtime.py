@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from .models import Actor, EventType, TaskMemory, utcnow
+from .models import Actor, EventType, TaskMemory, TaskPhase, utcnow
 from .store import MemoryStore, _dt, _iso
 
 
@@ -59,14 +59,16 @@ def bind_codex_runtime(
     remote_status: str | None = None,
     next_action: str | None = None,
     client_request_id: str | None = None,
+    task_phase: TaskPhase | None = None,
+    current_state: str | None = None,
     event_payload: dict[str, Any] | None = None,
 ) -> tuple[TaskMemory, CodexRuntimeState]:
     """Persist a supervisor-authorized Codex control transition atomically.
 
     This is intentionally revision protected. Read-only polling uses
     ``get_codex_runtime`` and does not mutate task state. Control actions update
-    both the task's current thread/turn snapshot and the dedicated durable
-    control-plane identity row, then append an auditable CODEX event.
+    the task phase/thread/turn snapshot and the dedicated durable control-plane
+    identity row in one revision transaction, then append an auditable event.
     """
     if event_type not in {
         EventType.CODEX_STARTED,
@@ -97,6 +99,10 @@ def bind_codex_runtime(
             values["codex_thread_id"] = effective_thread
         if effective_turn is not None:
             values["codex_turn_id"] = effective_turn
+        if task_phase is not None:
+            values["phase"] = task_phase
+        if current_state is not None:
+            values["current_state"] = current_state
         task = store._update_task(
             conn,
             task_id,
@@ -152,6 +158,7 @@ def bind_codex_runtime(
             "remote_status": state.remote_status,
             "next_action": state.next_action,
             "client_request_id": state.last_client_request_id,
+            "task_phase": task.phase.value,
         }
         payload.update(event_payload or {})
         store._insert_event(conn, task, Actor.CODEX, event_type, payload)

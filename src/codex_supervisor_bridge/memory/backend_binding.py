@@ -85,6 +85,7 @@ def bind_task_backend(
                     "Task is already bound to a different backend; "
                     "an explicit migration is required before switching"
                 )
+            _assert_migration_safe(conn, task_id)
 
         now = _iso(utcnow())
         task = store._update_task(conn, task_id, expected_revision)
@@ -128,6 +129,80 @@ def bind_task_backend(
             (task_id,),
         ).fetchone()
         return task, _binding_from_row(row)
+
+
+def _assert_migration_safe(conn: Any, task_id: str) -> None:
+    """Fail closed when a backend migration would race active work."""
+    execution = conn.execute(
+        "SELECT active_writer FROM task_execution_state WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    if execution is not None and execution["active_writer"] == "CODEX":
+        raise ConflictError(
+            "Backend migration is blocked while CODEX is the active writer; "
+            "the writer must be quiesced first"
+        )
+
+    safety = conn.execute(
+        "SELECT state FROM task_agent_safety WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    if safety is not None and safety["state"] != "NONE":
+        raise ConflictError(
+            "Backend migration is blocked by an unresolved agent compensation "
+            "or reconciliation latch"
+        )
+
+    prepared = conn.execute(
+        "SELECT operation_id FROM direct_workspace_operations "
+        "WHERE task_id = ? AND status = 'PREPARED' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if prepared is not None:
+        raise ConflictError(
+            "Backend migration is blocked by a pending direct mutation"
+        )
+
+    command = conn.execute(
+        "SELECT command_id FROM direct_command_sessions "
+        "WHERE task_id = ? AND status = 'RUNNING' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if command is not None:
+        raise ConflictError(
+            "Backend migration is blocked by a running direct command session"
+        )
+
+    runtime = conn.execute(
+        "SELECT remote_status FROM codex_runtime_state WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    if runtime is not None:
+        status = (runtime["remote_status"] or "").strip().lower()
+        if status in {
+            "planning",
+            "executing",
+            "running",
+            "inprogress",
+            "in_progress",
+            "started",
+        }:
+            raise ConflictError(
+                "Backend migration is blocked while a Codex runtime is active"
+            )
+
+    workspace = conn.execute(
+        "SELECT state FROM task_workspace_state WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    if workspace is None:
+        raise ConflictError(
+            "Backend migration requires a saved workspace snapshot before switching"
+        )
+    if workspace["state"] not in {"ACTIVE", "CLOSED"}:
+        raise ConflictError(
+            "Backend migration is blocked by a workspace reconciliation state"
+        )
 
 
 def assert_task_backend_binding(

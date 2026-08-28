@@ -89,7 +89,7 @@ class AgentExecutionCoordinator:
         self.memory = memory
         self.agent_backend = agent_backend
 
-    def _assert_safety_clear(self, task_id: str) -> None:
+    def assert_safety_clear(self, task_id: str) -> None:
         try:
             assert_agent_safety_clear(self.memory.store, task_id)
         except ConflictError as exc:
@@ -100,7 +100,7 @@ class AgentExecutionCoordinator:
                 "Workspace requires reconciliation before starting another Codex operation"
             )
 
-    async def _compensate_remote(
+    async def compensate_remote(
         self,
         task_id: str,
         operation: str,
@@ -185,7 +185,7 @@ class AgentExecutionCoordinator:
             "remote runtime was interrupted"
         )
 
-    def _post_call_stale_reasons(
+    def post_call_stale_reasons(
         self,
         task_id: str,
         expected_revision: int,
@@ -250,7 +250,7 @@ class AgentExecutionCoordinator:
         workspace: WorkspaceState,
     ) -> PlanHandle:
         baseline_task = self.memory.assert_revision(task_id, expected_revision)
-        self._assert_safety_clear(task_id)
+        self.assert_safety_clear(task_id)
         baseline_runtime = get_codex_runtime(self.memory.store, task_id)
         if _active_runtime(baseline_runtime):
             raise AgentPlanGateError("An active Codex runtime already exists for this task")
@@ -259,7 +259,7 @@ class AgentExecutionCoordinator:
             context_pack=context_pack,
             workspace=workspace,
         )
-        reasons = self._post_call_stale_reasons(
+        reasons = self.post_call_stale_reasons(
             task_id,
             expected_revision,
             baseline_task,
@@ -268,7 +268,7 @@ class AgentExecutionCoordinator:
             operation="plan",
         )
         if reasons:
-            await self._compensate_remote(task_id, "plan", handle, "; ".join(reasons))
+            await self.compensate_remote(task_id, "plan", handle, "; ".join(reasons))
         try:
             bind_codex_runtime(
                 self.memory.store,
@@ -288,7 +288,7 @@ class AgentExecutionCoordinator:
                 },
             )
         except StaleRevisionError as stale:
-            await self._compensate_remote(task_id, "plan", handle, str(stale))
+            await self.compensate_remote(task_id, "plan", handle, str(stale))
         return handle
 
     def import_plan(
@@ -338,7 +338,7 @@ class AgentExecutionCoordinator:
         lease: WriterLeaseToken,
     ) -> PlanHandle:
         baseline_task = self.memory.assert_revision(task_id, expected_revision)
-        self._assert_safety_clear(task_id)
+        self.assert_safety_clear(task_id)
         execution = get_execution_state(self.memory.store, task_id)
         if execution.active_writer != ActiveWriter.CODEX:
             raise AgentPlanGateError("Codex execution requires an active CODEX writer lease")
@@ -383,7 +383,7 @@ class AgentExecutionCoordinator:
             workspace=workspace,
             lease=lease,
         )
-        reasons = self._post_call_stale_reasons(
+        reasons = self.post_call_stale_reasons(
             task_id,
             expected_revision,
             baseline_task,
@@ -395,7 +395,7 @@ class AgentExecutionCoordinator:
             approved_content=approved.content,
         )
         if reasons:
-            await self._compensate_remote(task_id, "execution", handle, "; ".join(reasons))
+            await self.compensate_remote(task_id, "execution", handle, "; ".join(reasons))
         try:
             bind_codex_runtime(
                 self.memory.store,
@@ -412,5 +412,5 @@ class AgentExecutionCoordinator:
                 event_payload={"mode": "execute", "plan_id": approved.plan_id},
             )
         except StaleRevisionError as stale:
-            await self._compensate_remote(task_id, "execution", handle, str(stale))
+            await self.compensate_remote(task_id, "execution", handle, str(stale))
         return handle

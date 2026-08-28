@@ -9,6 +9,10 @@ from codex_supervisor_bridge.backends.models import (
     WorkspaceState,
     WriterLeaseToken,
 )
+from codex_supervisor_bridge.memory.agent_safety import (
+    record_agent_compensation_required,
+    record_agent_compensation_succeeded,
+)
 from codex_supervisor_bridge.memory.codex_runtime import (
     CodexRuntimeState,
     bind_codex_runtime,
@@ -24,7 +28,11 @@ from codex_supervisor_bridge.memory.models import (
 from codex_supervisor_bridge.memory.service import MemoryService
 from codex_supervisor_bridge.memory.workspace import get_workspace_binding
 
-from .agent_execution import AgentExecutionCoordinator, AgentPlanGateError
+from .agent_execution import (
+    AgentCompensationRequiredError,
+    AgentExecutionCoordinator,
+    AgentPlanGateError,
+)
 from .agent_session import AgentSessionManager
 
 SEMANTIC_TOOLS = [
@@ -61,6 +69,21 @@ _COMPLETE_STATUSES = {
     "failed",
     "error",
 }
+
+_MUTATION_INTERACTION_KINDS = {
+    "command_approval",
+    "file_change_approval",
+    "permissions_approval",
+}
+
+
+def _runtime_identity(runtime: CodexRuntimeState | None) -> tuple[str | None, ...] | None:
+    if runtime is None:
+        return None
+    return tuple(
+        getattr(runtime, field, None)
+        for field in ("workflow_id", "operation_id", "thread_id", "turn_id")
+    )
 
 
 class CodexSemanticFacade(Protocol):
@@ -287,12 +310,18 @@ class AgentSupervisorFacade:
             bind_task_backend,
         )
 
-        existing = assert_task_backend_binding(
-            self.memory.store,
-            task_id,
-            workspace_backend=self.workspace_backend,
-            agent_backend=self.agent_backend,
-        )
+        try:
+            existing = assert_task_backend_binding(
+                self.memory.store,
+                task_id,
+                workspace_backend=self.workspace_backend,
+                agent_backend=self.agent_backend,
+            )
+        except Exception as exc:
+            raise AgentPlanGateError(
+                "Task is already bound to a different development profile; "
+                "restart the Bridge with that profile or migrate explicitly"
+            ) from exc
         if existing is not None:
             return None
         bind_task_backend(
@@ -307,7 +336,7 @@ class AgentSupervisorFacade:
 
     async def _agent(self) -> Any:
         if self.session_manager is not None:
-            return self.session_manager.backend
+            return self.session_manager
         return self.coordinator.agent_backend
 
     def _workspace(
@@ -519,25 +548,58 @@ class AgentSupervisorFacade:
     ) -> dict[str, Any]:
         if not instruction.strip():
             raise AgentPlanGateError("instruction must not be empty")
-        self.memory.assert_revision(task_id, expected_revision)
+        baseline_task = self.memory.assert_revision(task_id, expected_revision)
         execution = get_execution_state(self.memory.store, task_id)
         if execution.active_writer != ActiveWriter.CODEX:
             raise AgentPlanGateError("Codex steering requires an active CODEX writer lease")
         runtime = get_codex_runtime(self.memory.store, task_id)
-        if runtime is None:
-            raise AgentPlanGateError("Task has no active Codex runtime")
+        if runtime is None or not any(
+            [runtime.workflow_id, runtime.operation_id, runtime.thread_id, runtime.turn_id]
+        ):
+            raise AgentPlanGateError("Task has no active Codex runtime identity")
+        self.coordinator.assert_safety_clear(task_id)
+        lease = WriterLeaseToken(
+            task_id=task_id,
+            writer=ActiveWriter.CODEX,
+            writer_epoch=execution.writer_epoch,
+            task_revision=expected_revision,
+        )
+        approved = self.memory.approved_plan(task_id)
+        approved_plan_id = (
+            approved.plan_id
+            if approved is not None and approved.status.value == "APPROVED"
+            else None
+        )
+        approved_content = (
+            approved.content
+            if approved is not None and approved.status.value == "APPROVED"
+            else None
+        )
         agent = await self._agent()
         handle = self._runtime_handle(runtime)
         snapshot = await agent.steer(
             handle,
             instruction.strip(),
-            lease=WriterLeaseToken(
-                task_id=task_id,
-                writer=ActiveWriter.CODEX,
-                writer_epoch=execution.writer_epoch,
-                task_revision=expected_revision,
-            ),
+            lease=lease,
         )
+        reasons = self.coordinator.post_call_stale_reasons(
+            task_id,
+            expected_revision,
+            baseline_task,
+            runtime,
+            handle,
+            operation="steer",
+            lease=lease,
+            approved_plan_id=approved_plan_id,
+            approved_content=approved_content,
+        )
+        if reasons:
+            await self.coordinator.compensate_remote(
+                task_id,
+                "steer",
+                handle,
+                "; ".join(reasons),
+            )
         _, current_runtime = bind_codex_runtime(
             self.memory.store,
             task_id,
@@ -565,22 +627,109 @@ class AgentSupervisorFacade:
         reason: str | None = None,
     ) -> dict[str, Any]:
         self.memory.assert_revision(task_id, expected_revision)
-        runtime = get_codex_runtime(self.memory.store, task_id)
-        if runtime is None or not any(
-            [runtime.workflow_id, runtime.operation_id, runtime.thread_id, runtime.turn_id]
+        baseline_runtime = get_codex_runtime(self.memory.store, task_id)
+        if baseline_runtime is None or not any(
+            [
+                baseline_runtime.workflow_id,
+                baseline_runtime.operation_id,
+                baseline_runtime.thread_id,
+                baseline_runtime.turn_id,
+            ]
         ):
             raise AgentPlanGateError("Task has no Codex runtime to interrupt")
         agent = await self._agent()
-        snapshot = await agent.interrupt(self._runtime_handle(runtime))
+        baseline_handle = self._runtime_handle(baseline_runtime)
+        snapshot = await agent.interrupt(baseline_handle)
+
+        current_runtime = get_codex_runtime(self.memory.store, task_id)
+        if _runtime_identity(current_runtime) != _runtime_identity(baseline_runtime):
+            execution = get_execution_state(self.memory.store, task_id)
+            current_status = (current_runtime.remote_status or "").strip().lower() if current_runtime else ""
+            if (
+                current_runtime is not None
+                and current_status in _ACTIVE_STATUSES
+                and execution.active_writer == ActiveWriter.CODEX
+            ):
+                current_handle = self._runtime_handle(current_runtime)
+                try:
+                    current_snapshot = await agent.observe(current_handle)
+                except Exception as exc:
+                    await self._latch_interrupt_reconciliation(
+                        task_id,
+                        baseline_runtime,
+                        current_runtime,
+                        f"stale interrupt; current runtime observe failed: {type(exc).__name__}",
+                    )
+                    raise AgentCompensationRequiredError(
+                        "COMPENSATION_REQUIRED: stale interrupt cannot confirm the current runtime"
+                    ) from exc
+                if (
+                    current_snapshot.reconciliation_required
+                    or (current_snapshot.status or "").strip().lower()
+                    in {"unknown", "reconciliation_required", "compensation_required"}
+                ):
+                    await self._latch_interrupt_reconciliation(
+                        task_id,
+                        baseline_runtime,
+                        current_runtime,
+                        f"stale interrupt; current runtime returned {current_snapshot.status!r}",
+                    )
+                    raise AgentCompensationRequiredError(
+                        "COMPENSATION_REQUIRED: stale interrupt cannot confirm the current runtime"
+                    )
+                record_agent_compensation_succeeded(
+                    self.memory.store,
+                    task_id,
+                    operation="interrupt",
+                    summary="A stale Codex runtime was interrupted; the current runtime remains supervised.",
+                    details={
+                        "interrupt_status": snapshot.status,
+                        "current_runtime_status": current_snapshot.status,
+                    },
+                    workflow_id=baseline_runtime.workflow_id,
+                    operation_id=baseline_runtime.operation_id,
+                    thread_id=baseline_runtime.thread_id,
+                    turn_id=baseline_runtime.turn_id,
+                )
+                return {
+                    "task": self.memory.get_task(task_id).model_dump(mode="json"),
+                    "runtime": current_runtime.model_dump(mode="json"),
+                    "snapshot": current_snapshot.model_dump(mode="json"),
+                    "stale_runtime_interrupted": True,
+                    "profile": self.profile,
+                }
+            record_agent_compensation_succeeded(
+                self.memory.store,
+                task_id,
+                operation="interrupt",
+                summary="A stale Codex runtime was interrupted before its result could bind.",
+                details={"interrupt_status": snapshot.status},
+                workflow_id=baseline_runtime.workflow_id,
+                operation_id=baseline_runtime.operation_id,
+                thread_id=baseline_runtime.thread_id,
+                turn_id=baseline_runtime.turn_id,
+            )
+            return {
+                "task": self.memory.get_task(task_id).model_dump(mode="json"),
+                "runtime": (
+                    current_runtime.model_dump(mode="json")
+                    if current_runtime is not None
+                    else None
+                ),
+                "snapshot": snapshot.model_dump(mode="json"),
+                "stale_runtime_interrupted": True,
+                "profile": self.profile,
+            }
+
         _, current_runtime = bind_codex_runtime(
             self.memory.store,
             task_id,
             expected_revision,
             event_type=EventType.CODEX_INTERRUPTED,
-            workflow_id=runtime.workflow_id,
-            operation_id=runtime.operation_id,
-            thread_id=runtime.thread_id,
-            turn_id=runtime.turn_id,
+            workflow_id=baseline_runtime.workflow_id,
+            operation_id=baseline_runtime.operation_id,
+            thread_id=baseline_runtime.thread_id,
+            turn_id=baseline_runtime.turn_id,
             remote_status=snapshot.status or "interrupted",
             task_phase=TaskPhase.PAUSED,
             current_state=reason or "Codex turn interrupted by Supervisor.",
@@ -621,10 +770,13 @@ class AgentSupervisorFacade:
             raise AgentPlanGateError("scope must be turn or session")
         if decision is None and answers is None:
             raise AgentPlanGateError("decision or answers is required")
-        self.memory.assert_revision(task_id, expected_revision)
+        baseline_task = self.memory.assert_revision(task_id, expected_revision)
         runtime = get_codex_runtime(self.memory.store, task_id)
-        if runtime is None:
-            raise AgentPlanGateError("Task has no Codex runtime")
+        if runtime is None or not any(
+            [runtime.workflow_id, runtime.operation_id, runtime.thread_id, runtime.turn_id]
+        ):
+            raise AgentPlanGateError("Task has no Codex runtime identity")
+        self.coordinator.assert_safety_clear(task_id)
         agent = await self._agent()
         handle = self._runtime_handle(runtime)
         interactions = await agent.list_pending_interactions(handle)
@@ -634,6 +786,44 @@ class AgentSupervisorFacade:
         )
         if interaction is None:
             raise AgentPlanGateError("Unknown pending Codex interaction")
+
+        kind = (interaction.kind or interaction.type or "").strip().lower()
+        lease: WriterLeaseToken | None = None
+        if kind in _MUTATION_INTERACTION_KINDS:
+            execution = get_execution_state(self.memory.store, task_id)
+            if execution.active_writer != ActiveWriter.CODEX:
+                raise AgentPlanGateError(
+                    f"{kind} requires an active CODEX writer lease; "
+                    "writer ownership is not CODEX"
+                )
+            lease = WriterLeaseToken(
+                task_id=task_id,
+                writer=ActiveWriter.CODEX,
+                writer_epoch=execution.writer_epoch,
+                task_revision=expected_revision,
+            )
+        elif kind == "user_input":
+            lease = None
+        elif kind == "provider_request":
+            raise AgentPlanGateError(
+                "provider_request interactions are denied by default"
+            )
+        else:
+            raise AgentPlanGateError(
+                f"unsupported interaction kind {kind!r}"
+            )
+
+        approved = self.memory.approved_plan(task_id)
+        approved_plan_id = (
+            approved.plan_id
+            if approved is not None and approved.status.value == "APPROVED"
+            else None
+        )
+        approved_content = (
+            approved.content
+            if approved is not None and approved.status.value == "APPROVED"
+            else None
+        )
         snapshot = await agent.respond_interaction(
             handle,
             interaction,
@@ -643,6 +833,24 @@ class AgentSupervisorFacade:
                 "scope": scope,
             },
         )
+        reasons = self.coordinator.post_call_stale_reasons(
+            task_id,
+            expected_revision,
+            baseline_task,
+            runtime,
+            handle,
+            operation="respond",
+            lease=lease,
+            approved_plan_id=approved_plan_id,
+            approved_content=approved_content,
+        )
+        if reasons:
+            await self.coordinator.compensate_remote(
+                task_id,
+                "respond",
+                handle,
+                "; ".join(reasons),
+            )
         _, current_runtime = bind_codex_runtime(
             self.memory.store,
             task_id,
@@ -660,3 +868,36 @@ class AgentSupervisorFacade:
             "runtime": current_runtime.model_dump(mode="json"),
             "snapshot": snapshot.model_dump(mode="json"),
         }
+
+    async def _latch_interrupt_reconciliation(
+        self,
+        task_id: str,
+        baseline_runtime: CodexRuntimeState,
+        current_runtime: CodexRuntimeState | None,
+        reason: str,
+    ) -> None:
+        from codex_supervisor_bridge.memory.errors import ConflictError
+
+        try:
+            record_agent_compensation_required(
+                self.memory.store,
+                task_id,
+                operation="interrupt",
+                summary=(
+                    "A stale interrupt left the current Codex runtime unconfirmed; "
+                    "reconciliation is required before new Codex work."
+                ),
+                details={
+                    "reason": reason,
+                    "interrupted_workflow_id": baseline_runtime.workflow_id,
+                    "interrupted_operation_id": baseline_runtime.operation_id,
+                    "interrupted_thread_id": baseline_runtime.thread_id,
+                    "interrupted_turn_id": baseline_runtime.turn_id,
+                },
+                workflow_id=current_runtime.workflow_id if current_runtime else baseline_runtime.workflow_id,
+                operation_id=current_runtime.operation_id if current_runtime else baseline_runtime.operation_id,
+                thread_id=current_runtime.thread_id if current_runtime else baseline_runtime.thread_id,
+                turn_id=current_runtime.turn_id if current_runtime else baseline_runtime.turn_id,
+            )
+        except ConflictError:
+            pass

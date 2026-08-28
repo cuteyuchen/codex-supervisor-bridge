@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from codex_supervisor_bridge.integrations.agent_backends import LOCAL_CODEX_TOOLS
 
@@ -17,12 +17,30 @@ class LocalCodexBridgeBootstrapConfig(BaseModel):
     working_directory: Path | None = None
     required_tools: list[str] = Field(default_factory=lambda: sorted(LOCAL_CODEX_TOOLS))
 
+    @field_validator("launch_command")
+    @classmethod
+    def reject_protocol_polluting_launcher(cls, value: list[str]) -> list[str]:
+        if len(value) >= 2 and value[0].lower() == "npm" and value[1].lower() == "start":
+            raise ValueError("use node dist/src/index.js for an MCP stdio launch")
+        return value
+
 
 class LocalCodexBridgeBootstrap:
     """Process and protocol checks for Local-Codex-Bridge at the provider edge."""
 
     def __init__(self, config: LocalCodexBridgeBootstrapConfig) -> None:
         self.config = config
+
+    @staticmethod
+    def canonical_launch_command(
+        repository_path: str | Path,
+        *,
+        node_executable: str = "node",
+    ) -> list[str]:
+        entrypoint = Path(repository_path).expanduser().resolve() / "dist" / "src" / "index.js"
+        if not entrypoint.is_file():
+            raise FileNotFoundError("Local-Codex-Bridge build output is missing")
+        return [node_executable, str(entrypoint)]
 
     def process_spec(
         self,

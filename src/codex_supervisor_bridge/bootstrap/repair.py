@@ -12,6 +12,7 @@ from .models import DoctorStatus, HealthStatus, RepairAction
 from .paths import AppDataPaths
 from .ports import PortAllocator
 from .process import ProcessManager
+from .secrets import MemorySecretStore, SecretStore, WindowsDpapiSecretStore
 
 
 class RepairService:
@@ -25,12 +26,14 @@ class RepairService:
         doctor: Doctor | None = None,
         process_manager: ProcessManager | None = None,
         port_allocator: PortAllocator | None = None,
+        secret_store: SecretStore | None = None,
     ) -> None:
         self.paths = paths or AppDataPaths.from_environment()
         self.config_store = config_store or ConfigStore(paths=self.paths)
         self.doctor = doctor or Doctor(paths=self.paths, config_store=self.config_store)
         self.process_manager = process_manager or ProcessManager(self.paths.runtime, self.paths.logs)
         self.port_allocator = port_allocator or PortAllocator()
+        self.secret_store = secret_store or self._default_secret_store()
 
     def repair(self, status: DoctorStatus | None = None, *, project_directory: Path | None = None) -> list[RepairAction]:
         status = status or self.doctor.run()
@@ -81,6 +84,7 @@ class RepairService:
                 executable=config.advanced.executable_paths.get("devspace", "devspace"),
             )
             devspace.write_config()
+            devspace.prepare_auth(self.secret_store)
             actions.append(RepairAction(action="generate_workspace_config", status=HealthStatus.READY, message="Local workspace settings are ready."))
 
         for process in self.process_manager.statuses():
@@ -116,3 +120,10 @@ class RepairService:
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
+
+    def _default_secret_store(self) -> SecretStore:
+        import platform
+
+        if platform.system() == "Windows":
+            return WindowsDpapiSecretStore(self.paths.config / "secrets")
+        return MemorySecretStore()

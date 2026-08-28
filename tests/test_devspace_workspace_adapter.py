@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from mcp.client.client import InMemoryTransport
 from mcp.server import MCPServer
 
 from codex_supervisor_bridge.backends.models import BackendHealthStatus, WriterLeaseToken
@@ -239,5 +240,31 @@ def test_devspace_adapter_health_degrades_when_required_tool_is_missing() -> Non
             assert health.repairable is True
             assert health.technical_detail is not None
             assert "write_stdin" in health.technical_detail
+
+    asyncio.run(scenario())
+
+
+def test_devspace_adapter_accepts_authenticated_transport_factory() -> None:
+    upstream, state = fake_devspace()
+
+    def authenticated_transport() -> InMemoryTransport:
+        return InMemoryTransport(upstream)
+
+    async def scenario() -> None:
+        async with DevSpaceWorkspaceAdapter(
+            "http://127.0.0.1:39101/mcp",
+            transport_factory=authenticated_transport,
+        ) as adapter:
+            health = await adapter.health()
+            assert health.status == BackendHealthStatus.READY
+
+            workspace = await adapter.open_workspace(
+                "C:/src/project",
+                worktree=True,
+                base_ref="main",
+            )
+            assert workspace.workspace_id == "ws-direct-1"
+
+        assert any(call[0] == "open_workspace" for call in state["calls"])
 
     asyncio.run(scenario())

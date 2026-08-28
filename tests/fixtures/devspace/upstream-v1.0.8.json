@@ -1,0 +1,31 @@
+{
+  "package": "@waishnav/devspace",
+  "version": "1.0.8",
+  "node_requirement": ">=22.19 <27",
+  "configuration_file": "config.json",
+  "authentication_file": "auth.json",
+  "configuration_kind": "flat",
+  "accepted_configuration_fields": [
+    "host",
+    "port",
+    "allowedRoots",
+    "publicBaseUrl",
+    "allowedHosts",
+    "stateDir",
+    "worktreeRoot",
+    "artifactsEnabled",
+    "artifactMaxFileBytes",
+    "agentDir",
+    "subagents"
+  ],
+  "public_base_url_is_nullable": true,
+  "owner_token_minimum_length": 16,
+  "required_tools": [
+    "apply_patch",
+    "exec_command",
+    "open_workspace",
+    "read",
+    "show_changes",
+    "write_stdin"
+  ]
+}

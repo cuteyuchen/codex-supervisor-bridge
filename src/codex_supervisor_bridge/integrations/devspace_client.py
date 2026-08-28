@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from contextlib import AbstractAsyncContextManager
+from typing import Any, Callable
 
 from mcp import Client
 
@@ -42,8 +43,13 @@ class DevSpaceWorkspaceAdapter:
     so the adapter can remain replaceable and independently protocol-tested.
     """
 
-    def __init__(self, target: Any = "http://127.0.0.1:7676/mcp") -> None:
-        self._client = Client(target)
+    def __init__(
+        self,
+        target: Any = "http://127.0.0.1:7676/mcp",
+        *,
+        transport_factory: Callable[[], AbstractAsyncContextManager[Any]] | None = None,
+    ) -> None:
+        self._client = Client(transport_factory() if transport_factory is not None else target)
         self._entered = False
         self._tool_names: set[str] | None = None
 

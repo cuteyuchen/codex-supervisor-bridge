@@ -24,7 +24,13 @@ from .configuration import (
     ConfigStore,
     DevelopmentStyle,
 )
-from .devspace import DevSpaceBootstrap, DevSpaceBootstrapConfig
+from .devspace import DevSpaceBootstrap, DevSpaceBootstrapConfig, DevSpaceVersionCompatibility
+from .devspace_auth import (
+    DevSpaceAuthConnection,
+    DevSpaceLocalOAuthDriver,
+    SecretTokenStorage,
+    redact_oauth_payload,
+)
 from .doctor import Doctor, DoctorOptions
 from .harness import (
     HarnessComparison,
@@ -83,6 +89,9 @@ __all__ = [
     "DoctorOptions",
     "DevSpaceBootstrap",
     "DevSpaceBootstrapConfig",
+    "DevSpaceAuthConnection",
+    "DevSpaceLocalOAuthDriver",
+    "DevSpaceVersionCompatibility",
     "DoctorStatus",
     "HarnessComparison",
     "HarnessStep",
@@ -92,6 +101,7 @@ __all__ = [
     "LocalCodexBridgeBootstrap",
     "LocalCodexBridgeBootstrapConfig",
     "MemorySecretStore",
+    "SecretTokenStorage",
     "PortAllocator",
     "PortLease",
     "ProcessManager",
@@ -113,4 +123,5 @@ __all__ = [
     "WindowsDpapiSecretStore",
     "authorize_command",
     "FirstAuthorizationFlow",
+    "redact_oauth_payload",
 ]

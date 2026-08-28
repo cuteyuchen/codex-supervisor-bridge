@@ -13,6 +13,11 @@ from codex_supervisor_bridge import __version__
 
 from .codex_runtime import CodexReadinessDetector
 from .configuration import AppConfig, ConfigStore
+from .devspace import (
+    DEVSPACE_SUPPORTED_VERSION_RANGE,
+    DEVSPACE_TESTED_VERSIONS,
+    DevSpaceVersionCompatibility,
+)
 from .models import ComponentHealth, DoctorStatus, HealthStatus
 from .paths import AppDataPaths
 from .ports import PortAllocator
@@ -297,6 +302,17 @@ class Doctor:
 
     def _workspace(self) -> ComponentHealth:
         result = self._executable("Local workspace", "devspace", "devspace --version")
+        version = result.advanced.get("version")
+        result.advanced["upstream_compatibility"] = {
+            "tested_versions": list(DEVSPACE_TESTED_VERSIONS),
+            "supported_version_range": DEVSPACE_SUPPORTED_VERSION_RANGE,
+            "compatible": DevSpaceVersionCompatibility.is_supported(version),
+        }
+        if result.status == HealthStatus.READY and not DevSpaceVersionCompatibility.is_supported(version):
+            result.status = HealthStatus.DEGRADED
+            result.repairable = False
+            result.user_message = "Local workspace needs a compatible release."
+            result.recommended_action = "repair_local_workspace"
         if result.status == HealthStatus.READY and self._find("bash") is None:
             result.status = HealthStatus.DEGRADED
             result.repairable = False

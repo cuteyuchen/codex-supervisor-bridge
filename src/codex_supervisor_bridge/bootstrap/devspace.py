@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import secrets
 import tempfile
 from pathlib import Path
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -12,11 +15,39 @@ from .paths import AppDataPaths
 from .process import ManagedProcessSpec
 from .secrets import SecretStore
 
+DEVSPACE_TESTED_VERSIONS = ("1.0.5", "1.0.8")
+DEVSPACE_SUPPORTED_VERSION_RANGE = ">=1.0.5,<1.1"
+
+
+class DevSpaceVersionCompatibility:
+    """Map a DevSpace release to the exact configuration layout it reads."""
+
+    @classmethod
+    def parse_version(cls, value: str | None) -> tuple[int, ...] | None:
+        if not value:
+            return None
+        match = re.search(r"(\d+(?:\.\d+)+)", value)
+        if match is None:
+            return None
+        try:
+            return tuple(int(part) for part in match.group(1).split("."))
+        except ValueError:
+            return None
+
+    @classmethod
+    def is_supported(cls, version: str | None) -> bool:
+        parsed = cls.parse_version(version)
+        return parsed is not None and (1, 0, 5) <= parsed < (1, 1)
+
+    @classmethod
+    def uses_flat_json(cls, version: str | None) -> bool:
+        parsed = cls.parse_version(version)
+        return parsed is not None and (1, 0, 5) <= parsed < (1, 1)
 
 class DevSpaceBootstrapConfig(BaseModel):
-    """The current DevSpace v1 config shape, kept at the provider boundary."""
+    """DevSpace 1.0.x released contract, kept at the provider boundary."""
 
-    config_version: int = 1
+    schema_variant: Literal["v1_0_flat"] = "v1_0_flat"
     port: int = Field(ge=1, le=65535)
     allowed_roots: list[Path] = Field(default_factory=list)
     worktree_root: Path
@@ -25,40 +56,27 @@ class DevSpaceBootstrapConfig(BaseModel):
     owner_secret_ref: str = "devspace-owner-token"
 
     def document(self) -> dict[str, object]:
+        if self.schema_variant != "v1_0_flat":
+            raise ValueError("unsupported DevSpace configuration schema")
         return {
-            "$schema": "https://raw.githubusercontent.com/Waishnav/devspace/main/schema/v1/devspace.schema.json",
-            "configVersion": self.config_version,
-            "server": {
-                "host": "127.0.0.1",
-                "port": self.port,
-                "publicBaseUrl": self.public_base_url,
-                "allowedHosts": [],
-                "trustProxy": False,
-            },
-            "workspaces": {
-                "allowedRoots": [str(path) for path in self.allowed_roots],
-                "worktreeRoot": str(self.worktree_root),
-            },
-            "storage": {"stateDir": str(self.state_dir)},
-            "tools": {"mode": "codex"},
-            "ui": {"enabled": False},
-            "artifacts": {"enabled": False},
-            "skills": {"enabled": True, "paths": [], "agentDir": "~/.codex"},
-            "subagents": {"enabled": False, "providers": []},
-            "logging": {
-                "level": "info",
-                "format": "json",
-                "requests": True,
-                "assets": False,
-                "toolCalls": True,
-                "shellCommands": False,
-            },
-            "oauth": {
-                "accessTokenTtlSeconds": 3600,
-                "refreshTokenTtlSeconds": 2592000,
-                "scopes": ["devspace"],
-                "allowedRedirectHosts": ["chatgpt.com", "localhost", "127.0.0.1"],
-            },
+            "host": "127.0.0.1",
+            "port": self.port,
+            "allowedRoots": [str(path) for path in self.allowed_roots],
+            "publicBaseUrl": self.public_base_url,
+            "allowedHosts": ["localhost", "127.0.0.1"],
+            "stateDir": str(self.state_dir),
+            "worktreeRoot": str(self.worktree_root),
+            "artifactsEnabled": False,
+            "agentDir": "~/.codex",
+            "subagents": False,
+        }
+
+    def upstream_compatibility(self) -> dict[str, Any]:
+        return {
+            "tested_versions": list(DEVSPACE_TESTED_VERSIONS),
+            "supported_version_range": DEVSPACE_SUPPORTED_VERSION_RANGE,
+            "configuration_kind": "v1_0_flat",
+            "configuration_file": "config.json",
         }
 
 
@@ -101,10 +119,38 @@ class DevSpaceBootstrap:
 
     @property
     def config_path(self) -> Path:
-        return self.config_directory / "config.jsonc"
+        return self.config_directory / "config.json"
+
+    @property
+    def auth_path(self) -> Path:
+        return self.config_directory / "auth.json"
+
+    def prepare_auth(self, secret_store: SecretStore) -> Path:
+        owner_token = secret_store.get(self.config.owner_secret_ref)
+        if not owner_token:
+            owner_token = secrets.token_urlsafe(32)
+            secret_store.set(self.config.owner_secret_ref, owner_token)
+        if len(owner_token) < 16:
+            raise ValueError("DevSpace owner credential is too short")
+        self.config_directory.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix="devspace-auth-", suffix=".tmp", dir=self.config_directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump({"ownerToken": owner_token}, handle)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.auth_path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return self.auth_path
 
     def write_config(self) -> Path:
         self.config_directory.mkdir(parents=True, exist_ok=True)
+        # DevSpace 1.0.x ignores this file when config.json exists. Keep the
+        # managed directory single-source if an earlier P6.6 prototype left one.
+        (self.config_directory / "config.jsonc").unlink(missing_ok=True)
         self.config.worktree_root.mkdir(parents=True, exist_ok=True)
         self.config.state_dir.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(self.config.document(), indent=2, sort_keys=True) + "\n"

@@ -4,7 +4,7 @@
 >
 > This document records the current product intent and the architecture decisions that supersede earlier fixed-backend assumptions. It is deliberately more durable than a browser conversation.
 
-Last updated: 2026-08-27
+Last updated: 2026-08-28
 
 ## Product goal
 
@@ -356,6 +356,15 @@ The first implementation slice is intentionally backend-neutral and layered:
   binding;
 - user-facing bootstrap projections hide internal repair/provider operation
   names while advanced diagnostics retain them;
+- DevSpace released-contract compatibility for npm versions 1.0.5 and 1.0.8:
+  one Bridge-managed flat `config.json`, one managed `auth.json`, no default
+  `~/.devspace` source, and no stale managed `config.jsonc`;
+- a local-only Supervisor -> DevSpace OAuth driver using the MCP Python SDK
+  OAuth client (discovery, dynamic registration, PKCE, bearer injection, and
+  refresh) with SecretStore-backed owner/OAuth credentials and redacted
+  diagnostics;
+- Local-Codex-Bridge canonical `node <repository>/dist/src/index.js` launch
+  validation with `npm start` explicitly rejected at the stdio boundary;
 - fake process/provider harnesses for Profile A/B semantic comparison.
 
 The current code-level work does not claim real Windows OAuth, ChatGPT Web

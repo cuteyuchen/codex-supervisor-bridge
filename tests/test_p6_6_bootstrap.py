@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
+from contextlib import asynccontextmanager
 from pathlib import Path
+
+import pytest
+from mcp.client.auth.oauth2 import OAuthClientProvider
+from mcp.shared.auth import OAuthToken
+from pydantic import ValidationError
 
 from codex_supervisor_bridge.bootstrap import (
     AppConfig,
@@ -16,6 +23,8 @@ from codex_supervisor_bridge.bootstrap import (
     CommandVerdict,
     ConfigStore,
     DevSpaceBootstrap,
+    DevSpaceLocalOAuthDriver,
+    DevSpaceVersionCompatibility,
     Doctor,
     FirstAuthorizationFlow,
     HarnessStep,
@@ -31,10 +40,12 @@ from codex_supervisor_bridge.bootstrap import (
     ProfileABHarness,
     ProfileScenarioRunner,
     ScenarioObservation,
+    SecretTokenStorage,
     SecureRemoteAccessConfig,
     SecureRemoteAccessController,
     SecureRemoteAccessValidator,
     authorize_command,
+    redact_oauth_payload,
 )
 from codex_supervisor_bridge.bootstrap.service import _find_executable
 from codex_supervisor_bridge.mcp.server import _is_loopback_host
@@ -215,6 +226,136 @@ def test_bootstrap_resolves_configured_absolute_executable_path(tmp_path: Path) 
     assert _find_executable(str(executable)) == str(executable)
 
 
+def test_devspace_current_config_filename(tmp_path: Path) -> None:
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    bootstrap = DevSpaceBootstrap.from_app_data(paths, port=39101)
+    stale = bootstrap.config_directory / "config.jsonc"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("{ stale prototype }", encoding="utf-8")
+    config_path = bootstrap.write_config()
+
+    assert bootstrap.config_directory == paths.config / "devspace"
+    assert config_path == paths.config / "devspace" / "config.json"
+    assert config_path.exists()
+    assert not stale.exists()
+    assert not (Path.home() / ".devspace" / "config.json").exists()
+
+
+def test_devspace_current_flat_config_matches_upstream_contract(tmp_path: Path) -> None:
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    bootstrap = DevSpaceBootstrap.from_app_data(paths, port=39101, project_directory=project)
+    document = json.loads(bootstrap.write_config().read_text(encoding="utf-8"))
+
+    assert document == {
+        "host": "127.0.0.1",
+        "port": 39101,
+        "allowedRoots": [str(project.resolve())],
+        "publicBaseUrl": None,
+        "allowedHosts": ["localhost", "127.0.0.1"],
+        "stateDir": str(paths.data / "devspace"),
+        "worktreeRoot": str(paths.cache / "devspace" / "worktrees"),
+        "artifactsEnabled": False,
+        "agentDir": "~/.codex",
+        "subagents": False,
+    }
+    assert bootstrap.config.upstream_compatibility() == {
+        "tested_versions": ["1.0.5", "1.0.8"],
+        "supported_version_range": ">=1.0.5,<1.1",
+        "configuration_kind": "v1_0_flat",
+        "configuration_file": "config.json",
+    }
+
+
+def test_upstream_release_contract_fixture_remains_current() -> None:
+    fixture_path = Path(__file__).parent / "fixtures" / "devspace" / "upstream-v1.0.8.json"
+    contract = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+    assert contract["package"] == "@waishnav/devspace"
+    assert contract["version"] == "1.0.8"
+    assert contract["node_requirement"] == ">=22.19 <27"
+    assert contract["configuration_file"] == "config.json"
+    assert contract["authentication_file"] == "auth.json"
+    assert contract["configuration_kind"] == "flat"
+    assert contract["public_base_url_is_nullable"] is True
+    assert contract["owner_token_minimum_length"] == 16
+    assert contract["required_tools"] == [
+        "apply_patch",
+        "exec_command",
+        "open_workspace",
+        "read",
+        "show_changes",
+        "write_stdin",
+    ]
+
+
+def test_devspace_version_compatibility_matches_tested_releases() -> None:
+    assert DevSpaceVersionCompatibility.parse_version("devspace 1.0.8") == (1, 0, 8)
+    assert DevSpaceVersionCompatibility.is_supported("1.0.5") is True
+    assert DevSpaceVersionCompatibility.is_supported("1.0.8") is True
+    assert DevSpaceVersionCompatibility.is_supported("1.1.0") is False
+    assert DevSpaceVersionCompatibility.is_supported("unknown") is False
+
+
+def test_devspace_managed_config_directory_is_used_by_repair_and_process(tmp_path: Path) -> None:
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    from codex_supervisor_bridge.bootstrap.repair import RepairService
+
+    secrets = MemorySecretStore()
+    RepairService(paths=paths, secret_store=secrets).repair(project_directory=project)
+    config = ConfigStore(paths=paths).load().config
+    bootstrap = DevSpaceBootstrap.from_app_data(
+        paths,
+        port=config.advanced.ports["devspace"],
+        project_directory=project,
+    )
+    spec = bootstrap.process_spec()
+
+    assert bootstrap.config_directory == paths.config / "devspace"
+    assert bootstrap.auth_path == paths.config / "devspace" / "auth.json"
+    assert spec.cwd == bootstrap.config_directory
+    assert spec.env is not None
+    assert spec.env["DEVSPACE_CONFIG_DIR"] == str(bootstrap.config_directory)
+    assert str(Path.home() / ".devspace") not in spec.env.values()
+    assert "DEVSPACE_OAUTH_OWNER_TOKEN" not in spec.env
+    auth = json.loads(bootstrap.auth_path.read_text(encoding="utf-8"))
+    owner_token = secrets.get("devspace-owner-token")
+    assert auth["ownerToken"] == owner_token
+    assert len(owner_token) >= 32
+    assert bootstrap.prepare_auth(secrets) == bootstrap.auth_path
+    assert secrets.get("devspace-owner-token") == owner_token
+
+
+def test_devspace_is_not_chatgpt_facing_public_endpoint(tmp_path: Path) -> None:
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    from codex_supervisor_bridge.bootstrap.repair import RepairService
+
+    RepairService(paths=paths, secret_store=MemorySecretStore()).repair(project_directory=tmp_path)
+    generated = json.loads(paths.generated_mcp_config.read_text(encoding="utf-8"))
+    workspace_document = json.loads(
+        (paths.config / "devspace" / "config.json").read_text(encoding="utf-8")
+    )
+
+    assert list(generated["mcpServers"]) == ["codex-supervisor-bridge"]
+    assert generated["mcpServers"]["codex-supervisor-bridge"]["url"].startswith("http://127.0.0.1:")
+    assert workspace_document["publicBaseUrl"] is None
+
+
 def test_bootstrap_start_reports_supervisor_launch_failure(tmp_path: Path) -> None:
     from codex_supervisor_bridge.bootstrap import BootstrapService
 
@@ -352,11 +493,9 @@ def test_devspace_bootstrap_writes_scoped_v1_config_and_process_command(tmp_path
     bootstrap = DevSpaceBootstrap.from_app_data(paths, port=39101, project_directory=project)
     config_path = bootstrap.write_config()
     document = json.loads(config_path.read_text(encoding="utf-8"))
-    assert document["configVersion"] == 1
-    assert document["server"]["host"] == "127.0.0.1"
-    assert document["server"]["port"] == 39101
-    assert document["tools"]["mode"] == "codex"
-    assert str(project) in document["workspaces"]["allowedRoots"]
+    assert document["host"] == "127.0.0.1"
+    assert document["port"] == 39101
+    assert str(project) in document["allowedRoots"]
     assert not (bootstrap.config_directory / "auth.json").exists()
     assert bootstrap.process_spec().command == ["devspace", "serve"]
 
@@ -373,6 +512,19 @@ def test_local_codex_bridge_bootstrap_checks_current_control_surface() -> None:
     )
     assert ready.status == HealthStatus.READY
     assert ready.advanced["semantics"] == ["turn", "observe", "steer", "respond", "interrupt"]
+
+
+def test_local_codex_bridge_rejects_npm_start_and_uses_node_entrypoint(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError):
+        LocalCodexBridgeBootstrapConfig(launch_command=["npm", "start"])
+
+    build_root = tmp_path / "Local-Codex-Bridge"
+    entrypoint = build_root / "dist" / "src" / "index.js"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("placeholder", encoding="utf-8")
+    command = LocalCodexBridgeBootstrap.canonical_launch_command(build_root)
+
+    assert command == ["node", str(entrypoint.resolve())]
 
 
 def test_secret_store_round_trip_and_remote_access_security_gate() -> None:
@@ -436,6 +588,89 @@ def test_first_authorization_flow_keeps_credentials_out_of_result() -> None:
     assert result.status == AuthorizationStatus.AUTHORIZED
     assert "do-not-log" not in result.model_dump_json()
     assert secrets.get("workspace-auth") == "do-not-log"
+
+
+def test_devspace_oauth_tokens_are_secret_store_backed_and_redacted() -> None:
+    async def scenario() -> None:
+        secrets = MemorySecretStore()
+        storage = SecretTokenStorage(secrets, secret_ref="devspace-oauth")
+        token = OAuthToken(
+            access_token="access-do-not-log",
+            token_type="Bearer",
+            refresh_token="refresh-do-not-log",
+            expires_in=3600,
+        )
+
+        await storage.set_tokens(token)
+        raw = secrets.get("devspace-oauth")
+        restored = await storage.get_tokens()
+
+        assert raw is not None
+        assert "access-do-not-log" in raw
+        assert restored == token
+        rendered = json.dumps(redact_oauth_payload(token.model_dump()))
+        assert "access-do-not-log" not in rendered
+        assert "refresh-do-not-log" not in rendered
+
+    asyncio.run(scenario())
+
+
+def test_devspace_local_oauth_uses_mcp_provider_and_owner_form() -> None:
+    async def scenario() -> None:
+        secrets = MemorySecretStore()
+        secrets.set("devspace-owner-token", "owner-secret-not-logged")
+        providers: list[object] = []
+
+        class FakeResponse:
+            def __init__(self, status_code: int, headers: dict[str, str]) -> None:
+                self.status_code = status_code
+                self.headers = headers
+
+        class FakeClient:
+            async def get(self, url: str, *, headers: dict[str, str] | None = None) -> FakeResponse:
+                del url, headers
+                return FakeResponse(200, {})
+
+            async def post(self, url: str, *, data: dict[str, str], follow_redirects: bool = False) -> FakeResponse:
+                del url, follow_redirects
+                assert data == {"owner_token": "owner-secret-not-logged"}
+                return FakeResponse(
+                    302,
+                    {"location": "http://127.0.0.1/codex-supervisor-callback?code=one-time-code&state=state-1"},
+                )
+
+        @asynccontextmanager
+        async def factory(auth: object):
+            if auth is not None:
+                providers.append(auth)
+            yield FakeClient()
+
+        missing = await DevSpaceLocalOAuthDriver().authorize(
+            mcp_url="http://127.0.0.1:39101/mcp",
+            secret_store=MemorySecretStore(),
+            http_client_factory=factory,
+        )
+        assert missing.status == "NEEDS_REPAIR"
+
+        driver = DevSpaceLocalOAuthDriver(http_client_factory=factory)
+        approval = await driver.submit_owner_approval(
+            client=FakeClient(),
+            authorization_url="http://127.0.0.1:39101/authorize?state=state-1",
+            owner_token="owner-secret-not-logged",
+        )
+        assert approval.code == "one-time-code"
+        assert approval.state == "state-1"
+
+        authorized = await driver.authorize(
+            mcp_url="http://127.0.0.1:39101/mcp",
+            secret_store=secrets,
+            http_client_factory=factory,
+        )
+        assert authorized.status == "AUTHORIZED"
+        assert len(providers) == 1
+        assert isinstance(providers[0], OAuthClientProvider)
+
+    asyncio.run(scenario())
 
 
 def test_codex_readiness_requires_more_than_an_executable() -> None:

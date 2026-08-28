@@ -3,12 +3,16 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import sys
 from pathlib import Path
 
 from mcp.server import MCPServer
 
 from codex_supervisor_bridge import __version__
 from codex_supervisor_bridge.bootstrap import BootstrapService
+from codex_supervisor_bridge.bootstrap.devspace_auth import DevSpaceLocalOAuthDriver
+from codex_supervisor_bridge.bootstrap.paths import AppDataPaths
+from codex_supervisor_bridge.bootstrap.secrets import MemorySecretStore, WindowsDpapiSecretStore
 from codex_supervisor_bridge.config import Settings
 from codex_supervisor_bridge.integrations.codex_control_client import CodexControlAdapter
 from codex_supervisor_bridge.integrations.codex_coordinator import CodexCoordinator
@@ -221,13 +225,30 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("HTTP MCP must bind to loopback; use a secure HTTPS tunnel for remote access")
 
     service = MemoryService(args.database)
+    app_paths = AppDataPaths.from_environment()
+    secret_store = (
+        WindowsDpapiSecretStore(app_paths.config / "secrets")
+        if sys.platform == "win32"
+        else MemorySecretStore()
+    )
+    devspace_auth = DevSpaceLocalOAuthDriver()
+
+    def authenticated_devspace_factory() -> DevSpaceWorkspaceAdapter:
+        return DevSpaceWorkspaceAdapter(
+            args.devspace_mcp_url,
+            transport_factory=lambda: devspace_auth.http_transport(
+                mcp_url=args.devspace_mcp_url,
+                secret_store=secret_store,
+            ),
+        )
+
     kandev = KandevCoordinator(
         service,
         lambda: KandevAdapter(args.kandev_mcp_url),
     )
     direct_workspace = DirectWorkspaceCoordinator(
         service,
-        lambda: DevSpaceWorkspaceAdapter(args.devspace_mcp_url),
+        authenticated_devspace_factory,
     )
     codex = CodexCoordinator(
         service,

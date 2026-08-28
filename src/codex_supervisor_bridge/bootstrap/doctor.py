@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -358,6 +359,25 @@ class Doctor:
                     "technical_detail": "dist/src/index.js not found",
                 },
             )
+        version_result = self._run([node, "--version"])
+        node_version = _first_line(version_result.stdout or version_result.stderr) if version_result.returncode == 0 else None
+        match = re.search(r"(\d+)", node_version or "")
+        node_major = int(match.group(1)) if match else None
+        if node_major is None or node_major < 24:
+            return ComponentHealth(
+                capability="Codex control",
+                status=HealthStatus.DEGRADED,
+                repairable=True,
+                user_message="Codex control needs Node.js 24 or newer.",
+                recommended_action="repair_codex_control",
+                advanced={
+                    "provider": "local-codex-bridge",
+                    "repository": str(resolved),
+                    "entrypoint": str(entrypoint),
+                    "node_version": node_version,
+                    "technical_detail": "Local-Codex-Bridge requires Node.js 24+",
+                },
+            )
         return ComponentHealth(
             capability="Codex control",
             status=HealthStatus.READY,
@@ -367,6 +387,7 @@ class Doctor:
                 "repository": str(resolved),
                 "entrypoint": str(entrypoint),
                 "launch_command": [node, str(entrypoint)],
+                "node_version": node_version,
             },
         )
 

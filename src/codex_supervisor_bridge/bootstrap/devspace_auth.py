@@ -7,7 +7,7 @@ from typing import Any, AsyncContextManager, AsyncIterator, Callable, Protocol
 from urllib.parse import parse_qs, urlparse
 
 import httpx2
-from mcp.client.auth.oauth2 import OAuthClientProvider
+from mcp.client.auth.oauth2 import OAuthClientInformationFull, OAuthClientProvider
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.auth import AuthorizationCodeResult, OAuthClientMetadata, OAuthToken
 
@@ -49,11 +49,11 @@ class SecretTokenStorage:
     async def set_tokens(self, tokens: OAuthToken) -> None:
         self.secret_store.set(self.secret_ref, tokens.model_dump_json(exclude_none=True))
 
-    async def get_client_info(self) -> Any | None:
+    async def get_client_info(self) -> OAuthClientInformationFull | None:
         raw = self.secret_store.get(f"{self.secret_ref}-client")
         if not raw:
             return None
-        return json.loads(raw)
+        return OAuthClientInformationFull.model_validate_json(raw)
 
     async def set_client_info(self, client_info: Any) -> None:
         payload = json.dumps(client_info.model_dump(mode="json", exclude_none=True))

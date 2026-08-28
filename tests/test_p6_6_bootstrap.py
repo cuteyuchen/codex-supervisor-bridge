@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from mcp.client.auth.oauth2 import OAuthClientProvider
+from mcp.client.auth.oauth2 import OAuthClientInformationFull, OAuthClientProvider
 from mcp.shared.auth import OAuthToken
 from pydantic import ValidationError
 
@@ -636,7 +636,7 @@ def test_doctor_reads_local_codex_repository_launch(tmp_path: Path) -> None:
 
     def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         del kwargs
-        return subprocess.CompletedProcess(command, 0, "ok\n", "")
+        return subprocess.CompletedProcess(command, 0, "v24.9.0\n", "")
 
     doctor = Doctor(
         paths=paths,
@@ -652,6 +652,38 @@ def test_doctor_reads_local_codex_repository_launch(tmp_path: Path) -> None:
         "C:/Program Files/nodejs/node.exe",
         str(entrypoint.resolve()),
     ]
+    assert health.advanced["node_version"] == "v24.9.0"
+
+
+def test_doctor_local_codex_repository_rejects_old_node(tmp_path: Path) -> None:
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    repository = tmp_path / "Local-Codex-Bridge"
+    entrypoint = repository / "dist" / "src" / "index.js"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("placeholder", encoding="utf-8")
+    config_store = ConfigStore(paths=paths)
+    config = AppConfig.safe_defaults(paths)
+    config.advanced.local_codex_repository = repository
+    config.advanced.executable_paths["node"] = "C:/node-20/node.exe"
+    config_store.save(config)
+
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        return subprocess.CompletedProcess(command, 0, "v20.19.0\n", "")
+
+    doctor = Doctor(
+        paths=paths,
+        config_store=config_store,
+        executable_finder=lambda name: "C:/node-20/node.exe" if name == "node" else None,
+        command_runner=runner,
+    )
+    health = doctor._codex_control(config)
+
+    assert health.status == HealthStatus.DEGRADED
+    assert health.advanced["node_version"] == "v20.19.0"
 
 
 def test_secret_store_round_trip_and_remote_access_security_gate() -> None:
@@ -957,6 +989,11 @@ def test_devspace_local_oauth_real_loopback_protocol() -> None:
     assert _FakeDevSpaceOAuthHandler.authorize_calls == 1
     assert _FakeDevSpaceOAuthHandler.register_calls == 1
     assert _FakeDevSpaceOAuthHandler.token_calls == 1
+    stored_client = asyncio.run(
+        SecretTokenStorage(secrets, secret_ref="devspace-oauth").get_client_info()
+    )
+    assert isinstance(stored_client, OAuthClientInformationFull)
+    assert stored_client.client_id == "fake-client"
 
     assert resumed.status == "AUTHORIZED"
     assert _FakeDevSpaceOAuthHandler.authorize_calls == 1

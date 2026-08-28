@@ -367,7 +367,8 @@ The first implementation slice is intentionally backend-neutral and layered:
 - Local-Codex-Bridge canonical `node <repository>/dist/src/index.js` launch
   validation with npm-family launchers explicitly rejected at the stdio
   boundary, plus repository-driven Doctor and `start` resolution through
-  `local_codex_repository` / `executable_paths.node`;
+  `local_codex_repository` / `executable_paths.node` and Node.js 24+ version
+  enforcement;
 - fake process/provider harnesses for Profile A/B semantic comparison.
 
 The current code-level work does not claim real Windows OAuth, ChatGPT Web

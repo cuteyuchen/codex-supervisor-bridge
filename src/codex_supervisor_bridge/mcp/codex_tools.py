@@ -5,7 +5,7 @@ from typing import Any
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 
-from codex_supervisor_bridge.integrations.codex_coordinator import CodexCoordinator
+from codex_supervisor_bridge.supervisor.agent_facade import CodexSemanticFacade
 
 from .errors import expose_integration_errors, tool_argument_error
 
@@ -31,25 +31,24 @@ INTERRUPT = ToolAnnotations(
 )
 
 
-def register_codex_tools(server: MCPServer, coordinator: CodexCoordinator) -> None:
-    """Register the P4 semantic Codex control surface.
+def register_codex_tools(server: MCPServer, facade: CodexSemanticFacade) -> None:
+    """Register the provider-neutral semantic Codex control surface.
 
-    Raw upstream tools are intentionally not re-exported. The Supervisor can
-    start/read a Plan workflow, import and approve a reviewed plan, execute it,
-    steer the current turn, answer bounded interactions, or interrupt work.
+    Raw upstream tools are intentionally not re-exported. The facade routes to
+    the active Profile A/B AgentBackend without exposing backend names.
     """
 
     @server.tool(annotations=READ_ONLY)
     @expose_integration_errors
     async def get_codex_control_health() -> dict[str, Any]:
-        """Verify Codex Control Plane MCP contract compatibility and health."""
-        return await coordinator.health()
+        """Verify the active Codex control surface contract and health."""
+        return await facade.health()
 
     @server.tool(annotations=READ_ONLY)
     @expose_integration_errors
     async def get_codex_runtime_capabilities() -> dict[str, Any]:
-        """Read sanitized Codex runtime capabilities after contract verification."""
-        return await coordinator.runtime_capabilities()
+        """Read sanitized Codex runtime capabilities for the active profile."""
+        return await facade.runtime_capabilities()
 
     @server.tool(annotations=READ_ONLY)
     @expose_integration_errors
@@ -62,7 +61,7 @@ def register_codex_tools(server: MCPServer, coordinator: CodexCoordinator) -> No
         """Run passive Codex preflight checks without starting a live probe."""
         if workflow_kind not in {"plan", "write", "review"}:
             raise tool_argument_error("workflow_kind must be plan, write, or review")
-        return await coordinator.preflight(
+        return await facade.preflight(
             project_id=project_id,
             cwd=cwd,
             model=model,
@@ -86,7 +85,7 @@ def register_codex_tools(server: MCPServer, coordinator: CodexCoordinator) -> No
         """
         if not project_id.strip():
             raise tool_argument_error("project_id must not be empty")
-        return await coordinator.start_plan(
+        return await facade.start_plan(
             task_id,
             expected_revision,
             project_id=project_id,
@@ -98,7 +97,7 @@ def register_codex_tools(server: MCPServer, coordinator: CodexCoordinator) -> No
     @expose_integration_errors
     async def get_codex_status(task_id: str) -> dict[str, Any]:
         """Read current durable Codex workflow/operation status without changing revision."""
-        return await coordinator.status(task_id)
+        return await facade.status(task_id)
 
     @server.tool(annotations=MUTATION)
     @expose_integration_errors
@@ -111,7 +110,7 @@ def register_codex_tools(server: MCPServer, coordinator: CodexCoordinator) -> No
         Only upstream plans classified as valid_plan are accepted. This does not
         approve or execute the plan.
         """
-        return await coordinator.import_latest_plan(task_id, expected_revision)
+        return await facade.import_latest_plan(task_id, expected_revision)
 
     @server.tool(annotations=MUTATION)
     @expose_integration_errors
@@ -124,10 +123,9 @@ def register_codex_tools(server: MCPServer, coordinator: CodexCoordinator) -> No
         Before execution, the Bridge re-reads Codex latestPlan and refuses to
         run if it differs from the local approved plan.
         """
-        return await coordinator.execute_approved_plan(
+        return await facade.execute_approved_plan(
             task_id,
             expected_revision,
-            sandbox="workspace-write",
         )
 
     @server.tool(annotations=MUTATION)
@@ -145,7 +143,7 @@ def register_codex_tools(server: MCPServer, coordinator: CodexCoordinator) -> No
         """
         if not instruction.strip():
             raise tool_argument_error("instruction must not be empty")
-        return await coordinator.soft_steer(task_id, expected_revision, instruction)
+        return await facade.soft_steer(task_id, expected_revision, instruction)
 
     @server.tool(annotations=INTERRUPT)
     @expose_integration_errors
@@ -155,7 +153,7 @@ def register_codex_tools(server: MCPServer, coordinator: CodexCoordinator) -> No
         reason: str | None = None,
     ) -> dict[str, Any]:
         """Interrupt the current Codex turn and move the Supervisor task to PAUSED."""
-        return await coordinator.interrupt(
+        return await facade.interrupt(
             task_id,
             expected_revision,
             reason=reason,
@@ -165,7 +163,7 @@ def register_codex_tools(server: MCPServer, coordinator: CodexCoordinator) -> No
     @expose_integration_errors
     async def list_codex_pending_interactions(task_id: str) -> dict[str, Any]:
         """List pending Codex approvals/questions scoped to this supervised task."""
-        return await coordinator.pending_interactions(task_id)
+        return await facade.pending_interactions(task_id)
 
     @server.tool(annotations=MUTATION)
     @expose_integration_errors
@@ -184,7 +182,7 @@ def register_codex_tools(server: MCPServer, coordinator: CodexCoordinator) -> No
             raise tool_argument_error("scope must be turn or session")
         if decision is None and answers is None:
             raise tool_argument_error("decision or answers is required")
-        return await coordinator.answer_interaction(
+        return await facade.answer_interaction(
             task_id,
             expected_revision,
             interaction_id,

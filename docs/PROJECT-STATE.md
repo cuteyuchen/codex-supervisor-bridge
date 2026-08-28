@@ -373,6 +373,45 @@ The first implementation slice is intentionally backend-neutral and layered:
   boundary, plus repository-driven Doctor and `start` resolution through
   `local_codex_repository` / `executable_paths.node` and Node.js 24+ version
   enforcement;
+- production Runtime Composition (`supervisor.runtime.RuntimeComposition`)
+  now wires the active Profile into the real Supervisor MCP surface:
+  Profile B uses `LocalCodexBridgeAgentBackend` through one long-lived
+  `AgentSessionManager` stdio session plus `AgentExecutionCoordinator` and
+  `CheckpointService`; Profile A keeps `ControlPlaneAgentBackend` as the
+  compatibility fallback. `mcp.server.create_mcp_server` accepts the neutral
+  `AgentSupervisorFacade`, and `mcp.codex_tools` is provider-neutral with the
+  same MCP tool names;
+- Local-Codex-Bridge is now a client-owned stdio MCP session, never a detached
+  daemon: `BootstrapService.start` no longer calls
+  `ProcessManager.start(local_codex_bridge.process_spec())`. The Supervisor
+  process owns the stdin/stdout lifecycle; restart recovery uses persisted
+  `thread_id/turn_id/operation_id`, resumes only when observe confirms the
+  runtime, and otherwise latches `RECONCILIATION_REQUIRED` and fails closed;
+- task-level backend/profile binding (schema v8 `task_backend_binding`) fixes
+  workspace/agent/profile on first runtime bind. A later capability drop
+  cannot silently switch a bound task; only an explicit controlled migration
+  may replace the binding;
+- `AgentSessionManager` reuses one managed session across
+  start_plan/observe/steer/respond/interrupt, counts session creation/shutdown,
+  and performs fail-closed restart recovery. The LCB session-reuse test proves
+  one active turn does not spawn five processes;
+- `codex-supervisor start` uses a bounded `SUPERVISOR_READY` log marker for
+  combined supervisor/agent readiness and reports DEGRADED instead of READY
+  when the agent probe is not healthy; the marker itself is fail-soft and
+  bounded, so an ephemeral agent probe failure cannot block Supervisor startup;
+- app-managed component installation foundation
+  (`bootstrap.installer.ComponentInstaller`) installs pinned manifests into
+  `%LOCALAPPDATA%\CodexSupervisorBridge\components`, verifies checksums,
+  runs bounded retries, promotes atomically, and rolls back to the previous
+  version; network download remains a later Windows Gate;
+- Profile B Node compatibility is unified to `>=24, <27` so Doctor and the
+  installer cannot report DevSpace READY while Local-Codex-Bridge later
+  rejects the same runtime;
+- a production-composition fake/protocol E2E now runs the full 20-step
+  scenario through real MemoryService, DirectWorkspaceCoordinator,
+  AgentExecutionCoordinator, and the semantic MCP facade for both profiles,
+  and compares revision, plan version, writer, writer_epoch, workspace
+  identity, and event sequence;
 - fake process/provider harnesses for Profile A/B semantic comparison;
 - ProcessManager watchdog behavior is now covered end to end: crashed-process
   detection clears the dead PID so later health checks remain CRASHED instead
@@ -396,8 +435,11 @@ The first implementation slice is intentionally backend-neutral and layered:
 - RepairService recovers invalid configuration from DEGRADED to safe defaults,
   and the `doctor` CLI emits structured UX JSON without provider, SQLite, or
   backend names. Doctor reports a stopped Supervisor Bridge as repairable
-  `start_supervisor` instead of falsely showing it as READY (157 tests locally
-  on Python 3.12/3.13).
+  `start_supervisor` instead of falsely showing it as READY. The current
+  code-level suite is 171 tests locally on Python 3.12/3.13, including task
+  backend binding, AgentSessionManager reuse and fail-closed restart,
+  installer atomic promote/rollback, production-composition E2E, and the
+  fail-soft readiness marker.
 
 The current code-level work does not claim real Windows OAuth, ChatGPT Web
 Remote MCP attachment, tunnel-provider login, or authenticated Codex runtime
@@ -440,6 +482,14 @@ Run the same supervised scenario against Profile A and Profile B. Required gates
 - failure/recovery behavior.
 
 Profile B becomes the default only if it passes these gates. Existing Profile A remains a fallback until the lightweight path is proven.
+
+Code-level production wiring for this phase is now complete in PR #9:
+Profile B runs through `AgentExecutionCoordinator` + `LocalCodexBridgeAgentBackend`
+via a persistent `AgentSessionManager`, Profile A remains the
+`ControlPlaneAgentBackend` compatibility path, the Codex semantic MCP facade is
+provider-neutral, task backend binding is durable (schema v8), and restart
+recovery fails closed into reconciliation. The next step is the real Windows
+Gate (install/launch/OAuth/Codex login/tunnel/ChatGPT Remote MCP attachment).
 
 #### P7 — Backend-neutral Review / QA / PR / CI loop
 

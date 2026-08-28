@@ -8,7 +8,7 @@ from pathlib import Path
 from codex_supervisor_bridge.backends.models import BackendHealth, BackendHealthStatus
 from codex_supervisor_bridge.capabilities import CapabilityResolver
 
-from .configuration import AppConfig, ConfigStore
+from .configuration import AppConfig, CommandPolicy, ConfigStore, DevelopmentStyle
 from .devspace import DevSpaceBootstrap
 from .doctor import Doctor, DoctorOptions
 from .local_codex import LocalCodexBridgeBootstrap, LocalCodexBridgeBootstrapConfig
@@ -54,6 +54,32 @@ class BootstrapService:
             selected_profile=_profile(config, doctor),
             doctor=doctor,
         )
+
+    def configure(
+        self,
+        *,
+        project_directory: Path | None = None,
+        development_style: DevelopmentStyle | None = None,
+        local_command_policy: CommandPolicy | None = None,
+        allow_chatgpt_codex_delegation: bool | None = None,
+        automatic_git_commit: bool | None = None,
+        automatic_pull_request: bool | None = None,
+    ) -> BootstrapStatus:
+        config = self.config_store.load().config
+        if project_directory is not None:
+            config.basic.project_directory = project_directory.expanduser().resolve()
+        if development_style is not None:
+            config.basic.development_style = development_style
+        if local_command_policy is not None:
+            config.basic.local_command_policy = local_command_policy
+        if allow_chatgpt_codex_delegation is not None:
+            config.basic.allow_chatgpt_codex_delegation = allow_chatgpt_codex_delegation
+        if automatic_git_commit is not None:
+            config.basic.automatic_git_commit = automatic_git_commit
+        if automatic_pull_request is not None:
+            config.basic.automatic_pull_request = automatic_pull_request
+        self.config_store.save(config)
+        return self.status(project_directory=project_directory or config.basic.project_directory)
 
     def repair_and_status(self, *, project_directory: Path | None = None) -> BootstrapStatus:
         before = self.doctor.run(DoctorOptions(project_directory=project_directory))

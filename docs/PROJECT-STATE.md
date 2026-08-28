@@ -337,6 +337,9 @@ P6.6 is the active phase: Windows Integration / Bootstrap / Real A-B Proof.
 The first implementation slice is intentionally backend-neutral and layered:
 
 - persistent versioned user configuration with Basic / Advanced projections;
+- `codex-supervisor configure` persists project directory and Basic user intent
+  (development style, command policy, delegation, auto commit/PR) without
+  exposing backend names;
 - Windows-aware application data directories under `%LOCALAPPDATA%` with
   portable test overrides;
 - platform, executable, runtime, project, GitHub, port, and local bind probes;

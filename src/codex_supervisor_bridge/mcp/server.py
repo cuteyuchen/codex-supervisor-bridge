@@ -9,7 +9,7 @@ from pathlib import Path
 from mcp.server import MCPServer
 
 from codex_supervisor_bridge import __version__
-from codex_supervisor_bridge.bootstrap import BootstrapService
+from codex_supervisor_bridge.bootstrap import BootstrapService, CommandPolicy, DevelopmentStyle
 from codex_supervisor_bridge.bootstrap.devspace_auth import DevSpaceLocalOAuthDriver
 from codex_supervisor_bridge.bootstrap.paths import AppDataPaths
 from codex_supervisor_bridge.bootstrap.secrets import MemorySecretStore, WindowsDpapiSecretStore
@@ -140,12 +140,42 @@ def build_parser(settings: Settings | None = None) -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("doctor", "start", "status", "repair"),
+        choices=("configure", "doctor", "start", "status", "repair"),
         help="Bootstrap command; omit to run the MCP server",
     )
     parser.add_argument("--json", action="store_true", dest="json_output", help="Render structured output")
     parser.add_argument("--advanced", action="store_true", help="Include technical diagnostics")
     parser.add_argument("--project", type=Path, default=None, help="Project directory for bootstrap commands")
+    parser.add_argument(
+        "--style",
+        choices=[item.value for item in DevelopmentStyle],
+        default=None,
+        help="Default development style for configure",
+    )
+    parser.add_argument(
+        "--command-policy",
+        choices=[item.value for item in CommandPolicy],
+        default=None,
+        help="Local command policy for configure",
+    )
+    parser.add_argument(
+        "--allow-codex-delegation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Allow ChatGPT to delegate to Codex automatically",
+    )
+    parser.add_argument(
+        "--auto-commit",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Automatically create Git commits",
+    )
+    parser.add_argument(
+        "--auto-pr",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Automatically create draft pull requests",
+    )
     parser.add_argument(
         "--database",
         type=Path,
@@ -201,6 +231,15 @@ def main(argv: list[str] | None = None) -> None:
             result = bootstrap.status(project_directory=args.project)
         elif args.command == "repair":
             result = bootstrap.repair_and_status(project_directory=args.project)
+        elif args.command == "configure":
+            result = bootstrap.configure(
+                project_directory=args.project,
+                development_style=DevelopmentStyle(args.style) if args.style else None,
+                local_command_policy=CommandPolicy(args.command_policy) if args.command_policy else None,
+                allow_chatgpt_codex_delegation=args.allow_codex_delegation,
+                automatic_git_commit=args.auto_commit,
+                automatic_pull_request=args.auto_pr,
+            )
         else:
             result = bootstrap.start(project_directory=args.project)
         payload = result.advanced_view() if args.advanced else result.user_view()

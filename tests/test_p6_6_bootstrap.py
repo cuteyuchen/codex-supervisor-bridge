@@ -52,7 +52,7 @@ from codex_supervisor_bridge.bootstrap import (
     redact_oauth_payload,
 )
 from codex_supervisor_bridge.bootstrap.service import _find_executable
-from codex_supervisor_bridge.mcp.server import _is_loopback_host
+from codex_supervisor_bridge.mcp.server import _is_loopback_host, build_parser
 from codex_supervisor_bridge.memory.models import ActiveWriter
 
 
@@ -94,6 +94,52 @@ def test_config_migrates_old_shape_and_invalid_config_degrades(tmp_path: Path) -
     )
     secret_config = store.load()
     assert secret_config.status == "DEGRADED"
+
+
+def test_configure_persists_user_intent_and_cli_flags(tmp_path: Path) -> None:
+    from codex_supervisor_bridge.bootstrap import BootstrapService
+    from codex_supervisor_bridge.bootstrap.configuration import CommandPolicy, DevelopmentStyle
+
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    service = BootstrapService(paths=paths)
+    result = service.configure(
+        project_directory=project,
+        development_style=DevelopmentStyle.CODEX_FIRST,
+        local_command_policy=CommandPolicy.ALLOW,
+        allow_chatgpt_codex_delegation=True,
+        automatic_git_commit=True,
+        automatic_pull_request=False,
+    )
+
+    config = ConfigStore(paths=paths).load().config
+    assert config.basic.project_directory == project.resolve()
+    assert config.basic.development_style == DevelopmentStyle.CODEX_FIRST
+    assert config.basic.local_command_policy == CommandPolicy.ALLOW
+    assert config.basic.allow_chatgpt_codex_delegation is True
+    assert config.basic.automatic_git_commit is True
+    assert config.basic.automatic_pull_request is False
+    assert result.project_directory == str(project.resolve())
+
+    namespace = build_parser().parse_args(
+        [
+            "configure",
+            "--project",
+            str(project),
+            "--style",
+            "web_first",
+            "--allow-codex-delegation",
+            "--no-auto-commit",
+        ]
+    )
+    assert namespace.command == "configure"
+    assert namespace.style == "web_first"
+    assert namespace.allow_codex_delegation is True
+    assert namespace.auto_commit is False
 
 
 def test_port_allocator_prefers_configured_port_then_recovers_conflict() -> None:

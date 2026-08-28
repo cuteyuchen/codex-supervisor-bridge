@@ -25,11 +25,14 @@ from codex_supervisor_bridge.bootstrap import (
     CommandSession,
     CommandSessionStatus,
     CommandVerdict,
+    ComponentHealth,
     ConfigStore,
     DevSpaceBootstrap,
     DevSpaceLocalOAuthDriver,
     DevSpaceVersionCompatibility,
     Doctor,
+    DoctorOptions,
+    DoctorStatus,
     FirstAuthorizationFlow,
     HarnessStep,
     HarnessTrace,
@@ -55,6 +58,27 @@ from codex_supervisor_bridge.bootstrap.service import _find_executable
 from codex_supervisor_bridge.mcp.server import _is_loopback_host, build_parser
 from codex_supervisor_bridge.mcp.server import main as cli_main
 from codex_supervisor_bridge.memory.models import ActiveWriter
+
+
+class FakeDoctor:
+    def __init__(
+        self,
+        *,
+        status: HealthStatus = HealthStatus.READY,
+        components: list[ComponentHealth] | None = None,
+    ) -> None:
+        self.status = status
+        self.components = components or [
+            ComponentHealth(
+                capability="Local workspace",
+                status=HealthStatus.READY,
+                user_message="Local workspace is ready.",
+            )
+        ]
+
+    def run(self, options: object | None = None) -> DoctorStatus:
+        del options
+        return DoctorStatus(status=self.status, components=list(self.components))
 
 
 def test_windows_paths_follow_local_app_data(tmp_path: Path) -> None:
@@ -531,6 +555,20 @@ def test_bootstrap_start_uses_local_codex_protocol_bootstrap(tmp_path: Path) -> 
         paths=paths,
         config_store=config_store,
         process_manager=process_manager,
+        doctor=FakeDoctor(
+            components=[
+                ComponentHealth(
+                    capability="Local workspace",
+                    status=HealthStatus.READY,
+                    user_message="Local workspace is ready.",
+                ),
+                ComponentHealth(
+                    capability="Codex control",
+                    status=HealthStatus.READY,
+                    user_message="Codex control is ready.",
+                ),
+            ]
+        ),
     ).start(project_directory=tmp_path)
 
     local = next(item for item in process_manager.started if item.name == "local_codex_bridge")
@@ -575,10 +613,213 @@ def test_bootstrap_start_uses_local_codex_repository_launch(tmp_path: Path) -> N
         paths=paths,
         config_store=config_store,
         process_manager=process_manager,
+        doctor=FakeDoctor(
+            components=[
+                ComponentHealth(
+                    capability="Local workspace",
+                    status=HealthStatus.READY,
+                    user_message="Local workspace is ready.",
+                ),
+                ComponentHealth(
+                    capability="Codex control",
+                    status=HealthStatus.READY,
+                    user_message="Codex control is ready.",
+                ),
+            ]
+        ),
     ).start(project_directory=tmp_path)
 
     local = next(item for item in process_manager.started if item.name == "local_codex_bridge")
     assert list(local.command) == ["C:/Program Files/nodejs/node.exe", str(entrypoint.resolve())]
+    assert any(item.action == "start_process:local_codex_bridge" for item in result.repairs)
+
+
+def test_bootstrap_start_skips_incompatible_devspace_release(tmp_path: Path) -> None:
+    from codex_supervisor_bridge.bootstrap import BootstrapService
+
+    class RecordingProcessManager:
+        def __init__(self) -> None:
+            self.started: list[ManagedProcessSpec] = []
+
+        def statuses(self) -> list[ProcessState]:
+            return []
+
+        def health(self, name: str) -> ProcessState:
+            return ProcessState(name, "STOPPED")
+
+        def start(self, spec: ManagedProcessSpec, *, restart: bool = False) -> ProcessState:
+            del restart
+            self.started.append(spec)
+            return ProcessState(spec.name, "RUNNING", pid=50010)
+
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    process_manager = RecordingProcessManager()
+    doctor = FakeDoctor(
+        status=HealthStatus.DEGRADED,
+        components=[
+            ComponentHealth(
+                capability="Local workspace",
+                status=HealthStatus.DEGRADED,
+                repairable=False,
+                user_message="Local workspace needs a compatible release.",
+                recommended_action="repair_local_workspace",
+                advanced={
+                    "version": "1.1.0",
+                    "upstream_compatibility": {"compatible": False},
+                },
+            )
+        ],
+    )
+
+    result = BootstrapService(
+        paths=paths,
+        process_manager=process_manager,
+        doctor=doctor,
+    ).start(project_directory=tmp_path)
+
+    devspace_action = next(item for item in result.repairs if item.action == "start_process:devspace")
+    assert devspace_action.status == HealthStatus.DEGRADED
+    assert devspace_action.requires_user_action is True
+    assert not any(spec.name == "devspace" for spec in process_manager.started)
+    assert any(spec.name == "supervisor" for spec in process_manager.started)
+
+
+def test_bootstrap_start_skips_local_codex_bridge_with_old_node(tmp_path: Path) -> None:
+    from codex_supervisor_bridge.bootstrap import BootstrapService
+
+    class RecordingProcessManager:
+        def __init__(self) -> None:
+            self.started: list[ManagedProcessSpec] = []
+
+        def statuses(self) -> list[ProcessState]:
+            return []
+
+        def health(self, name: str) -> ProcessState:
+            return ProcessState(name, "STOPPED")
+
+        def start(self, spec: ManagedProcessSpec, *, restart: bool = False) -> ProcessState:
+            del restart
+            self.started.append(spec)
+            return ProcessState(spec.name, "RUNNING", pid=50011)
+
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    repository = tmp_path / "Local-Codex-Bridge"
+    entrypoint = repository / "dist" / "src" / "index.js"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("placeholder", encoding="utf-8")
+    config_store = ConfigStore(paths=paths)
+    config = AppConfig.safe_defaults(paths)
+    config.advanced.local_codex_repository = repository
+    config.advanced.executable_paths["node"] = "C:/Program Files/nodejs/node.exe"
+    config_store.save(config)
+    process_manager = RecordingProcessManager()
+    doctor = FakeDoctor(
+        status=HealthStatus.DEGRADED,
+        components=[
+            ComponentHealth(
+                capability="Local workspace",
+                status=HealthStatus.READY,
+                user_message="Local workspace is ready.",
+            ),
+            ComponentHealth(
+                capability="Codex control",
+                status=HealthStatus.DEGRADED,
+                repairable=True,
+                user_message="Codex control needs Node.js 24 or newer.",
+                recommended_action="repair_codex_control",
+                advanced={"node_version": "v20.19.0"},
+            ),
+        ],
+    )
+
+    result = BootstrapService(
+        paths=paths,
+        config_store=config_store,
+        process_manager=process_manager,
+        doctor=doctor,
+    ).start(project_directory=tmp_path)
+
+    control_action = next(
+        item for item in result.repairs if item.action == "start_process:local_codex_bridge"
+    )
+    assert control_action.status == HealthStatus.DEGRADED
+    assert control_action.requires_user_action is True
+    assert not any(spec.name == "local_codex_bridge" for spec in process_manager.started)
+
+
+def test_bootstrap_start_launches_all_healthy_components(tmp_path: Path) -> None:
+    from codex_supervisor_bridge.bootstrap import BootstrapService
+
+    class RecordingProcessManager:
+        def __init__(self) -> None:
+            self.started: list[ManagedProcessSpec] = []
+
+        def statuses(self) -> list[ProcessState]:
+            return []
+
+        def health(self, name: str) -> ProcessState:
+            return ProcessState(name, "STOPPED")
+
+        def start(self, spec: ManagedProcessSpec, *, restart: bool = False) -> ProcessState:
+            del restart
+            self.started.append(spec)
+            return ProcessState(spec.name, "RUNNING", pid=50012)
+
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    devspace_executable = tmp_path / "devspace.cmd"
+    devspace_executable.write_text("placeholder", encoding="utf-8")
+    repository = tmp_path / "Local-Codex-Bridge"
+    entrypoint = repository / "dist" / "src" / "index.js"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("placeholder", encoding="utf-8")
+    config_store = ConfigStore(paths=paths)
+    config = AppConfig.safe_defaults(paths)
+    config.advanced.executable_paths["devspace"] = str(devspace_executable)
+    config.advanced.executable_paths["node"] = "C:/Program Files/nodejs/node.exe"
+    config.advanced.local_codex_repository = repository
+    config_store.save(config)
+    process_manager = RecordingProcessManager()
+    doctor = FakeDoctor(
+        components=[
+            ComponentHealth(
+                capability="Local workspace",
+                status=HealthStatus.READY,
+                user_message="Local workspace is ready.",
+            ),
+            ComponentHealth(
+                capability="Codex control",
+                status=HealthStatus.READY,
+                user_message="Codex control is ready.",
+            ),
+        ]
+    )
+
+    result = BootstrapService(
+        paths=paths,
+        config_store=config_store,
+        process_manager=process_manager,
+        doctor=doctor,
+    ).start(project_directory=tmp_path)
+
+    assert [spec.name for spec in process_manager.started] == [
+        "supervisor",
+        "devspace",
+        "local_codex_bridge",
+    ]
+    devspace_spec = next(spec for spec in process_manager.started if spec.name == "devspace")
+    assert list(devspace_spec.command) == [str(devspace_executable), "serve"]
+    assert devspace_spec.env is not None
+    assert devspace_spec.env["DEVSPACE_CONFIG_DIR"] == str(paths.config / "devspace")
+    assert any(item.action == "start_process:devspace" for item in result.repairs)
     assert any(item.action == "start_process:local_codex_bridge" for item in result.repairs)
 
 
@@ -630,6 +871,72 @@ def test_repair_persists_distinct_supervisor_and_workspace_ports(tmp_path: Path)
     ports = ConfigStore(paths=paths).load().config.advanced.ports
 
     assert ports["supervisor"] != ports["devspace"]
+
+
+def test_repair_recovers_stale_process_and_keeps_unknown_for_user(tmp_path: Path) -> None:
+    from codex_supervisor_bridge.bootstrap.repair import RepairService
+
+    class FakeProcessManager:
+        def __init__(self) -> None:
+            self.states = [
+                ProcessState("devspace", "STALE", pid=999999),
+                ProcessState("supervisor", "UNKNOWN", pid=42),
+            ]
+
+        def statuses(self) -> list[ProcessState]:
+            return list(self.states)
+
+        def repair_stale(self, name: str) -> ProcessState:
+            state = next(item for item in self.states if item.name == name)
+            state.status = "STOPPED"
+            state.pid = None
+            state.technical_detail = "stale runtime state cleared"
+            return state
+
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    actions = RepairService(
+        paths=paths,
+        process_manager=FakeProcessManager(),
+        secret_store=MemorySecretStore(),
+    ).repair(project_directory=tmp_path)
+
+    stale_action = next(item for item in actions if item.action == "repair_process:devspace")
+    assert stale_action.status == HealthStatus.READY
+    assert stale_action.requires_user_action is False
+    unknown_action = next(item for item in actions if item.action == "repair_process:supervisor")
+    assert unknown_action.status == HealthStatus.DEGRADED
+    assert unknown_action.requires_user_action is True
+
+
+def test_doctor_marks_crashed_supervisor_repairable(tmp_path: Path) -> None:
+    class CrashedProcessManager:
+        def health(self, name: str) -> ProcessState:
+            return ProcessState(name, "CRASHED", last_exit=1)
+
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        return subprocess.CompletedProcess(command, 0, "ok\n", "")
+
+    status = Doctor(
+        paths=paths,
+        command_runner=runner,
+        process_manager=CrashedProcessManager(),
+    ).run(DoctorOptions(check_optional_components=False))
+    supervisor = status.component("Supervisor Bridge")
+
+    assert supervisor is not None
+    assert supervisor.status == HealthStatus.DEGRADED
+    assert supervisor.repairable is True
+    assert supervisor.recommended_action == "restart_supervisor"
+    assert supervisor.advanced["status"] == "CRASHED"
 
 
 def test_bootstrap_user_view_hides_internal_repair_names(tmp_path: Path) -> None:
@@ -809,6 +1116,34 @@ def test_secret_store_round_trip_and_remote_access_security_gate() -> None:
             session_identity="session-2",
         )
     )["session_identity"] == "session-2"
+
+
+def test_secure_remote_controller_fails_closed_without_configuration() -> None:
+    remote = SecureRemoteAccessController()
+    with pytest.raises(RuntimeError, match="not been configured"):
+        remote.reconnect()
+
+    remote.start(
+        SecureRemoteAccessConfig(
+            public_url="https://example.invalid/mcp",
+            auth_secret_ref="chatgpt",
+            session_identity="session-1",
+        )
+    )
+    remote.stop()
+
+    assert remote.health()["active"] is False
+    assert remote.health()["public_url"] == "https://example.invalid/mcp"
+    assert remote.health()["session_identity"] == "session-1"
+    with pytest.raises(ValueError, match="prerequisites failed"):
+        remote.rotate(
+            SecureRemoteAccessConfig(
+                public_url="http://0.0.0.0:8765/mcp",
+                bind_host="0.0.0.0",
+                auth_secret_ref="chatgpt",
+                session_identity="session-2",
+            )
+        )
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows DPAPI is only available on Windows")
@@ -1178,6 +1513,72 @@ def test_profile_scenario_runner_executes_all_required_steps_without_raw_payload
     assert trace.steps == list(HarnessStep)
     assert len(trace.evidence) == len(HarnessStep)
     assert not hasattr(trace, "raw_payload")
+
+
+def test_profile_ab_harness_reports_normalized_differences() -> None:
+    def trace(
+        profile: str,
+        *,
+        task_id: str = "task-1",
+        revisions: list[int] | None = None,
+        writer_history: list[str] | None = None,
+        evidence: list[str] | None = None,
+    ) -> HarnessTrace:
+        return HarnessTrace(
+            profile=profile,
+            task_id=task_id,
+            workspace_identity="provider-specific-workspace",
+            steps=list(HarnessStep),
+            revisions=revisions or [0, 1, 2, 3],
+            writer_history=writer_history or ["NONE", "CHATGPT", "NONE", "CODEX"],
+            evidence=evidence or ["diff", "checkpoint", "final-git-state"],
+        )
+
+    identity = ProfileABHarness(
+        lambda: trace("A", task_id="task-a"),
+        lambda: trace("B", task_id="task-b"),
+    ).run()
+    assert identity.equivalent is False
+    assert "task identity changed" in identity.differences
+
+    semantics = ProfileABHarness(
+        lambda: trace("A", revisions=[0, 1, 2, 3]),
+        lambda: trace("B", revisions=[0, 1, 2, 4]),
+    ).run()
+    assert semantics.equivalent is False
+    assert "normalized Supervisor semantics differ" in semantics.differences
+
+    evidence = ProfileABHarness(
+        lambda: trace("A", evidence=["diff", "checkpoint"]),
+        lambda: trace("B", evidence=["diff", "checkpoint", "extra"]),
+    ).run()
+    assert evidence.equivalent is False
+    assert "normalized Supervisor semantics differ" in evidence.differences
+
+
+def test_profile_scenario_runner_rejects_identity_and_status_changes() -> None:
+    class SwappingDriver:
+        def execute(self, step: HarnessStep, *, task_id: str) -> ScenarioObservation:
+            del step, task_id
+            return ScenarioObservation(task_id="other-task", workspace_identity="w", revision=0)
+
+    with pytest.raises(ValueError, match="canonical task identity"):
+        ProfileScenarioRunner().run(profile="A", task_id="task-1", driver=SwappingDriver())
+
+    class FailedDriver:
+        def execute(self, step: HarnessStep, *, task_id: str) -> ScenarioObservation:
+            failed = step == HarnessStep.DIRECT_PATCH
+            return ScenarioObservation(
+                task_id=task_id,
+                workspace_identity="w",
+                status="failed" if failed else "ok",
+                revision=list(HarnessStep).index(step),
+                writer="CHATGPT",
+                evidence=[],
+            )
+
+    with pytest.raises(RuntimeError, match="revision 3"):
+        ProfileScenarioRunner().run(profile="B", task_id="task-1", driver=FailedDriver())
 
 
 class SlowStopProcess(DummyProcess):

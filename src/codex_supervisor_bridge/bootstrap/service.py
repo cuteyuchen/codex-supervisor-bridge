@@ -139,7 +139,18 @@ class BootstrapService:
         )
         result.repairs.append(start_action)
         devspace_executable = config.advanced.executable_paths.get("devspace", "devspace")
-        if _find_executable(devspace_executable):
+        workspace_health = result.doctor.component("Local workspace")
+        if workspace_health is not None and workspace_health.status != HealthStatus.READY:
+            result.repairs.append(
+                RepairAction(
+                    action="start_process:devspace",
+                    status=workspace_health.status,
+                    message=workspace_health.user_message,
+                    requires_user_action=True,
+                    advanced={**workspace_health.advanced, "executable": devspace_executable},
+                )
+            )
+        elif _find_executable(devspace_executable):
             devspace = DevSpaceBootstrap.from_app_data(
                 self.paths,
                 port=config.advanced.ports.get("devspace", port),
@@ -179,21 +190,33 @@ class BootstrapService:
                 )
             )
         elif config.advanced.local_codex_repository:
-            try:
-                local_codex_bootstrap = LocalCodexBridgeBootstrap.from_repository(
-                    config.advanced.local_codex_repository,
-                    node_executable=config.advanced.executable_paths.get("node", "node"),
-                )
-            except FileNotFoundError as exc:
+            control_health = result.doctor.component("Codex control")
+            if control_health is not None and control_health.status != HealthStatus.READY:
                 result.repairs.append(
                     RepairAction(
                         action="start_process:local_codex_bridge",
-                        status=HealthStatus.UNAVAILABLE,
-                        message="Codex control needs an update or build.",
+                        status=control_health.status,
+                        message=control_health.user_message,
                         requires_user_action=True,
-                        advanced={"technical_detail": str(exc)},
+                        advanced=dict(control_health.advanced),
                     )
                 )
+            else:
+                try:
+                    local_codex_bootstrap = LocalCodexBridgeBootstrap.from_repository(
+                        config.advanced.local_codex_repository,
+                        node_executable=config.advanced.executable_paths.get("node", "node"),
+                    )
+                except FileNotFoundError as exc:
+                    result.repairs.append(
+                        RepairAction(
+                            action="start_process:local_codex_bridge",
+                            status=HealthStatus.UNAVAILABLE,
+                            message="Codex control needs an update or build.",
+                            requires_user_action=True,
+                            advanced={"technical_detail": str(exc)},
+                        )
+                    )
         if local_codex_bootstrap is not None:
             try:
                 component = self.process_manager.start(

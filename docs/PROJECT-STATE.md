@@ -386,6 +386,13 @@ The first implementation slice is intentionally backend-neutral and layered:
 - the `configure` CLI is covered by an end-to-end `main()` test that persists
   Basic user intent into the versioned settings file and emits normal UX JSON
   without provider names, plus an advanced JSON test for future GUI consumers.
+- `BootstrapService.start` consults Doctor before launching optional
+  components: incompatible DevSpace releases and non-ready Local-Codex-Bridge
+  runtimes are reported as user-action repairs instead of being started. The
+  healthy supervisor / workspace / Codex-control orchestration path, RepairService
+  stale and UNKNOWN process handling, Doctor crash reflection, fail-closed
+  SecureRemote reconnect/rotate, and Profile A/B normalized difference detection
+  are covered by fake tests (154 tests locally on Python 3.12/3.13).
 
 The current code-level work does not claim real Windows OAuth, ChatGPT Web
 Remote MCP attachment, tunnel-provider login, or authenticated Codex runtime

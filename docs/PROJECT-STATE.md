@@ -393,6 +393,9 @@ The first implementation slice is intentionally backend-neutral and layered:
   stale and UNKNOWN process handling, Doctor crash reflection, fail-closed
   SecureRemote reconnect/rotate, and Profile A/B normalized difference detection
   are covered by fake tests (154 tests locally on Python 3.12/3.13).
+- RepairService recovers invalid configuration from DEGRADED to safe defaults,
+  and the `doctor` CLI emits structured UX JSON without provider, SQLite, or
+  backend names (156 tests locally on Python 3.12/3.13).
 
 The current code-level work does not claim real Windows OAuth, ChatGPT Web
 Remote MCP attachment, tunnel-provider login, or authenticated Codex runtime

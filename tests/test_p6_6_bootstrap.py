@@ -859,6 +859,32 @@ def test_repair_creates_data_and_mcp_config_without_secrets(tmp_path: Path) -> N
     assert "token" not in paths.generated_mcp_config.read_text(encoding="utf-8").lower()
 
 
+def test_repair_recovers_invalid_config_to_safe_defaults(tmp_path: Path) -> None:
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    paths.config.mkdir(parents=True)
+    paths.settings.write_text("{not-json", encoding="utf-8")
+    from codex_supervisor_bridge.bootstrap.repair import RepairService
+
+    doctor = Doctor(paths=paths)
+    before = doctor.run()
+    config_component = before.component("Configuration")
+    assert config_component is not None
+    assert config_component.status == HealthStatus.DEGRADED
+    assert config_component.repairable is True
+
+    RepairService(paths=paths, secret_store=MemorySecretStore()).repair(
+        before,
+        project_directory=tmp_path,
+    )
+
+    after = ConfigStore(paths=paths).load()
+    assert after.status == "READY"
+    assert after.config.config_version == 1
+
+
 def test_repair_persists_distinct_supervisor_and_workspace_ports(tmp_path: Path) -> None:
     paths = AppDataPaths.from_environment(
         environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
@@ -1890,3 +1916,26 @@ def test_configure_cli_advanced_json_keeps_gui_diagnostics(
     assert "selected_profile" in payload
     assert "diagnostics" in payload
     assert any(item["capability"] == "Project directory" for item in payload["diagnostics"])
+
+
+def test_doctor_cli_emits_structured_ux_without_provider_names(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    app = tmp_path / "app"
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("CODEX_SUPERVISOR_DATA_DIR", str(app))
+    monkeypatch.setenv("SUPERVISOR_DB_PATH", str(app / "data" / "supervisor.db"))
+
+    cli_main(["doctor", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    rendered = json.dumps(payload, ensure_ascii=False).lower()
+    assert "components" in payload
+    assert "project_directory" in payload
+    assert "devspace" not in rendered
+    assert "local-codex-bridge" not in rendered
+    assert "codex-control-plane" not in rendered
+    assert "sqlite" not in rendered

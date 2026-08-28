@@ -825,7 +825,7 @@ def test_bootstrap_start_launches_all_healthy_components(tmp_path: Path) -> None
         doctor=doctor,
     ).start(project_directory=tmp_path)
 
-    assert [spec.name for spec in process_manager.started] == ["supervisor", "devspace"]
+    assert [spec.name for spec in process_manager.started] == ["devspace", "supervisor"]
     devspace_spec = next(spec for spec in process_manager.started if spec.name == "devspace")
     assert list(devspace_spec.command) == [str(devspace_executable), "serve"]
     assert devspace_spec.env is not None
@@ -833,6 +833,60 @@ def test_bootstrap_start_launches_all_healthy_components(tmp_path: Path) -> None
     assert any(item.action == "start_process:devspace" for item in result.repairs)
     assert any(item.action == "agent_session:local_codex_bridge" for item in result.repairs)
     assert not any(spec.name == "local_codex_bridge" for spec in process_manager.started)
+
+
+def test_bootstrap_start_uses_managed_node_to_launch_devspace(tmp_path: Path) -> None:
+    from codex_supervisor_bridge.bootstrap import BootstrapService
+
+    class RecordingProcessManager:
+        def __init__(self) -> None:
+            self.started: list[ManagedProcessSpec] = []
+
+        def statuses(self) -> list[ProcessState]:
+            return []
+
+        def health(self, name: str) -> ProcessState:
+            return ProcessState(name, "STOPPED")
+
+        def start(self, spec: ManagedProcessSpec, *, restart: bool = False) -> ProcessState:
+            del restart
+            self.started.append(spec)
+            return ProcessState(spec.name, "RUNNING", pid=50013)
+
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    node = tmp_path / "node.exe"
+    node.write_text("placeholder", encoding="utf-8")
+    entrypoint = tmp_path / "devspace-cli.js"
+    entrypoint.write_text("placeholder", encoding="utf-8")
+    config_store = ConfigStore(paths=paths)
+    config = AppConfig.safe_defaults(paths)
+    config.advanced.executable_paths["devspace"] = str(node)
+    config.advanced.executable_paths["devspace_entrypoint"] = str(entrypoint)
+    config_store.save(config)
+    process_manager = RecordingProcessManager()
+
+    result = BootstrapService(
+        paths=paths,
+        config_store=config_store,
+        process_manager=process_manager,
+        doctor=FakeDoctor(
+            components=[
+                ComponentHealth(
+                    capability="Local workspace",
+                    status=HealthStatus.READY,
+                    user_message="Local workspace is ready.",
+                ),
+            ]
+        ),
+    ).start(project_directory=tmp_path)
+
+    devspace_spec = next(spec for spec in process_manager.started if spec.name == "devspace")
+    assert list(devspace_spec.command) == [str(node), str(entrypoint), "serve"]
+    assert [spec.name for spec in process_manager.started] == ["devspace", "supervisor"]
+    assert result.repairs
 
 
 def test_http_mcp_bind_must_be_loopback() -> None:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,7 @@ from pydantic import ValidationError
 from codex_supervisor_bridge.bootstrap import (
     ManagedComponentRegistry,
 )
+from codex_supervisor_bridge.bootstrap.configuration import ConfigStore
 from codex_supervisor_bridge.bootstrap.installer import (
     ComponentInstaller,
     ComponentManifest,
@@ -25,6 +28,13 @@ from codex_supervisor_bridge.bootstrap.repair import RepairService
 from codex_supervisor_bridge.bootstrap.secrets import MemorySecretStore
 
 
+def _zip_payload(component: str = "component") -> bytes:
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w") as handle:
+        handle.writestr(f"{component}/component.txt", "v2.1.3")
+    return stream.getvalue()
+
+
 def manifest(
     name: str = "local-codex-bridge",
     *,
@@ -32,7 +42,7 @@ def manifest(
     checksum: str | None = None,
     install_commands: list[list[str]] | None = None,
 ) -> ComponentManifest:
-    payload = b"component-archive"
+    payload = _zip_payload()
     return ComponentManifest(
         name=name,
         display_name="Codex control",
@@ -40,6 +50,8 @@ def manifest(
         source="https://example.invalid/component.tgz",
         source_ref="v2.1.3",
         checksum_sha256=checksum or hashlib.sha256(payload).hexdigest(),
+        archive_kind="zip",
+        archive_root="component",
         install_commands=install_commands or [["npm", "ci"], ["npm", "run", "build"]],
         requires_node=True,
     )
@@ -49,10 +61,10 @@ def test_installer_atomic_promote_and_current_pointer(tmp_path: Path) -> None:
     commands: list[tuple[list[str], Path]] = []
     downloaded: list[tuple[str, Path]] = []
 
-    def downloader(url: str, destination: Path) -> bytes:
+    def downloader(url: str, destination: Path) -> Path:
         downloaded.append((url, destination))
-        (destination / "component.txt").write_text("v2.1.3", encoding="utf-8")
-        return b"component-archive"
+        destination.write_bytes(_zip_payload())
+        return destination
 
     def runner(command: list[str], cwd: Path) -> int:
         commands.append((command, cwd))
@@ -97,9 +109,9 @@ def test_installer_rolls_back_to_previous_version(tmp_path: Path) -> None:
     state: dict[str, Any] = {"fail": False}
     commands: list[list[str]] = []
 
-    def downloader(url: str, destination: Path) -> bytes:
-        (destination / "component.txt").write_text("content", encoding="utf-8")
-        return b"component-archive"
+    def downloader(url: str, destination: Path) -> Path:
+        destination.write_bytes(_zip_payload())
+        return destination
 
     def runner(command: list[str], cwd: Path) -> int:
         del cwd
@@ -125,6 +137,138 @@ def test_installer_rolls_back_to_previous_version(tmp_path: Path) -> None:
     assert pointer["version"] == "2.1.2"
 
 
+def test_installer_same_version_reinstall_is_idempotent(tmp_path: Path) -> None:
+    calls = {"download": 0, "runner": 0}
+
+    def downloader(url: str, destination: Path) -> Path:
+        del url
+        calls["download"] += 1
+        destination.write_bytes(_zip_payload())
+        return destination
+
+    def runner(command: list[str], cwd: Path) -> int:
+        del command, cwd
+        calls["runner"] += 1
+        return 0
+
+    installer = ComponentInstaller(
+        tmp_path / "components",
+        downloader=downloader,
+        runner=runner,
+        max_retries=1,
+    )
+    first = installer.install(manifest())
+    second = installer.install(manifest())
+
+    assert first.status == "INSTALLED"
+    assert second.status == "ALREADY_INSTALLED"
+    assert calls == {"download": 1, "runner": 2}
+
+
+def test_installer_reinstalls_same_version_when_marker_is_damaged(tmp_path: Path) -> None:
+    calls = {"download": 0}
+
+    def downloader(url: str, destination: Path) -> Path:
+        del url
+        calls["download"] += 1
+        destination.write_bytes(_zip_payload())
+        return destination
+
+    def runner(command: list[str], cwd: Path) -> int:
+        del command, cwd
+        return 0
+
+    installer = ComponentInstaller(
+        tmp_path / "components",
+        downloader=downloader,
+        runner=runner,
+        max_retries=1,
+    )
+    first = installer.install(manifest())
+    (first.installed_path / ".codex-supervisor-installed.json").unlink()
+    second = installer.install(manifest())
+
+    assert second.status == "INSTALLED"
+    assert calls["download"] == 2
+
+
+def test_installer_recovers_interrupted_staging(tmp_path: Path) -> None:
+    def downloader(url: str, destination: Path) -> Path:
+        del url
+        destination.write_bytes(_zip_payload())
+        return destination
+
+    installer = ComponentInstaller(
+        tmp_path / "components",
+        downloader=downloader,
+        runner=lambda command, cwd: 0,
+        max_retries=1,
+    )
+    stale = (
+        tmp_path
+        / "components"
+        / "local-codex-bridge"
+        / ".staging"
+        / "interrupted"
+    )
+    stale.mkdir(parents=True)
+    (stale / "partial").write_text("partial", encoding="utf-8")
+
+    result = installer.install(manifest())
+
+    assert result.status == "INSTALLED"
+    assert not (tmp_path / "components" / "local-codex-bridge" / ".staging").exists()
+
+
+def test_installer_uses_managed_node_for_npm_commands(tmp_path: Path) -> None:
+    components = tmp_path / "components"
+    node_root = components / "nodejs" / "24.20.0"
+    node_root.mkdir(parents=True)
+    (node_root / "node.exe").write_text("node", encoding="utf-8")
+    npm_script = node_root / "node_modules" / "npm" / "bin" / "npm-cli.js"
+    npm_script.parent.mkdir(parents=True)
+    npm_script.write_text("npm", encoding="utf-8")
+    node_manifest = manifest(name="nodejs", version="24.20.0")
+    node_manifest = node_manifest.model_copy(
+        update={"source_ref": "v24.20.0", "requires_node": False}
+    )
+    (components / "nodejs").mkdir(parents=True, exist_ok=True)
+    (components / "nodejs" / "current.json").write_text(
+        json.dumps(
+            {
+                "name": "nodejs",
+                "version": "24.20.0",
+                "path": str(node_root),
+                "manifest": node_manifest.model_dump(mode="json"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    commands: list[list[str]] = []
+
+    def downloader(url: str, destination: Path) -> Path:
+        del url
+        destination.write_bytes(_zip_payload())
+        return destination
+
+    def runner(command: list[str], cwd: Path) -> int:
+        del cwd
+        commands.append(command)
+        return 0
+
+    installer = ComponentInstaller(
+        components,
+        downloader=downloader,
+        runner=runner,
+        max_retries=1,
+    )
+    result = installer.install(manifest(install_commands=[["npm", "ci"]]))
+
+    assert result.status == "INSTALLED"
+    assert commands[0][:2] == [str(node_root / "node.exe"), str(npm_script)]
+    assert commands[0][2:] == ["ci"]
+
+
 def test_builtin_registry_uses_pinned_versions_and_no_floating_latest() -> None:
     registry = ManagedComponentRegistry()
     node = registry.manifest("nodejs")
@@ -142,9 +286,10 @@ def test_builtin_registry_uses_pinned_versions_and_no_floating_latest() -> None:
     assert devspace.checksum_sha256
 
     assert lcb.version == "2.1.3"
-    assert "v2.1.3" in lcb.source
+    assert lcb.commit_sha == "4ffed814f615316ade8967189a2e1772488d33c2"
+    assert "4ffed814f615316ade8967189a2e1772488d33c2" in lcb.source
     assert lcb.checksum_sha256 is None
-    assert "upstream publishes no official SHA256" in registry.verification_strategy(
+    assert "immutable GitHub commit archive" in registry.verification_strategy(
         "local-codex-bridge"
     )
 
@@ -277,3 +422,115 @@ def test_repair_exposes_install_plan_only_in_advanced_diagnostics(tmp_path: Path
         for item in advanced
     }
     assert planned_names == {"nodejs", "devspace", "local-codex-bridge"}
+
+
+def test_repair_executes_trusted_install_and_registers_managed_paths(
+    tmp_path: Path,
+) -> None:
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+
+    class MissingComponentsDoctor:
+        def run(self, options: object | None = None) -> DoctorStatus:
+            del options
+            return DoctorStatus(
+                status=HealthStatus.UNAVAILABLE,
+                components=[
+                    ComponentHealth(
+                        capability="Node.js",
+                        status=HealthStatus.UNAVAILABLE,
+                        user_message="Local runtime needs an update.",
+                        repairable=True,
+                    ),
+                    ComponentHealth(
+                        capability="Local workspace",
+                        status=HealthStatus.UNAVAILABLE,
+                        user_message="Local workspace is not installed.",
+                        repairable=True,
+                    ),
+                    ComponentHealth(
+                        capability="Codex control",
+                        status=HealthStatus.UNAVAILABLE,
+                        user_message="Codex control is not installed.",
+                        repairable=True,
+                    ),
+                ],
+            )
+
+    registry = ManagedComponentRegistry()
+    manifests = registry.manifests()
+    manifests["nodejs"] = manifests["nodejs"].model_copy(
+        update={"checksum_sha256": None}
+    )
+    manifests["devspace"] = manifests["devspace"].model_copy(
+        update={
+            "checksum_sha256": None,
+            "archive_kind": "zip",
+        }
+    )
+    manifests["local-codex-bridge"] = manifests["local-codex-bridge"].model_copy(
+        update={
+            "archive_kind": "zip",
+            "archive_root": (
+                "Local-Codex-Bridge-4ffed814f615316ade8967189a2e1772488d33c2"
+            ),
+        }
+    )
+    registry = ManagedComponentRegistry(manifests)
+
+    def downloader(url: str, destination: Path) -> Path:
+        del url
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w") as handle:
+            if "nodejs" in str(destination):
+                root = "node-v24.20.0-win-x64"
+                files = ["node.exe"]
+            elif "devspace" in str(destination):
+                root = "package"
+                files = ["dist/cli.js"]
+            else:
+                root = "Local-Codex-Bridge-4ffed814f615316ade8967189a2e1772488d33c2"
+                files = ["dist/src/index.js"]
+            for relative in files:
+                handle.writestr(f"{root}/{relative}", "placeholder")
+        destination.write_bytes(stream.getvalue())
+        return destination
+
+    installer = ComponentInstaller(
+        paths.components,
+        trusted_manifests=registry.manifests(),
+        downloader=downloader,
+        runner=lambda command, cwd: 0,
+        max_retries=1,
+    )
+    service = RepairService(
+        paths=paths,
+        doctor=MissingComponentsDoctor(),  # type: ignore[arg-type]
+        installer=installer,
+        registry=registry,
+        secret_store=MemorySecretStore(),
+        auto_install=True,
+    )
+    actions = service.repair(project_directory=tmp_path)
+
+    install_actions = [
+        action for action in actions if action.action.startswith("install_component:")
+    ]
+    assert len(install_actions) == 3
+    assert all(action.status == HealthStatus.READY for action in install_actions)
+    assert all(action.requires_user_action is False for action in install_actions)
+    config = ConfigStore(paths=paths).load().config
+    assert Path(config.advanced.executable_paths["node"]).name == "node.exe"
+    assert Path(config.advanced.executable_paths["devspace_entrypoint"]).parts[-2:] == (
+        "dist",
+        "cli.js",
+    )
+    assert config.advanced.local_codex_repository is not None
+    assert (
+        config.advanced.local_codex_repository
+        / "dist"
+        / "src"
+        / "index.js"
+    ).is_file()

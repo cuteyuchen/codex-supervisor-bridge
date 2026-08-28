@@ -312,6 +312,49 @@ class Doctor:
         )
 
     def _workspace(self) -> ComponentHealth:
+        managed = self._managed_component("devspace")
+        config = self.config_store.load().config
+        if managed is not None:
+            entrypoint = managed / "dist" / "cli.js"
+            node = self._resolve_executable(
+                config.advanced.executable_paths.get("node", "node")
+            )
+            if node is not None and entrypoint.is_file():
+                version_result = self._run([node, str(entrypoint), "--version"])
+                version = (
+                    _first_line(version_result.stdout or version_result.stderr)
+                    if version_result.returncode == 0
+                    else None
+                )
+                compatible = DevSpaceVersionCompatibility.is_supported(version)
+                status = (
+                    HealthStatus.READY
+                    if compatible
+                    else HealthStatus.DEGRADED
+                )
+                return ComponentHealth(
+                    capability="Local workspace",
+                    status=status,
+                    repairable=not compatible,
+                    user_message=(
+                        "Local workspace is ready."
+                        if compatible
+                        else "Local workspace needs a compatible release."
+                    ),
+                    recommended_action=(
+                        None if compatible else "repair_local_workspace"
+                    ),
+                    advanced={
+                        "managed": True,
+                        "version": version,
+                        "launch_command": [node, str(entrypoint), "serve"],
+                        "upstream_compatibility": {
+                            "tested_versions": list(DEVSPACE_TESTED_VERSIONS),
+                            "supported_version_range": DEVSPACE_SUPPORTED_VERSION_RANGE,
+                            "compatible": compatible,
+                        },
+                    },
+                )
         result = self._executable("Local workspace", "devspace", "devspace --version")
         version = result.advanced.get("version")
         result.advanced["upstream_compatibility"] = {
@@ -335,12 +378,20 @@ class Doctor:
     def _codex_control(self, config: AppConfig) -> ComponentHealth:
         repository = config.advanced.local_codex_repository
         if repository is None:
-            return self._executable("Codex control", "local-codex-bridge", "local-codex-bridge --version")
+            managed = self._managed_component("local-codex-bridge")
+            if managed is not None:
+                repository = managed
+            else:
+                return self._executable(
+                    "Codex control",
+                    "local-codex-bridge",
+                    "local-codex-bridge --version",
+                )
 
         resolved = repository.expanduser().resolve()
         entrypoint = resolved / "dist" / "src" / "index.js"
         node_value = config.advanced.executable_paths.get("node", "node")
-        node = self._find(node_value) or self._find("node")
+        node = self._resolve_executable(node_value) or self._resolve_executable("node")
         if node is None:
             return ComponentHealth(
                 capability="Codex control",
@@ -432,7 +483,50 @@ class Doctor:
 
     def _node(self, config: AppConfig, *, required: bool) -> ComponentHealth:
         configured = config.advanced.executable_paths.get("node")
-        result = self._executable("Node.js", configured or "node", "node --version")
+        if configured:
+            resolved = self._resolve_executable(configured)
+            if resolved is not None:
+                result = self._executable("Node.js", configured, "node --version")
+            else:
+                managed = self._managed_component("nodejs")
+                if managed is not None:
+                    node = managed / "node.exe"
+                    if node.is_file():
+                        version = self._run([str(node), "--version"])
+                        if version.returncode == 0:
+                            return ComponentHealth(
+                                capability="Node.js",
+                                status=HealthStatus.READY,
+                                user_message="Node.js is ready.",
+                                advanced={
+                                    "managed": True,
+                                    "executable": str(node),
+                                    "version": _first_line(
+                                        version.stdout or version.stderr
+                                    ),
+                                },
+                            )
+                result = self._executable("Node.js", configured, "node --version")
+        else:
+            managed = self._managed_component("nodejs")
+            if managed is not None:
+                node = managed / "node.exe"
+                if node.is_file():
+                    version = self._run([str(node), "--version"])
+                    if version.returncode == 0:
+                        return ComponentHealth(
+                            capability="Node.js",
+                            status=HealthStatus.READY,
+                            user_message="Node.js is ready.",
+                            advanced={
+                                "managed": True,
+                                "executable": str(node),
+                                "version": _first_line(
+                                    version.stdout or version.stderr
+                                ),
+                            },
+                        )
+            result = self._executable("Node.js", "node", "node --version")
         if result.status == HealthStatus.UNAVAILABLE and not required:
             return ComponentHealth(
                 capability="Node.js",
@@ -441,6 +535,31 @@ class Doctor:
                 advanced={"required": False, "executable": None},
             )
         return result
+
+    def _resolve_executable(self, value: str) -> str | None:
+        if Path(value).is_file():
+            return value
+        return self._find(value)
+
+    def _managed_component(self, name: str) -> Path | None:
+        import json
+
+        pointer = self.paths.components / name / "current.json"
+        try:
+            payload = json.loads(pointer.read_text(encoding="utf-8"))
+            path = Path(str(payload["path"]))
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
+        if not path.is_dir():
+            return None
+        marker = path / ".codex-supervisor-installed.json"
+        try:
+            marker_payload = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
+        if marker_payload.get("name") != name:
+            return None
+        return path
 
     def _executable(
         self,

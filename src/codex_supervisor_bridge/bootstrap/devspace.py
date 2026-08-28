@@ -87,10 +87,12 @@ class DevSpaceBootstrap:
         paths: AppDataPaths,
         config: DevSpaceBootstrapConfig,
         executable: str = "devspace",
+        entrypoint: str | None = None,
     ) -> None:
         self.paths = paths
         self.config = config
         self.executable = executable
+        self.entrypoint = entrypoint
 
     @classmethod
     def from_app_data(
@@ -100,6 +102,7 @@ class DevSpaceBootstrap:
         port: int,
         project_directory: Path | None = None,
         executable: str = "devspace",
+        entrypoint: str | None = None,
     ) -> "DevSpaceBootstrap":
         roots = [project_directory.resolve()] if project_directory else []
         return cls(
@@ -111,6 +114,7 @@ class DevSpaceBootstrap:
                 state_dir=paths.data / "devspace",
             ),
             executable=executable,
+            entrypoint=entrypoint,
         )
 
     @property
@@ -167,9 +171,14 @@ class DevSpaceBootstrap:
         return self.config_path
 
     def process_spec(self, *, startup_timeout: float = 15.0, shutdown_timeout: float = 10.0) -> ManagedProcessSpec:
+        command: list[str]
+        if self.entrypoint:
+            command = [self.executable, self.entrypoint, "serve"]
+        else:
+            command = [self.executable, "serve"]
         return ManagedProcessSpec(
             name="devspace",
-            command=[self.executable, "serve"],
+            command=command,
             cwd=self.config_directory,
             env={**os.environ, "DEVSPACE_CONFIG_DIR": str(self.config_directory)},
             startup_timeout=startup_timeout,

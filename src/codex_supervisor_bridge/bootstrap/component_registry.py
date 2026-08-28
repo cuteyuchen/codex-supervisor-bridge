@@ -13,7 +13,10 @@ BUILTIN_MANIFESTS: dict[str, ComponentManifest] = {
         source="https://nodejs.org/dist/v24.20.0/node-v24.20.0-win-x64.zip",
         source_ref="v24.20.0",
         checksum_sha256="6cac9ffbca8f6a47091e4b5c772e0606049c3871cb67d900c0cedde630e545ba",
-        install_commands=[["tar", "-xf", "download", "-C", "."]],
+        archive_kind="zip",
+        archive_root="node-v24.20.0-win-x64",
+        entrypoint="node.exe",
+        install_commands=[],
         requires_node=False,
     ),
     "devspace": ComponentManifest(
@@ -23,9 +26,11 @@ BUILTIN_MANIFESTS: dict[str, ComponentManifest] = {
         source="https://registry.npmjs.org/@waishnav/devspace/-/devspace-1.0.8.tgz",
         source_ref="1.0.8",
         checksum_sha256="59578f71855c160826682fa0409ca885287fee79f549b57128d8962348ff6488",
+        archive_kind="tgz",
+        archive_root="package",
+        entrypoint="dist/cli.js",
         install_commands=[
-            ["tar", "-xzf", "download", "-C", "."],
-            ["npm", "install", "--omit=dev", "--prefix", "package"],
+            ["npm", "install", "--omit=dev"],
         ],
         requires_node=True,
     ),
@@ -33,10 +38,19 @@ BUILTIN_MANIFESTS: dict[str, ComponentManifest] = {
         name="local-codex-bridge",
         display_name="Codex control",
         version="2.1.3",
-        source="https://github.com/zoeynine/Local-Codex-Bridge/archive/refs/tags/v2.1.3.tar.gz",
-        source_ref="v2.1.3",
+        source=(
+            "https://github.com/zoeynine/Local-Codex-Bridge/archive/"
+            "4ffed814f615316ade8967189a2e1772488d33c2.tar.gz"
+        ),
+        source_ref="4ffed814f615316ade8967189a2e1772488d33c2",
+        commit_sha="4ffed814f615316ade8967189a2e1772488d33c2",
         checksum_sha256=None,
-        install_commands=[["tar", "-xzf", "download", "-C", "."]],
+        archive_kind="tgz",
+        entrypoint="dist/src/index.js",
+        install_commands=[
+            ["npm", "ci"],
+            ["npm", "run", "build"],
+        ],
         requires_node=True,
     ),
 }
@@ -46,8 +60,7 @@ class ManagedComponentRegistry:
     """Built-in trusted registry for app-managed component installation.
 
     Normal users never supply manifests, URLs, checksums, or install commands.
-    The registry owns the pinned versions and their verification strategy;
-    network download is deferred to the opt-in Windows Gate.
+    The registry owns the pinned versions and their verification strategy.
     """
 
     def __init__(
@@ -91,6 +104,13 @@ class ManagedComponentRegistry:
 
     def verification_strategy(self, name: str) -> str:
         manifest = self.manifest(name)
+        if manifest.commit_sha:
+            return (
+                f"pinned {manifest.version} at commit {manifest.commit_sha}; "
+                "the upstream archive is unsigned, so the immutable GitHub "
+                "commit archive plus build and protocol health is the "
+                "verification strategy"
+            )
         if manifest.checksum_sha256:
             return (
                 f"pinned {manifest.version}; SHA256 verified from the official "

@@ -8,10 +8,14 @@ import subprocess
 import tempfile
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Literal, Mapping
 
 from pydantic import BaseModel, Field, field_validator
+
+from .archive import extract_tar_safe, extract_zip_safe
+from .download import HttpsDownloader
 
 
 class ComponentManifest(BaseModel):
@@ -22,7 +26,14 @@ class ComponentManifest(BaseModel):
     version: str = Field(pattern=r"^[0-9A-Za-z][0-9A-Za-z.+-]*$")
     source: str = Field(pattern=r"^https://")
     source_ref: str
+    commit_sha: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{40}$",
+    )
     checksum_sha256: str | None = None
+    archive_kind: Literal["auto", "zip", "tgz"] = "auto"
+    archive_root: str | None = None
+    entrypoint: str | None = None
     install_commands: list[list[str]] = Field(default_factory=list)
     requires_node: bool = False
 
@@ -55,7 +66,7 @@ class InstallResult(BaseModel):
 
 @dataclass(frozen=True)
 class InstallerOptions:
-    downloader: Callable[[str, Path], bytes] | None = None
+    downloader: Callable[[str, Path], Path | bytes] | None = None
     runner: Callable[[list[str], Path], int] | None = None
     max_retries: int = 3
 
@@ -67,7 +78,7 @@ class ComponentInstaller:
         self,
         components_root: str | Path,
         *,
-        downloader: Callable[[str, Path], bytes] | None = None,
+        downloader: Callable[[str, Path], Path | bytes] | None = None,
         runner: Callable[[list[str], Path], int] | None = None,
         max_retries: int = 3,
         trusted_manifests: Mapping[str, ComponentManifest] | None = None,
@@ -101,6 +112,16 @@ class ComponentInstaller:
         self._assert_within_root(component_root)
         component_root.mkdir(parents=True, exist_ok=True)
         previous = self._current_version(component_root)
+        if previous is not None and previous["path"] == plan.target_dir:
+            if self._validate_install_marker(plan.target_dir, manifest):
+                return InstallResult(
+                    component=manifest,
+                    installed_path=plan.target_dir,
+                    status="ALREADY_INSTALLED",
+                    retry_count=0,
+                )
+        shutil.rmtree(plan.staging_dir, ignore_errors=True)
+        plan.staging_dir.mkdir(parents=True, exist_ok=True)
         last_error: str | None = None
         attempts = 0
         for attempt in range(plan.max_retries):
@@ -109,25 +130,28 @@ class ComponentInstaller:
             staging.mkdir(parents=True)
             self._assert_within_root(staging)
             try:
-                artifact = staging / plan.artifact_name
-                artifact.mkdir(parents=True)
-                payload = self._downloader(manifest.source, artifact)
-                if manifest.checksum_sha256:
-                    self._verify_checksum(payload, manifest.checksum_sha256, manifest.name)
-                archive_path = artifact / "download"
-                archive_path.write_bytes(payload)
+                archive_path = self._download(manifest, staging)
+                extract_root = staging / "extract"
+                extract_root.mkdir(parents=True)
+                self._extract(manifest, archive_path, extract_root)
+                source_root = self._archive_root(manifest, extract_root)
+                node_executable, npm_script = self._managed_toolchain()
                 for command in manifest.install_commands:
-                    exit_code = self._runner(list(command), artifact)
+                    exit_code = self._runner(
+                        self._expand_command(command, node_executable, npm_script),
+                        source_root,
+                    )
                     if exit_code != 0:
                         raise RuntimeError(
                             f"install command failed with exit code {exit_code}"
                         )
-                os.replace(artifact, plan.target_dir)
+                self._write_install_marker(source_root, manifest)
+                promoted = self._promote(source_root, plan.target_dir)
                 self._write_current(component_root, manifest, plan.target_dir)
                 shutil.rmtree(plan.staging_dir, ignore_errors=True)
                 return InstallResult(
                     component=manifest,
-                    installed_path=plan.target_dir,
+                    installed_path=promoted,
                     status="INSTALLED",
                     retry_count=attempts,
                 )
@@ -169,10 +193,8 @@ class ComponentInstaller:
             raise RuntimeError(f"checksum mismatch for {name}")
 
     @staticmethod
-    def _default_downloader(url: str, destination: Path) -> bytes:
-        raise NotImplementedError(
-            "network downloads are delegated to the Windows Gate installer"
-        )
+    def _default_downloader(url: str, destination: Path) -> Path:
+        return HttpsDownloader().download(url, destination)
 
     @staticmethod
     def _default_runner(command: list[str], cwd: Path) -> int:
@@ -201,6 +223,149 @@ class ComponentInstaller:
         if not isinstance(manifest, dict):
             return None
         return {"path": Path(path), "manifest": ComponentManifest.model_validate(manifest)}
+
+    def _download(
+        self,
+        manifest: ComponentManifest,
+        staging: Path,
+    ) -> Path:
+        target = staging / "download"
+        payload = self._downloader(manifest.source, target)
+        if isinstance(payload, bytes):
+            if manifest.checksum_sha256:
+                self._verify_checksum(payload, manifest.checksum_sha256, manifest.name)
+            target.write_bytes(payload)
+        else:
+            if manifest.checksum_sha256:
+                digest = hashlib.sha256(payload.read_bytes()).hexdigest()
+                if digest.lower() != manifest.checksum_sha256.lower():
+                    raise RuntimeError(f"checksum mismatch for {manifest.name}")
+        return target
+
+    def _extract(
+        self,
+        manifest: ComponentManifest,
+        archive_path: Path,
+        destination: Path,
+    ) -> None:
+        kind = manifest.archive_kind
+        if kind == "auto":
+            suffix = archive_path.suffix.lower()
+            kind = "zip" if suffix == ".zip" else "tgz"
+        if kind == "zip":
+            extract_zip_safe(archive_path, destination)
+            return
+        if kind == "tgz":
+            extract_tar_safe(archive_path, destination)
+            return
+        raise ValueError(f"unsupported archive kind: {manifest.archive_kind}")
+
+    @staticmethod
+    def _archive_root(manifest: ComponentManifest, extract_root: Path) -> Path:
+        if manifest.archive_root:
+            root = extract_root / manifest.archive_root
+            if not root.is_dir():
+                raise RuntimeError(
+                    f"component {manifest.name} archive root is missing: {root}"
+                )
+            return root
+        children = [path for path in extract_root.iterdir()]
+        if len(children) == 1 and children[0].is_dir():
+            return children[0]
+        if any(path.is_dir() for path in children):
+            raise RuntimeError(
+                f"component {manifest.name} archive has no single known root"
+            )
+        return extract_root
+
+    def _promote(self, source: Path, target: Path) -> Path:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        old = target.parent / f".previous-{uuid.uuid4().hex}"
+        if target.exists():
+            os.replace(target, old)
+        try:
+            os.replace(source, target)
+        except OSError:
+            if old.exists() and not target.exists():
+                os.replace(old, target)
+            raise
+        if old.exists():
+            shutil.rmtree(old, ignore_errors=True)
+        return target
+
+    def _managed_toolchain(self) -> tuple[str | None, str | None]:
+        node_root = self.components_root / "nodejs"
+        current = self._current_version(node_root)
+        if current is None:
+            return None, None
+        node_exe = Path(str(current["path"])) / "node.exe"
+        npm_script = (
+            Path(str(current["path"]))
+            / "node_modules"
+            / "npm"
+            / "bin"
+            / "npm-cli.js"
+        )
+        if not node_exe.is_file() or not npm_script.is_file():
+            return None, None
+        return str(node_exe), str(npm_script)
+
+    @staticmethod
+    def _expand_command(
+        command: list[str],
+        node_executable: str | None,
+        npm_script: str | None,
+    ) -> list[str]:
+        if not command:
+            return command
+        launcher = command[0].lower()
+        if launcher in {"node", "node.exe"} and node_executable:
+            return [node_executable, *command[1:]]
+        if launcher in {"npm", "npm.cmd", "npm.exe"}:
+            if node_executable and npm_script:
+                return [node_executable, npm_script, *command[1:]]
+            if launcher == "npm":
+                return ["npm", *command[1:]]
+            return [launcher, *command[1:]]
+        return list(command)
+
+    def _write_install_marker(self, root: Path, manifest: ComponentManifest) -> Path:
+        marker = root / ".codex-supervisor-installed.json"
+        payload = {
+            "name": manifest.name,
+            "version": manifest.version,
+            "source_ref": manifest.source_ref,
+            "commit_sha": manifest.commit_sha,
+            "checksum_sha256": manifest.checksum_sha256,
+            "entrypoint": manifest.entrypoint,
+            "installed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        marker.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return marker
+
+    def _validate_install_marker(
+        self,
+        root: Path,
+        manifest: ComponentManifest,
+    ) -> bool:
+        marker = root / ".codex-supervisor-installed.json"
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return False
+        if (
+            payload.get("name") != manifest.name
+            or payload.get("version") != manifest.version
+            or payload.get("source_ref") != manifest.source_ref
+            or payload.get("commit_sha") != manifest.commit_sha
+        ):
+            return False
+        if manifest.entrypoint and not (root / manifest.entrypoint).is_file():
+            return False
+        return True
 
     @staticmethod
     def _write_current(

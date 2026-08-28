@@ -31,6 +31,7 @@ class RepairService:
         secret_store: SecretStore | None = None,
         installer: ComponentInstaller | None = None,
         registry: ManagedComponentRegistry | None = None,
+        auto_install: bool = False,
     ) -> None:
         self.paths = paths or AppDataPaths.from_environment()
         self.config_store = config_store or ConfigStore(paths=self.paths)
@@ -43,6 +44,7 @@ class RepairService:
             self.paths.components,
             trusted_manifests=self.registry.manifests(),
         )
+        self.auto_install = auto_install
 
     def repair(self, status: DoctorStatus | None = None, *, project_directory: Path | None = None) -> list[RepairAction]:
         status = status or self.doctor.run()
@@ -86,11 +88,15 @@ class RepairService:
         actions.append(RepairAction(action="generate_mcp_config", status=HealthStatus.READY, message="Local connection settings are ready."))
         project = project_directory or config.basic.project_directory
         if config.advanced.ports.get("devspace"):
+            devspace_entrypoint = config.advanced.executable_paths.get(
+                "devspace_entrypoint"
+            )
             devspace = DevSpaceBootstrap.from_app_data(
                 self.paths,
                 port=config.advanced.ports["devspace"],
                 project_directory=project,
                 executable=config.advanced.executable_paths.get("devspace", "devspace"),
+                entrypoint=devspace_entrypoint,
             )
             devspace.write_config()
             devspace.prepare_auth(self.secret_store)
@@ -139,17 +145,61 @@ class RepairService:
         name: str,
         component: object,
     ) -> RepairAction:
-        plan = self.installer.plan(self.registry.manifest(name))
+        manifest = self.registry.manifest(name)
+        if not self.auto_install:
+            plan = self.installer.plan(manifest)
+            return RepairAction(
+                action=f"install_component:{name}",
+                status=getattr(component, "status"),
+                message=str(getattr(component, "user_message")),
+                requires_user_action=True,
+                advanced={
+                    "install_plan": plan.model_dump(mode="json"),
+                    "verification_strategy": self.registry.verification_strategy(name),
+                },
+            )
+        result = self.installer.install(manifest)
+        if result.status in {"INSTALLED", "ALREADY_INSTALLED"} and result.installed_path:
+            self._register_managed_paths(name, result.installed_path)
         return RepairAction(
             action=f"install_component:{name}",
-            status=getattr(component, "status"),
-            message=str(getattr(component, "user_message")),
-            requires_user_action=True,
+            status=(
+                HealthStatus.READY
+                if result.status in {"INSTALLED", "ALREADY_INSTALLED"}
+                else HealthStatus.DEGRADED
+            ),
+            message=(
+                "Local development environment is ready."
+                if result.status in {"INSTALLED", "ALREADY_INSTALLED"}
+                else "Local development environment needs a repair."
+            ),
+            requires_user_action=result.status not in {"INSTALLED", "ALREADY_INSTALLED"},
             advanced={
-                "install_plan": plan.model_dump(mode="json"),
+                "install_result": result.model_dump(mode="json"),
                 "verification_strategy": self.registry.verification_strategy(name),
+                "repairable": bool(getattr(component, "repairable", False)),
             },
         )
+
+    def _register_managed_paths(self, name: str, installed_path: Path) -> None:
+        loaded = self.config_store.load()
+        config = loaded.config
+        if name == "nodejs":
+            node_exe = installed_path / "node.exe"
+            if node_exe.is_file():
+                config.advanced.executable_paths["node"] = str(node_exe)
+        elif name == "devspace":
+            entrypoint = installed_path / "dist" / "cli.js"
+            node_exe = config.advanced.executable_paths.get("node")
+            if entrypoint.is_file():
+                config.advanced.executable_paths["devspace_entrypoint"] = str(entrypoint)
+            if node_exe:
+                config.advanced.executable_paths["devspace"] = node_exe
+        elif name == "local-codex-bridge":
+            entrypoint = installed_path / "dist" / "src" / "index.js"
+            if entrypoint.is_file():
+                config.advanced.local_codex_repository = installed_path
+        self.config_store.save(config)
 
     def _write_mcp_config(self, config: AppConfig) -> None:
         port = config.advanced.ports.get("supervisor")

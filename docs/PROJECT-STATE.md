@@ -403,7 +403,9 @@ The first implementation slice is intentionally backend-neutral and layered:
   (`bootstrap.installer.ComponentInstaller`) installs pinned manifests into
   `%LOCALAPPDATA%\CodexSupervisorBridge\components`, verifies checksums,
   runs bounded retries, promotes atomically, and rolls back to the previous
-  version; network download remains a later Windows Gate;
+  version; `codex-supervisor repair/start` now executes these trusted
+  installs, while library callers without `auto_install=True` still receive
+  bounded plans for tests and GUI previews;
 - Profile B Node compatibility is unified to `>=24, <27` so Doctor and the
   installer cannot report DevSpace READY while Local-Codex-Bridge later
   rejects the same runtime;
@@ -431,12 +433,13 @@ The first implementation slice is intentionally backend-neutral and layered:
   healthy supervisor / workspace / Codex-control orchestration path, RepairService
   stale and UNKNOWN process handling, Doctor crash reflection, fail-closed
   SecureRemote reconnect/rotate, and Profile A/B normalized difference detection
-  are covered by fake tests (154 tests locally on Python 3.12/3.13).
+  are covered by fake tests (the suite has grown since this earlier round).
 - RepairService recovers invalid configuration from DEGRADED to safe defaults,
   and the `doctor` CLI emits structured UX JSON without provider, SQLite, or
   backend names. Doctor reports a stopped Supervisor Bridge as repairable
   `start_supervisor` instead of falsely showing it as READY. The current
-  code-level suite is 171 tests locally on Python 3.12/3.13, including task
+  code-level suite was 171 tests at that point locally on Python 3.12/3.13,
+  including task
   backend binding, AgentSessionManager reuse and fail-closed restart,
   installer atomic promote/rollback, production-composition E2E, and the
   fail-soft readiness marker.
@@ -494,8 +497,9 @@ The pre-real-Gate production wiring round is complete on the P6.6 branch:
   upstream publishes no official SHA256. The installer now accepts argv-only
   install commands, rejects non-built-in manifests when a trusted registry is
   configured, rejects path traversal, and RepairService exposes
-  `prepare_local_environment` install plans in advanced diagnostics only;
-- the current code-level suite is 211 tests locally on Python 3.12/3.13,
+  `prepare_local_environment` install plans in advanced diagnostics when
+  auto-install is disabled or a trusted install fails;
+- the code-level suite was 211 tests at that point locally on Python 3.12/3.13,
   including the production startup E2E (healthy Profile B, Profile A fallback,
   bound-task no-fallback, pre-READY reconciliation, first health call, clean
   shutdown, no orphan session), guarded steer/respond/interrupt race tests,
@@ -507,6 +511,70 @@ Remote MCP attachment, tunnel-provider login, or authenticated Codex runtime
 proof. Those remain opt-in/manual gates after the fake and protocol coverage is
 complete. Profile A remains the fallback until Profile B passes the documented
 real Windows scenario.
+
+### 2026-08-28 cold-start / managed installer / UNKNOWN safety round
+
+This round closes the remaining code-level production gaps before the real
+Windows Gate:
+
+- DevSpace now starts before the Supervisor process in
+  `BootstrapService.start`: managed config/auth are prepared, the local
+  workspace process is launched, and only then is Supervisor started, so
+  `SUPERVISOR_READY` cannot be claimed against a DevSpace that never came up;
+- `ComponentInstaller` is now a real installer, not a plan-only stub: it uses
+  a bounded HTTPS downloader, rejects HTTP, verifies SHA256, performs safe ZIP /
+  tar extraction with no traversal/link/device escapes, runs argv-only install
+  commands, promotes atomically, rolls back to the previous version, cleans
+  interrupted staging, and treats a healthy same-version install as
+  `ALREADY_INSTALLED` (corrupt markers are reinstalled);
+- managed Node.js 24.20.0 is the Profile B runtime: `npm` install commands are
+  rewritten to `managed-node.exe <npm-cli.js> ...` when the managed Node is
+  installed, DevSpace is launched as `managed-node.exe <package>/dist/cli.js
+  serve`, and Local-Codex-Bridge uses the managed Node plus the managed
+  repository's `dist/src/index.js`; no system PATH dependency is required for
+  Profile B components;
+- the built-in registry pins immutable artifacts: Node.js 24.20.0 (official
+  SHA256), DevSpace 1.0.8 (published SHA256), and Local-Codex-Bridge v2.1.3 at
+  exact commit `4ffed814f615316ade8967189a2e1772488d33c2` (unsigned upstream
+  archive; verification is the immutable GitHub commit archive plus build and
+  protocol health);
+- `codex-supervisor repair/start` runs with `auto_install=True`: missing
+  trusted components are downloaded, extracted, verified, promoted, and their
+  managed paths are persisted into Advanced settings before the doctor is
+  re-run; normal UX still shows only `prepare_local_environment`;
+- `RuntimeResolver` now includes the `codex` capability as a separate
+  readiness input, so a healthy LCB/DevSpace pair cannot report PROFILE_READY
+  when the Codex CLI is missing or unauthenticated;
+- `mcp/server.py` reads persisted active `task_backend_binding` rows at
+  startup: one active binding is enforced (no fallback to a healthier
+  profile), and multiple active tasks bound to different profiles fail closed
+  with `STARTUP_RECONCILIATION_REQUIRED`;
+- `AgentSessionManager` recovery is scoped to the current composition binding:
+  an active CODEX writer bound to another profile becomes a startup
+  reconciliation blocker instead of being resumed by the wrong agent session;
+- `CapabilityResolver` maps the public `Codex` capability to the real
+  `codex` readiness probe instead of the AgentBackend health, so Kandev /
+  Control Plane availability can no longer masquerade as Codex readiness;
+- `soft_steer` and `answer_interaction` now fail closed when the remote
+  snapshot is `UNKNOWN` / `reconciliation_required`: the shared
+  `post_call_stale_reasons` includes the remote result and compensation
+  interrupts before any result can bind;
+- `interrupt` never writes `PAUSED` from an UNKNOWN remote outcome; it latches
+  `RECONCILIATION_REQUIRED` and raises. A revision-only interrupt race (same
+  runtime identity, revision changed while the remote call was in flight)
+  observes the current runtime and only binds a confirmed terminal state,
+  otherwise reconciliation is latched and no stale interrupt can overwrite a
+  newer intent;
+- new cold-start, managed-installer, binding-conflict, Codex-readiness,
+  UNKNOWN-steer/respond/interrupt, revision-only race, and archive-safety tests
+  are part of the PR #9 suite. The code-level suite is 234 tests locally on
+  Python 3.12/3.13.
+
+The real Windows Gate remains: install/launch DevSpace and Local-Codex-Bridge
+on a user machine, complete one DevSpace authorization, log in to Codex,
+create the Supervisor-only HTTPS tunnel, attach ChatGPT Web Remote MCP to the
+Supervisor endpoint, and run the same Profile A/B scenario against real
+worktrees. P6.6 is not marked complete until those gates pass.
 
 ### Revised next phases
 

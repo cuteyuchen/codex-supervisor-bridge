@@ -28,6 +28,7 @@ class BootstrapService:
         doctor: Doctor | None = None,
         repair: RepairService | None = None,
         process_manager: ProcessManager | None = None,
+        auto_install: bool = False,
     ) -> None:
         self.paths = paths or AppDataPaths.from_environment()
         self.config_store = config_store or ConfigStore(paths=self.paths)
@@ -42,6 +43,7 @@ class BootstrapService:
             config_store=self.config_store,
             doctor=self.doctor,
             process_manager=self.process_manager,
+            auto_install=auto_install,
         )
 
     def status(self, *, project_directory: Path | None = None) -> BootstrapStatus:
@@ -100,6 +102,78 @@ class BootstrapService:
         config = self.config_store.load().config
         if result.status == HealthStatus.UNAVAILABLE:
             return result
+        devspace_executable = config.advanced.executable_paths.get("devspace", "devspace")
+        devspace_entrypoint = config.advanced.executable_paths.get("devspace_entrypoint")
+        workspace_health = result.doctor.component("Local workspace")
+        workspace_ready = (
+            workspace_health is not None
+            and workspace_health.status == HealthStatus.READY
+        )
+        if not workspace_ready:
+            result.repairs.append(
+                RepairAction(
+                    action="start_process:devspace",
+                    status=(
+                        workspace_health.status
+                        if workspace_health is not None
+                        else HealthStatus.DEGRADED
+                    ),
+                    message=(
+                        workspace_health.user_message
+                        if workspace_health is not None
+                        else "Local workspace needs setup."
+                    ),
+                    requires_user_action=True,
+                    advanced={
+                        **(
+                            workspace_health.advanced
+                            if workspace_health is not None
+                            else {}
+                        ),
+                        "executable": devspace_executable,
+                    },
+                )
+            )
+        elif _find_executable(devspace_executable):
+            devspace = DevSpaceBootstrap.from_app_data(
+                self.paths,
+                port=config.advanced.ports.get("devspace", 39000),
+                project_directory=project_directory or config.basic.project_directory,
+                executable=devspace_executable,
+                entrypoint=devspace_entrypoint,
+            )
+            try:
+                component = self.process_manager.start(
+                    devspace.process_spec(
+                        startup_timeout=config.advanced.startup_timeout_seconds,
+                        shutdown_timeout=config.advanced.shutdown_timeout_seconds,
+                    )
+                )
+                result.repairs.append(
+                    RepairAction(
+                        action="start_process:devspace",
+                        status=(
+                            HealthStatus.READY
+                            if component.status == "RUNNING"
+                            else HealthStatus.UNAVAILABLE
+                        ),
+                        message=(
+                            "Local workspace started."
+                            if component.status == "RUNNING"
+                            else "Local workspace could not start."
+                        ),
+                        advanced=component.as_dict(),
+                    )
+                )
+            except (OSError, ValueError) as exc:
+                result.repairs.append(
+                    RepairAction(
+                        action="start_process:devspace",
+                        status=HealthStatus.UNAVAILABLE,
+                        message="Local workspace could not start.",
+                        advanced={"technical_detail": str(exc)},
+                    )
+                )
         port = config.advanced.ports.get("supervisor")
         if port is None:
             return result
@@ -156,49 +230,6 @@ class BootstrapService:
             advanced={**state.as_dict(), "readiness": readiness.value if readiness else None},
         )
         result.repairs.append(start_action)
-        devspace_executable = config.advanced.executable_paths.get("devspace", "devspace")
-        workspace_health = result.doctor.component("Local workspace")
-        if workspace_health is not None and workspace_health.status != HealthStatus.READY:
-            result.repairs.append(
-                RepairAction(
-                    action="start_process:devspace",
-                    status=workspace_health.status,
-                    message=workspace_health.user_message,
-                    requires_user_action=True,
-                    advanced={**workspace_health.advanced, "executable": devspace_executable},
-                )
-            )
-        elif _find_executable(devspace_executable):
-            devspace = DevSpaceBootstrap.from_app_data(
-                self.paths,
-                port=config.advanced.ports.get("devspace", port),
-                project_directory=project_directory or config.basic.project_directory,
-                executable=devspace_executable,
-            )
-            try:
-                component = self.process_manager.start(
-                    devspace.process_spec(
-                        startup_timeout=config.advanced.startup_timeout_seconds,
-                        shutdown_timeout=config.advanced.shutdown_timeout_seconds,
-                    )
-                )
-                result.repairs.append(
-                    RepairAction(
-                        action="start_process:devspace",
-                        status=HealthStatus.READY if component.status == "RUNNING" else HealthStatus.UNAVAILABLE,
-                        message="Local workspace started." if component.status == "RUNNING" else "Local workspace could not start.",
-                        advanced=component.as_dict(),
-                    )
-                )
-            except (OSError, ValueError) as exc:
-                result.repairs.append(
-                    RepairAction(
-                        action="start_process:devspace",
-                        status=HealthStatus.UNAVAILABLE,
-                        message="Local workspace could not start.",
-                        advanced={"technical_detail": str(exc)},
-                    )
-                )
         control_health = result.doctor.component("Codex control")
         lcb_command = config.advanced.process_commands.get("local_codex_bridge")
         launch: list[str] | None = None
@@ -309,6 +340,7 @@ def _profile(config: AppConfig, doctor: DoctorStatus) -> str:
         "local_codex_bridge": "Codex control",
         "kandev": "Fallback workspace",
         "control_plane": "Fallback control",
+        "codex": "Codex",
         "github": "GitHub",
     }
     for name, label in aliases.items():

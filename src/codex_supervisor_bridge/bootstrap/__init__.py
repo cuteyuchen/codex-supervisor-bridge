@@ -1,5 +1,6 @@
 """Windows-friendly bootstrap, diagnostics, and local runtime lifecycle."""
 
+from .archive import UnsafeArchiveError, extract_tar_safe, extract_zip_safe
 from .auth import (
     AuthorizationChallenge,
     AuthorizationResult,
@@ -36,6 +37,7 @@ from .devspace_auth import (
     redact_oauth_payload,
 )
 from .doctor import Doctor, DoctorOptions
+from .download import DownloadError, HttpsDownloader
 from .harness import (
     HarnessComparison,
     HarnessStep,
@@ -98,6 +100,7 @@ __all__ = [
     "CodexReadiness",
     "CodexReadinessDetector",
     "DevelopmentStyle",
+    "DownloadError",
     "Doctor",
     "DoctorOptions",
     "DevSpaceBootstrap",
@@ -110,6 +113,7 @@ __all__ = [
     "HarnessStep",
     "HarnessTrace",
     "HealthStatus",
+    "HttpsDownloader",
     "InstallPlan",
     "InstallResult",
     "ManagedProcessSpec",
@@ -137,7 +141,10 @@ __all__ = [
     "ProfileScenarioRunner",
     "ScenarioObservation",
     "WindowsDpapiSecretStore",
+    "UnsafeArchiveError",
     "authorize_command",
+    "extract_tar_safe",
+    "extract_zip_safe",
     "FirstAuthorizationFlow",
     "redact_oauth_payload",
 ]

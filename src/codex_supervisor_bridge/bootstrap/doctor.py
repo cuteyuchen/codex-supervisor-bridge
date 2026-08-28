@@ -80,7 +80,7 @@ class Doctor:
             components.extend(
                 [
                     self._workspace(),
-                    self._executable("Codex control", "local-codex-bridge", "local-codex-bridge --version"),
+                    self._codex_control(config),
                     self._executable("Fallback workspace", "kandev", "kandev --version"),
                     self._executable("Fallback control", "codex-control-plane-mcp", "codex-control-plane-mcp --version"),
                 ]
@@ -320,6 +320,55 @@ class Doctor:
             result.recommended_action = "install_git_bash_or_wsl"
             result.advanced["shell"] = None
         return result
+
+    def _codex_control(self, config: AppConfig) -> ComponentHealth:
+        repository = config.advanced.local_codex_repository
+        if repository is None:
+            return self._executable("Codex control", "local-codex-bridge", "local-codex-bridge --version")
+
+        resolved = repository.expanduser().resolve()
+        entrypoint = resolved / "dist" / "src" / "index.js"
+        node_value = config.advanced.executable_paths.get("node", "node")
+        node = self._find(node_value) or self._find("node")
+        if node is None:
+            return ComponentHealth(
+                capability="Codex control",
+                status=HealthStatus.UNAVAILABLE,
+                repairable=True,
+                user_message="Codex control needs Node.js or a runtime repair.",
+                recommended_action="repair_codex_control",
+                advanced={
+                    "provider": "local-codex-bridge",
+                    "repository": str(resolved),
+                    "executable": None,
+                    "technical_detail": "node executable not found",
+                },
+            )
+        if not entrypoint.is_file():
+            return ComponentHealth(
+                capability="Codex control",
+                status=HealthStatus.DEGRADED,
+                repairable=True,
+                user_message="Codex control needs an update or build.",
+                recommended_action="repair_codex_control",
+                advanced={
+                    "provider": "local-codex-bridge",
+                    "repository": str(resolved),
+                    "entrypoint": str(entrypoint),
+                    "technical_detail": "dist/src/index.js not found",
+                },
+            )
+        return ComponentHealth(
+            capability="Codex control",
+            status=HealthStatus.READY,
+            user_message="Codex control is ready.",
+            advanced={
+                "provider": "local-codex-bridge",
+                "repository": str(resolved),
+                "entrypoint": str(entrypoint),
+                "launch_command": [node, str(entrypoint)],
+            },
+        )
 
     def _codex(self, config: AppConfig, *, workspace: Path | None) -> ComponentHealth:
         configured = config.advanced.executable_paths.get("codex")

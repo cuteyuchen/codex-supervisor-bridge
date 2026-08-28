@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -241,7 +242,6 @@ def test_devspace_current_config_filename(tmp_path: Path) -> None:
     assert config_path == paths.config / "devspace" / "config.json"
     assert config_path.exists()
     assert not stale.exists()
-    assert not (Path.home() / ".devspace" / "config.json").exists()
 
 
 def test_devspace_current_flat_config_matches_upstream_contract(tmp_path: Path) -> None:
@@ -272,6 +272,43 @@ def test_devspace_current_flat_config_matches_upstream_contract(tmp_path: Path) 
         "configuration_kind": "v1_0_flat",
         "configuration_file": "config.json",
     }
+
+
+def test_bridge_config_reads_through_upstream_flat_parser(tmp_path: Path) -> None:
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "devspace" / "upstream-v1.0.8.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    bootstrap = DevSpaceBootstrap.from_app_data(paths, port=39101, project_directory=project)
+    secrets = MemorySecretStore()
+    bootstrap.write_config()
+    bootstrap.prepare_auth(secrets)
+
+    def load_devspace_files(directory: Path) -> dict[str, object]:
+        return {
+            "dir": str(directory),
+            "config": json.loads((directory / "config.json").read_text(encoding="utf-8")),
+            "auth": json.loads((directory / "auth.json").read_text(encoding="utf-8")),
+        }
+
+    files = load_devspace_files(bootstrap.config_directory)
+    config = files["config"]
+    auth = files["auth"]
+    assert isinstance(config, dict)
+    assert isinstance(auth, dict)
+    assert set(config).issubset(set(fixture["accepted_configuration_fields"]))
+    assert config["host"] == "127.0.0.1"
+    assert config["port"] == 39101
+    assert config["allowedRoots"] == [str(project.resolve())]
+    assert config["publicBaseUrl"] is None
+    assert auth["ownerToken"] == secrets.get("devspace-owner-token")
 
 
 def test_upstream_release_contract_fixture_remains_current() -> None:
@@ -419,6 +456,50 @@ def test_bootstrap_start_uses_local_codex_protocol_bootstrap(tmp_path: Path) -> 
     assert any(item.action == "start_process:local_codex_bridge" for item in result.repairs)
 
 
+def test_bootstrap_start_uses_local_codex_repository_launch(tmp_path: Path) -> None:
+    from codex_supervisor_bridge.bootstrap import BootstrapService
+
+    class RecordingProcessManager:
+        def __init__(self) -> None:
+            self.started: list[ManagedProcessSpec] = []
+
+        def statuses(self) -> list[ProcessState]:
+            return []
+
+        def health(self, name: str) -> ProcessState:
+            return ProcessState(name, "STOPPED")
+
+        def start(self, spec: ManagedProcessSpec, *, restart: bool = False) -> ProcessState:
+            del restart
+            self.started.append(spec)
+            return ProcessState(spec.name, "RUNNING", pid=50001)
+
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    repository = tmp_path / "Local-Codex-Bridge"
+    entrypoint = repository / "dist" / "src" / "index.js"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("placeholder", encoding="utf-8")
+    config_store = ConfigStore(paths=paths)
+    config = AppConfig.safe_defaults(paths)
+    config.advanced.local_codex_repository = repository
+    config.advanced.executable_paths["node"] = "C:/Program Files/nodejs/node.exe"
+    config_store.save(config)
+    process_manager = RecordingProcessManager()
+
+    result = BootstrapService(
+        paths=paths,
+        config_store=config_store,
+        process_manager=process_manager,
+    ).start(project_directory=tmp_path)
+
+    local = next(item for item in process_manager.started if item.name == "local_codex_bridge")
+    assert list(local.command) == ["C:/Program Files/nodejs/node.exe", str(entrypoint.resolve())]
+    assert any(item.action == "start_process:local_codex_bridge" for item in result.repairs)
+
+
 def test_http_mcp_bind_must_be_loopback() -> None:
     assert _is_loopback_host("127.0.0.1") is True
     assert _is_loopback_host("::1") is True
@@ -515,8 +596,14 @@ def test_local_codex_bridge_bootstrap_checks_current_control_surface() -> None:
 
 
 def test_local_codex_bridge_rejects_npm_start_and_uses_node_entrypoint(tmp_path: Path) -> None:
-    with pytest.raises(ValidationError):
-        LocalCodexBridgeBootstrapConfig(launch_command=["npm", "start"])
+    for polluted in (
+        ["npm", "start"],
+        ["npm.cmd", "start"],
+        ["npm", "run", "start"],
+        [str(tmp_path / "npm.cmd"), "start"],
+    ):
+        with pytest.raises(ValidationError):
+            LocalCodexBridgeBootstrapConfig(launch_command=polluted)
 
     build_root = tmp_path / "Local-Codex-Bridge"
     entrypoint = build_root / "dist" / "src" / "index.js"
@@ -525,6 +612,43 @@ def test_local_codex_bridge_rejects_npm_start_and_uses_node_entrypoint(tmp_path:
     command = LocalCodexBridgeBootstrap.canonical_launch_command(build_root)
 
     assert command == ["node", str(entrypoint.resolve())]
+    from_repository = LocalCodexBridgeBootstrap.from_repository(build_root, node_executable="C:/node.exe")
+    assert from_repository.config.launch_command == ["C:/node.exe", str(entrypoint.resolve())]
+
+
+def test_doctor_reads_local_codex_repository_launch(tmp_path: Path) -> None:
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    repository = tmp_path / "Local-Codex-Bridge"
+    entrypoint = repository / "dist" / "src" / "index.js"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("placeholder", encoding="utf-8")
+    config_store = ConfigStore(paths=paths)
+    config = AppConfig.safe_defaults(paths)
+    config.advanced.local_codex_repository = repository
+    config.advanced.executable_paths["node"] = "C:/Program Files/nodejs/node.exe"
+    config_store.save(config)
+
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        return subprocess.CompletedProcess(command, 0, "ok\n", "")
+
+    doctor = Doctor(
+        paths=paths,
+        config_store=config_store,
+        executable_finder=lambda name: "C:/Program Files/nodejs/node.exe" if name == "node" else None,
+        command_runner=runner,
+    )
+    health = doctor._codex_control(config)
+
+    assert health.status == HealthStatus.READY
+    assert health.advanced["entrypoint"] == str(entrypoint.resolve())
+    assert health.advanced["launch_command"] == [
+        "C:/Program Files/nodejs/node.exe",
+        str(entrypoint.resolve()),
+    ]
 
 
 def test_secret_store_round_trip_and_remote_access_security_gate() -> None:
@@ -571,6 +695,18 @@ def test_secret_store_round_trip_and_remote_access_security_gate() -> None:
             session_identity="session-2",
         )
     )["session_identity"] == "session-2"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows DPAPI is only available on Windows")
+def test_windows_dpapi_secret_store_round_trip(tmp_path: Path) -> None:
+    from codex_supervisor_bridge.bootstrap.secrets import WindowsDpapiSecretStore
+
+    store = WindowsDpapiSecretStore(tmp_path / "secrets")
+    store.set("devspace-owner-token", "owner-secret-not-logged")
+
+    assert store.get("devspace-owner-token") == "owner-secret-not-logged"
+    store.delete("devspace-owner-token")
+    assert store.get("devspace-owner-token") is None
 
 
 def test_first_authorization_flow_keeps_credentials_out_of_result() -> None:

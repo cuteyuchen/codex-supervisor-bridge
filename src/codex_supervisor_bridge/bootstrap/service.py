@@ -139,15 +139,33 @@ class BootstrapService:
                     )
                 )
         local_codex_command = config.advanced.process_commands.get("local_codex_bridge")
+        local_codex_bootstrap: LocalCodexBridgeBootstrap | None = None
         if local_codex_command and local_codex_command.strip():
+            local_codex_bootstrap = LocalCodexBridgeBootstrap(
+                LocalCodexBridgeBootstrapConfig(
+                    launch_command=shlex.split(local_codex_command, posix=False)
+                )
+            )
+        elif config.advanced.local_codex_repository:
             try:
-                local_codex = LocalCodexBridgeBootstrap(
-                    LocalCodexBridgeBootstrapConfig(
-                        launch_command=shlex.split(local_codex_command, posix=False)
+                local_codex_bootstrap = LocalCodexBridgeBootstrap.from_repository(
+                    config.advanced.local_codex_repository,
+                    node_executable=config.advanced.executable_paths.get("node", "node"),
+                )
+            except FileNotFoundError as exc:
+                result.repairs.append(
+                    RepairAction(
+                        action="start_process:local_codex_bridge",
+                        status=HealthStatus.UNAVAILABLE,
+                        message="Codex control needs an update or build.",
+                        requires_user_action=True,
+                        advanced={"technical_detail": str(exc)},
                     )
                 )
+        if local_codex_bootstrap is not None:
+            try:
                 component = self.process_manager.start(
-                    local_codex.process_spec(
+                    local_codex_bootstrap.process_spec(
                         startup_timeout=config.advanced.startup_timeout_seconds,
                         shutdown_timeout=config.advanced.shutdown_timeout_seconds,
                     )

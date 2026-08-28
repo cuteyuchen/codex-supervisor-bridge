@@ -42,6 +42,7 @@ class AdvancedSettings(BaseModel):
 
     executable_paths: dict[str, str] = Field(default_factory=dict)
     process_commands: dict[str, str] = Field(default_factory=dict)
+    local_codex_repository: Path | None = None
     backend_detail: dict[str, str] = Field(default_factory=dict)
     ports: dict[str, int] = Field(default_factory=dict)
     sqlite_path: Path | None = None

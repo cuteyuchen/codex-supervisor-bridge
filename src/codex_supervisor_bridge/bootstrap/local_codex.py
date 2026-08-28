@@ -20,8 +20,10 @@ class LocalCodexBridgeBootstrapConfig(BaseModel):
     @field_validator("launch_command")
     @classmethod
     def reject_protocol_polluting_launcher(cls, value: list[str]) -> list[str]:
-        if len(value) >= 2 and value[0].lower() == "npm" and value[1].lower() == "start":
-            raise ValueError("use node dist/src/index.js for an MCP stdio launch")
+        if value:
+            launcher = Path(value[0]).name.lower()
+            if launcher in {"npm", "npm.cmd", "npm.exe"}:
+                raise ValueError("use node dist/src/index.js for an MCP stdio launch")
         return value
 
 
@@ -30,6 +32,22 @@ class LocalCodexBridgeBootstrap:
 
     def __init__(self, config: LocalCodexBridgeBootstrapConfig) -> None:
         self.config = config
+
+    @classmethod
+    def from_repository(
+        cls,
+        repository_path: str | Path,
+        *,
+        node_executable: str = "node",
+    ) -> "LocalCodexBridgeBootstrap":
+        return cls(
+            LocalCodexBridgeBootstrapConfig(
+                launch_command=cls.canonical_launch_command(
+                    repository_path,
+                    node_executable=node_executable,
+                )
+            )
+        )
 
     @staticmethod
     def canonical_launch_command(

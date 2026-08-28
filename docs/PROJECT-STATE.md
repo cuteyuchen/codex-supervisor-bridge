@@ -364,7 +364,9 @@ The first implementation slice is intentionally backend-neutral and layered:
   refresh) with SecretStore-backed owner/OAuth credentials and redacted
   diagnostics;
 - Local-Codex-Bridge canonical `node <repository>/dist/src/index.js` launch
-  validation with `npm start` explicitly rejected at the stdio boundary;
+  validation with npm-family launchers explicitly rejected at the stdio
+  boundary, plus repository-driven Doctor and `start` resolution through
+  `local_codex_repository` / `executable_paths.node`;
 - fake process/provider harnesses for Profile A/B semantic comparison.
 
 The current code-level work does not claim real Windows OAuth, ChatGPT Web

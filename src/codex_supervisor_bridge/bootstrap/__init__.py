@@ -16,6 +16,10 @@ from .command_auth import (
     CommandVerdict,
     authorize_command,
 )
+from .component_registry import (
+    BUILTIN_MANIFESTS,
+    ManagedComponentRegistry,
+)
 from .configuration import (
     AppConfig,
     BasicSettings,
@@ -78,6 +82,7 @@ __all__ = [
     "BasicSettings",
     "BootstrapService",
     "BootstrapStatus",
+    "BUILTIN_MANIFESTS",
     "CommandAuthorization",
     "CommandAuthorizationPolicy",
     "CommandPolicy",
@@ -108,6 +113,7 @@ __all__ = [
     "InstallPlan",
     "InstallResult",
     "ManagedProcessSpec",
+    "ManagedComponentRegistry",
     "LocalCodexBridgeBootstrap",
     "LocalCodexBridgeBootstrapConfig",
     "MemorySecretStore",

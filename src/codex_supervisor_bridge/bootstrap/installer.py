@@ -9,9 +9,9 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ComponentManifest(BaseModel):
@@ -19,12 +19,22 @@ class ComponentManifest(BaseModel):
 
     name: str = Field(pattern=r"^[a-z0-9][a-z0-9-]*$")
     display_name: str
-    version: str
-    source: str
+    version: str = Field(pattern=r"^[0-9A-Za-z][0-9A-Za-z.+-]*$")
+    source: str = Field(pattern=r"^https://")
     source_ref: str
     checksum_sha256: str | None = None
-    install_commands: list[str] = Field(default_factory=list)
+    install_commands: list[list[str]] = Field(default_factory=list)
     requires_node: bool = False
+
+    @field_validator("install_commands")
+    @classmethod
+    def reject_shell_strings(cls, value: list[list[str]]) -> list[list[str]]:
+        for command in value:
+            if not command or not command[0].strip():
+                raise ValueError("install commands must be non-empty argv lists")
+            if any(not isinstance(part, str) for part in command):
+                raise ValueError("install commands must contain only strings")
+        return value
 
 
 class InstallPlan(BaseModel):
@@ -60,17 +70,22 @@ class ComponentInstaller:
         downloader: Callable[[str, Path], bytes] | None = None,
         runner: Callable[[list[str], Path], int] | None = None,
         max_retries: int = 3,
+        trusted_manifests: Mapping[str, ComponentManifest] | None = None,
     ) -> None:
         self.components_root = Path(components_root)
         self.components_root.mkdir(parents=True, exist_ok=True)
         self._downloader = downloader or self._default_downloader
         self._runner = runner or self._default_runner
         self.max_retries = max_retries
+        self._trusted = dict(trusted_manifests or {})
 
     def plan(self, manifest: ComponentManifest) -> InstallPlan:
+        self._assert_trusted(manifest)
         component_root = self.components_root / manifest.name
         staging_root = component_root / ".staging"
         staging_root.mkdir(parents=True, exist_ok=True)
+        self._assert_within_root(component_root)
+        self._assert_within_root(staging_root)
         return InstallPlan(
             component=manifest,
             target_dir=component_root / manifest.version,
@@ -80,8 +95,10 @@ class ComponentInstaller:
         )
 
     def install(self, manifest: ComponentManifest) -> InstallResult:
+        self._assert_trusted(manifest)
         plan = self.plan(manifest)
         component_root = self.components_root / manifest.name
+        self._assert_within_root(component_root)
         component_root.mkdir(parents=True, exist_ok=True)
         previous = self._current_version(component_root)
         last_error: str | None = None
@@ -90,17 +107,20 @@ class ComponentInstaller:
             attempts = attempt + 1
             staging = plan.staging_dir / f"{uuid.uuid4().hex}"
             staging.mkdir(parents=True)
+            self._assert_within_root(staging)
             try:
                 artifact = staging / plan.artifact_name
                 artifact.mkdir(parents=True)
                 payload = self._downloader(manifest.source, artifact)
                 if manifest.checksum_sha256:
                     self._verify_checksum(payload, manifest.checksum_sha256, manifest.name)
+                archive_path = artifact / "download"
+                archive_path.write_bytes(payload)
                 for command in manifest.install_commands:
-                    exit_code = self._runner(command, artifact)
+                    exit_code = self._runner(list(command), artifact)
                     if exit_code != 0:
                         raise RuntimeError(
-                            f"install command failed with exit code {exit_code}: {command}"
+                            f"install command failed with exit code {exit_code}"
                         )
                 os.replace(artifact, plan.target_dir)
                 self._write_current(component_root, manifest, plan.target_dir)
@@ -155,11 +175,11 @@ class ComponentInstaller:
         )
 
     @staticmethod
-    def _default_runner(command: str, cwd: Path) -> int:
+    def _default_runner(command: list[str], cwd: Path) -> int:
         result = subprocess.run(
-            command,
+            list(command),
             cwd=str(cwd),
-            shell=True,
+            shell=False,
             capture_output=True,
             text=True,
             check=False,
@@ -210,3 +230,20 @@ class ComponentInstaller:
             if os.path.exists(temporary):
                 os.unlink(temporary)
         return pointer
+
+    def _assert_trusted(self, manifest: ComponentManifest) -> None:
+        if not self._trusted:
+            return
+        trusted = self._trusted.get(manifest.name)
+        if trusted is None or trusted != manifest:
+            raise ValueError(
+                f"component {manifest.name!r} is not from the Bridge trusted registry"
+            )
+
+    def _assert_within_root(self, path: Path) -> None:
+        resolved = path.resolve()
+        root = self.components_root.resolve()
+        if resolved != root and root not in resolved.parents:
+            raise ValueError(
+                f"component path escapes the managed components root: {resolved}"
+            )

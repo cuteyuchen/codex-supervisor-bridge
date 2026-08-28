@@ -16,6 +16,7 @@ class AppDataPaths:
     runtime: Path
     config: Path
     cache: Path
+    components: Path
 
     @classmethod
     def from_environment(
@@ -45,6 +46,7 @@ class AppDataPaths:
             runtime=root / "runtime",
             config=root / "config",
             cache=root / "cache",
+            components=root / "components",
         )
 
     @property
@@ -60,5 +62,13 @@ class AppDataPaths:
         return self.config / "mcp.json"
 
     def ensure_directories(self) -> None:
-        for path in (self.root, self.data, self.logs, self.runtime, self.config, self.cache):
+        for path in (
+            self.root,
+            self.data,
+            self.logs,
+            self.runtime,
+            self.config,
+            self.cache,
+            self.components,
+        ):
             path.mkdir(parents=True, exist_ok=True)

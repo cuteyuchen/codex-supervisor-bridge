@@ -5,9 +5,11 @@ import os
 import tempfile
 from pathlib import Path
 
+from .component_registry import ManagedComponentRegistry
 from .configuration import AppConfig, ConfigStore
 from .devspace import DevSpaceBootstrap
-from .doctor import Doctor
+from .doctor import Doctor, DoctorOptions
+from .installer import ComponentInstaller
 from .models import DoctorStatus, HealthStatus, RepairAction
 from .paths import AppDataPaths
 from .ports import PortAllocator
@@ -27,6 +29,8 @@ class RepairService:
         process_manager: ProcessManager | None = None,
         port_allocator: PortAllocator | None = None,
         secret_store: SecretStore | None = None,
+        installer: ComponentInstaller | None = None,
+        registry: ManagedComponentRegistry | None = None,
     ) -> None:
         self.paths = paths or AppDataPaths.from_environment()
         self.config_store = config_store or ConfigStore(paths=self.paths)
@@ -34,6 +38,11 @@ class RepairService:
         self.process_manager = process_manager or ProcessManager(self.paths.runtime, self.paths.logs)
         self.port_allocator = port_allocator or PortAllocator()
         self.secret_store = secret_store or self._default_secret_store()
+        self.registry = registry or ManagedComponentRegistry()
+        self.installer = installer or ComponentInstaller(
+            self.paths.components,
+            trusted_manifests=self.registry.manifests(),
+        )
 
     def repair(self, status: DoctorStatus | None = None, *, project_directory: Path | None = None) -> list[RepairAction]:
         status = status or self.doctor.run()
@@ -95,7 +104,52 @@ class RepairService:
                 actions.append(RepairAction(action=f"repair_process:{process.name}", status=HealthStatus.DEGRADED, message="A process may still be running; inspect before restarting.", requires_user_action=True, advanced=process.as_dict()))
         if project is None:
             actions.append(RepairAction(action="select_project_directory", status=HealthStatus.DEGRADED, message="Select a project directory to continue.", requires_user_action=True))
+        actions.extend(self._component_install_plans(status, project_directory=project_directory))
         return actions
+
+    def _component_install_plans(
+        self,
+        status: DoctorStatus,
+        *,
+        project_directory: Path | None,
+    ) -> list[RepairAction]:
+        actions: list[RepairAction] = []
+        node_required = self.doctor.run(
+            DoctorOptions(
+                project_directory=project_directory,
+                require_node=True,
+                check_optional_components=False,
+            )
+        )
+        node_item = node_required.component("Node.js")
+        if node_item is not None and node_item.status != HealthStatus.READY:
+            actions.append(self._install_action("nodejs", node_item))
+        for name, label in (
+            ("devspace", "Local workspace"),
+            ("local-codex-bridge", "Codex control"),
+        ):
+            item = status.component(label)
+            if item is None or item.status == HealthStatus.READY:
+                continue
+            actions.append(self._install_action(name, item))
+        return actions
+
+    def _install_action(
+        self,
+        name: str,
+        component: object,
+    ) -> RepairAction:
+        plan = self.installer.plan(self.registry.manifest(name))
+        return RepairAction(
+            action=f"install_component:{name}",
+            status=getattr(component, "status"),
+            message=str(getattr(component, "user_message")),
+            requires_user_action=True,
+            advanced={
+                "install_plan": plan.model_dump(mode="json"),
+                "verification_strategy": self.registry.verification_strategy(name),
+            },
+        )
 
     def _write_mcp_config(self, config: AppConfig) -> None:
         port = config.advanced.ports.get("supervisor")

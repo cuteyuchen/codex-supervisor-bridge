@@ -1,21 +1,45 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel, Field
+
+from codex_supervisor_bridge.backends.models import (
+    BackendHealth,
+    BackendHealthStatus,
+)
 from codex_supervisor_bridge.backends.workspace import WorkspaceBackend
 from codex_supervisor_bridge.memory.service import MemoryService
 
 from .agent_execution import AgentExecutionCoordinator
 from .agent_facade import AgentSupervisorFacade
-from .agent_session import AgentSessionManager
+from .agent_session import AgentSessionManager, SessionRecoveryOutcome
 from .checkpoints import CheckpointService
 
 WorkspaceAdapterFactory = Callable[[], AbstractAsyncContextManager[WorkspaceBackend]]
+READINESS_PROBE_TIMEOUT_SECONDS = 15.0
+
+
+class ProfileReadiness(BaseModel):
+    """Combined workspace + agent + Codex + startup-recovery readiness."""
+
+    profile: str
+    status: str
+    workspace_backend: str
+    agent_backend: str
+    workspace_status: str
+    agent_status: str
+    codex_status: str
+    recovery_outcomes: list[SessionRecoveryOutcome] = Field(default_factory=list)
+    startup_blockers: list[str] = Field(default_factory=list)
+    requires_user_action: bool = False
+    reason: str = ""
 
 
 @dataclass
@@ -34,6 +58,8 @@ class RuntimeComposition:
     session_manager: AgentSessionManager | None = None
     checkpoint_service: CheckpointService | None = None
     delivery_backend: str = "github"
+    started: bool = False
+    recovery_outcomes: list[SessionRecoveryOutcome] = field(default_factory=list)
 
     @classmethod
     def profile_b(
@@ -87,6 +113,7 @@ class RuntimeComposition:
         *,
         adapter_factory: Callable[[], Any],
         workspace_factory: WorkspaceAdapterFactory | None = None,
+        kandev_adapter_factory: Callable[[], Any] | None = None,
         delivery_backend: str = "github",
     ) -> "RuntimeComposition":
         from codex_supervisor_bridge.integrations.agent_backends import (
@@ -106,7 +133,8 @@ class RuntimeComposition:
             profile="existing",
             workspace_backend="kandev",
             agent_backend="control_plane",
-            workspace_factory=workspace_factory or cls._default_devspace_workspace_factory(),
+            workspace_factory=workspace_factory
+            or cls._default_kandev_workspace_factory(kandev_adapter_factory),
             agent_coordinator=coordinator,
             session_manager=session,
             checkpoint_service=checkpoints,
@@ -120,6 +148,100 @@ class RuntimeComposition:
         )
 
         return lambda: DevSpaceWorkspaceAdapter()
+
+    @staticmethod
+    def _default_kandev_workspace_factory(
+        kandev_adapter_factory: Callable[[], Any] | None,
+    ) -> WorkspaceAdapterFactory:
+        from codex_supervisor_bridge.integrations.kandev_client import KandevAdapter
+        from codex_supervisor_bridge.integrations.kandev_workspace import (
+            KandevWorkspaceBackend,
+        )
+
+        adapter_factory = kandev_adapter_factory or (lambda: KandevAdapter())
+        return lambda: KandevWorkspaceBackend(adapter_factory)
+
+    async def start(self) -> list[SessionRecoveryOutcome]:
+        """Start persistent owned resources and run startup recovery before READY."""
+        if self.started:
+            return list(self.recovery_outcomes)
+        if self.session_manager is not None:
+            self.recovery_outcomes = await self.session_manager.start()
+        self.started = True
+        return list(self.recovery_outcomes)
+
+    async def shutdown(self) -> None:
+        """Stop owned resources; safe to call more than once."""
+        if self.session_manager is not None:
+            await self.session_manager.shutdown()
+        self.started = False
+
+    async def readiness(self) -> ProfileReadiness:
+        """Probe workspace and agent capabilities after startup recovery."""
+        recovery = list(self.recovery_outcomes)
+        if self.session_manager is not None:
+            agent_health = await self.session_manager.health()
+        else:
+            agent_health = BackendHealth(
+                capability=self.agent_backend,
+                status=BackendHealthStatus.UNAVAILABLE,
+                user_message="Codex control is not connected.",
+                repairable=True,
+                technical_detail="no AgentSessionManager is composed",
+            )
+
+        try:
+            workspace_health = await asyncio.wait_for(
+                self._probe_workspace(),
+                timeout=READINESS_PROBE_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            workspace_health = BackendHealth(
+                capability=self.workspace_backend,
+                status=BackendHealthStatus.UNAVAILABLE,
+                user_message="Local workspace is not ready.",
+                repairable=True,
+                technical_detail="workspace readiness probe failed",
+            )
+
+        blockers = [
+            f"{outcome.task_id}: {outcome.status} - {outcome.detail}"
+            for outcome in recovery
+            if outcome.status == "RECONCILIATION_REQUIRED"
+        ]
+        status = self._combined_status(workspace_health.status, agent_health.status)
+        if blockers:
+            status = BackendHealthStatus.DEGRADED
+        return ProfileReadiness(
+            profile=self.profile,
+            status=status.value,
+            workspace_backend=self.workspace_backend,
+            agent_backend=self.agent_backend,
+            workspace_status=workspace_health.status.value,
+            agent_status=agent_health.status.value,
+            codex_status=agent_health.status.value,
+            recovery_outcomes=recovery,
+            startup_blockers=blockers,
+            requires_user_action=status != BackendHealthStatus.READY or bool(blockers),
+            reason=(
+                "startup reconciliation blocks PROFILE_READY"
+                if blockers
+                else "combined workspace and agent readiness"
+            ),
+        )
+
+    async def _probe_workspace(self) -> BackendHealth:
+        async with self.workspace_factory() as adapter:
+            return await adapter.health()
+
+    @staticmethod
+    def _combined_status(*statuses: BackendHealthStatus) -> BackendHealthStatus:
+        rank = {
+            BackendHealthStatus.READY: 0,
+            BackendHealthStatus.DEGRADED: 1,
+            BackendHealthStatus.UNAVAILABLE: 2,
+        }
+        return max(statuses, key=lambda status: rank[status])
 
     def agent_facade(self, memory: MemoryService) -> AgentSupervisorFacade:
         return AgentSupervisorFacade(

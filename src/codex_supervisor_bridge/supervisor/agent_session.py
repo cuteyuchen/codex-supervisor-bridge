@@ -72,6 +72,7 @@ class AgentSessionManager:
         self.session_count = 0
         self.shutdown_count = 0
         self.reconnect_count = 0
+        self.recovery_outcomes: list[SessionRecoveryOutcome] = []
         self._lock = asyncio.Lock()
 
     @property
@@ -88,17 +89,18 @@ class AgentSessionManager:
         if self._backend is None:
             await self.start()
 
-    async def start(self) -> None:
+    async def start(self) -> list[SessionRecoveryOutcome]:
         async with self._lock:
             if self._backend is not None:
-                return
+                return list(self.recovery_outcomes)
             backend = self._backend_factory()
             enter = getattr(backend, "__aenter__", None)
             if enter is not None:
                 await enter()
             self._backend = backend
             self.session_count += 1
-            await self._recover_active_runtimes()
+            self.recovery_outcomes = await self._recover_active_runtimes()
+            return list(self.recovery_outcomes)
 
     async def shutdown(self) -> None:
         async with self._lock:
@@ -354,4 +356,5 @@ class AgentSessionManager:
             "session_count": self.session_count,
             "shutdown_count": self.shutdown_count,
             "reconnect_count": self.reconnect_count,
+            "recovery_outcomes": [outcome.model_dump(mode="json") for outcome in self.recovery_outcomes],
         }

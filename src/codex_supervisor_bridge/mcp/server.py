@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import ipaddress
 import json
 import sys
 from pathlib import Path
 
+import anyio
 from mcp.server import MCPServer
 
 from codex_supervisor_bridge import __version__
+from codex_supervisor_bridge.backends.models import BackendHealth, BackendHealthStatus
 from codex_supervisor_bridge.bootstrap import BootstrapService, CommandPolicy, DevelopmentStyle
 from codex_supervisor_bridge.bootstrap.configuration import ConfigStore
 from codex_supervisor_bridge.bootstrap.devspace_auth import DevSpaceLocalOAuthDriver
+from codex_supervisor_bridge.bootstrap.doctor import DoctorOptions
 from codex_supervisor_bridge.bootstrap.paths import AppDataPaths
 from codex_supervisor_bridge.bootstrap.secrets import MemorySecretStore, WindowsDpapiSecretStore
 from codex_supervisor_bridge.config import Settings
@@ -30,10 +32,12 @@ from codex_supervisor_bridge.supervisor.agent_facade import (
 from codex_supervisor_bridge.supervisor.checkpoints import CheckpointService
 from codex_supervisor_bridge.supervisor.direct_workspace import DirectWorkspaceCoordinator
 from codex_supervisor_bridge.supervisor.runtime import (
+    ProfileReadiness,
     RuntimeComposition,
     lcb_environment,
     lcb_launch_from_config,
 )
+from codex_supervisor_bridge.supervisor.runtime_resolver import RuntimeResolver
 
 from .checkpoint_tools import register_checkpoint_tools
 from .codex_tools import register_codex_tools
@@ -41,8 +45,6 @@ from .direct_workspace_tools import register_direct_workspace_tools
 from .execution_tools import register_execution_tools
 from .kandev_tools import register_kandev_tools
 from .tools import register_memory_tools
-
-READINESS_PROBE_TIMEOUT_SECONDS = 15.0
 
 SERVER_INSTRUCTIONS = """
 You are connected to Codex Supervisor Bridge, the durable task memory and
@@ -316,15 +318,18 @@ def main(argv: list[str] | None = None) -> None:
             ),
         )
 
-    kandev = KandevCoordinator(
-        service,
-        lambda: KandevAdapter(args.kandev_mcp_url),
-    )
-    direct_workspace = DirectWorkspaceCoordinator(
-        service,
-        authenticated_devspace_factory,
-    )
     config = ConfigStore(paths=app_paths).load().config
+    bootstrap = BootstrapService(
+        paths=app_paths,
+        config_store=ConfigStore(paths=app_paths),
+    )
+    doctor = bootstrap.doctor.run(
+        DoctorOptions(project_directory=config.basic.project_directory)
+    )
+    selection = RuntimeResolver(
+        _doctor_health(doctor),
+        development_style=config.basic.development_style.value,
+    ).resolve()
     launch_command: list[str] | None = None
     repository = config.advanced.local_codex_repository
     if repository is not None:
@@ -335,7 +340,7 @@ def main(argv: list[str] | None = None) -> None:
             )
         except FileNotFoundError:
             launch_command = None
-    if launch_command:
+    if selection.profile == "lightweight" and launch_command:
         composition = RuntimeComposition.profile_b(
             service,
             launch_command=launch_command,
@@ -349,55 +354,86 @@ def main(argv: list[str] | None = None) -> None:
                 args.codex_control_command,
                 env={"CODEX_MCP_EXECUTION_MODE": "client"},
             ),
-            workspace_factory=authenticated_devspace_factory,
+            kandev_adapter_factory=lambda: KandevAdapter(args.kandev_mcp_url),
         )
-    facade = composition.agent_facade(service)
-    server = create_mcp_server(
+    kandev = KandevCoordinator(
         service,
-        kandev=kandev,
-        agent_facade=facade,
-        checkpoints=composition.checkpoint_service,
-        direct_workspace=direct_workspace,
+        lambda: KandevAdapter(args.kandev_mcp_url),
     )
-    _emit_readiness_marker(composition)
-    try:
-        if args.transport == "stdio":
-            server.run(transport="stdio")
-        else:
-            server.run(
-                transport="streamable-http",
-                host=args.host,
-                port=args.port,
-                streamable_http_path=args.mcp_path,
-                json_response=True,
-                stateless_http=True,
-            )
-    finally:
-        service.close()
+    direct_workspace = DirectWorkspaceCoordinator(
+        service,
+        composition.workspace_factory,
+        backend_name=composition.workspace_backend,
+    )
 
-
-def _emit_readiness_marker(composition: RuntimeComposition) -> None:
-    """Print one bounded readiness line for the bootstrap start gate."""
-
-    async def probe() -> str:
-        if composition.session_manager is not None:
-            try:
-                health = await composition.session_manager.probe_health()
-            except Exception:
-                return "UNAVAILABLE"
-            return health.status.value
-        return "UNAVAILABLE"
-
-    try:
-        status = asyncio.run(
-            asyncio.wait_for(probe(), timeout=READINESS_PROBE_TIMEOUT_SECONDS)
+    async def serve() -> None:
+        await composition.start()
+        readiness = await composition.readiness()
+        _emit_readiness_marker(readiness)
+        facade = composition.agent_facade(service)
+        server = create_mcp_server(
+            service,
+            kandev=kandev,
+            agent_facade=facade,
+            checkpoints=composition.checkpoint_service,
+            direct_workspace=direct_workspace,
         )
-    except (asyncio.TimeoutError, TimeoutError):
-        status = "UNAVAILABLE"
+        try:
+            if args.transport == "stdio":
+                await server.run_stdio_async()
+            else:
+                await server.run_streamable_http_async(
+                    host=args.host,
+                    port=args.port,
+                    streamable_http_path=args.mcp_path,
+                    json_response=True,
+                    stateless_http=True,
+                )
+        finally:
+            await composition.shutdown()
+            service.close()
+
+    anyio.run(serve)
+
+
+def _doctor_health(doctor: object) -> dict[str, BackendHealth]:
+    """Map Doctor components onto provider-neutral capability health."""
+    from codex_supervisor_bridge.bootstrap.models import HealthStatus
+
+    aliases = {
+        "devspace": "Local workspace",
+        "local_codex_bridge": "Codex control",
+        "kandev": "Fallback workspace",
+        "control_plane": "Fallback control",
+        "github": "GitHub",
+    }
+    result: dict[str, BackendHealth] = {}
+    for name, label in aliases.items():
+        item = doctor.component(label)
+        if item is None:
+            continue
+        mapped = {
+            HealthStatus.READY: BackendHealthStatus.READY,
+            HealthStatus.DEGRADED: BackendHealthStatus.DEGRADED,
+            HealthStatus.UNAVAILABLE: BackendHealthStatus.UNAVAILABLE,
+            HealthStatus.REPAIRING: BackendHealthStatus.DEGRADED,
+        }[item.status]
+        result[name] = BackendHealth(
+            capability=name,
+            status=mapped,
+            user_message=item.user_message,
+            repairable=item.repairable,
+            technical_detail=str(item.advanced.get("technical_detail", "")),
+        )
+    return result
+
+
+def _emit_readiness_marker(readiness: ProfileReadiness) -> None:
+    """Print one bounded readiness line for the bootstrap start gate."""
     print(
-        f"SUPERVISOR_READY status={status} profile={composition.profile} "
-        f"workspace_backend={composition.workspace_backend} "
-        f"agent_backend={composition.agent_backend}",
+        f"SUPERVISOR_READY status={readiness.status} profile={readiness.profile} "
+        f"workspace_backend={readiness.workspace_backend} "
+        f"agent_backend={readiness.agent_backend}",
         file=sys.stderr,
         flush=True,
     )

@@ -395,7 +395,9 @@ The first implementation slice is intentionally backend-neutral and layered:
   are covered by fake tests (154 tests locally on Python 3.12/3.13).
 - RepairService recovers invalid configuration from DEGRADED to safe defaults,
   and the `doctor` CLI emits structured UX JSON without provider, SQLite, or
-  backend names (156 tests locally on Python 3.12/3.13).
+  backend names. Doctor reports a stopped Supervisor Bridge as repairable
+  `start_supervisor` instead of falsely showing it as READY (157 tests locally
+  on Python 3.12/3.13).
 
 The current code-level work does not claim real Windows OAuth, ChatGPT Web
 Remote MCP attachment, tunnel-provider login, or authenticated Codex runtime

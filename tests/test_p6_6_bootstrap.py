@@ -965,6 +965,34 @@ def test_doctor_marks_crashed_supervisor_repairable(tmp_path: Path) -> None:
     assert supervisor.advanced["status"] == "CRASHED"
 
 
+def test_doctor_marks_stopped_supervisor_needing_start(tmp_path: Path) -> None:
+    class StoppedProcessManager:
+        def health(self, name: str) -> ProcessState:
+            return ProcessState(name, "STOPPED")
+
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        return subprocess.CompletedProcess(command, 0, "ok\n", "")
+
+    status = Doctor(
+        paths=paths,
+        command_runner=runner,
+        process_manager=StoppedProcessManager(),
+    ).run(DoctorOptions(check_optional_components=False))
+    supervisor = status.component("Supervisor Bridge")
+
+    assert supervisor is not None
+    assert supervisor.status == HealthStatus.DEGRADED
+    assert supervisor.repairable is True
+    assert supervisor.recommended_action == "start_supervisor"
+    assert supervisor.user_message == "Development environment needs to start."
+
+
 def test_bootstrap_user_view_hides_internal_repair_names(tmp_path: Path) -> None:
     paths = AppDataPaths.from_environment(
         environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},

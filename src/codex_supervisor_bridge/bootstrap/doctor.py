@@ -126,13 +126,20 @@ class Doctor:
 
     def _supervisor(self) -> ComponentHealth:
         process = self._process_manager.health("supervisor") if self._process_manager else None
-        if process and process.status in {"CRASHED", "STALE", "UNKNOWN"}:
+        if process is not None and process.status != "RUNNING":
+            crashed = process.status in {"CRASHED", "STALE", "UNKNOWN"}
             return ComponentHealth(
                 capability="Supervisor Bridge",
                 status=HealthStatus.DEGRADED,
                 repairable=True,
-                user_message="Development environment needs a restart.",
-                recommended_action="restart_supervisor",
+                user_message=(
+                    "Development environment needs a restart."
+                    if crashed
+                    else "Development environment needs to start."
+                ),
+                recommended_action=(
+                    "restart_supervisor" if crashed else "start_supervisor"
+                ),
                 advanced=process.as_dict(),
             )
         return ComponentHealth(

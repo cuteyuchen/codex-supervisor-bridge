@@ -8,6 +8,33 @@ from pydantic import BaseModel
 from .models import Actor, EventType, TaskMemory, TaskPhase, utcnow
 from .store import MemoryStore, _dt, _iso
 
+ACTIVE_RUNTIME_STATUSES = frozenset(
+    {
+        "planning",
+        "executing",
+        "running",
+        "inprogress",
+        "in_progress",
+        "started",
+    }
+)
+PLAN_RUNTIME_STATUSES = frozenset({"planning"})
+EXECUTION_RUNTIME_STATUSES = frozenset(
+    ACTIVE_RUNTIME_STATUSES - PLAN_RUNTIME_STATUSES
+)
+
+
+def is_plan_runtime(status: str | None) -> bool:
+    return (status or "").strip().lower() in PLAN_RUNTIME_STATUSES
+
+
+def is_execution_runtime(status: str | None) -> bool:
+    return (status or "").strip().lower() in EXECUTION_RUNTIME_STATUSES
+
+
+def is_active_runtime(status: str | None) -> bool:
+    return (status or "").strip().lower() in ACTIVE_RUNTIME_STATUSES
+
 
 class CodexRuntimeState(BaseModel):
     task_id: str

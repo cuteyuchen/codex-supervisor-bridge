@@ -17,7 +17,7 @@ from codex_supervisor_bridge.integrations.local_codex_bridge_client import (
 from codex_supervisor_bridge.memory.agent_safety import get_agent_safety
 from codex_supervisor_bridge.memory.backend_binding import bind_task_backend
 from codex_supervisor_bridge.memory.codex_runtime import bind_codex_runtime
-from codex_supervisor_bridge.memory.execution import acquire_writer
+from codex_supervisor_bridge.memory.execution import acquire_writer, get_execution_state
 from codex_supervisor_bridge.memory.models import ActiveWriter, EventType, TaskPhase
 from codex_supervisor_bridge.memory.service import MemoryService
 from codex_supervisor_bridge.supervisor.agent_session import AgentSessionManager
@@ -286,6 +286,245 @@ def test_recovery_is_scoped_to_current_composition_binding(tmp_path: Path) -> No
         assert agent.resume_calls == 0
     finally:
         asyncio.run(session.shutdown())
+        reopened.close()
+
+
+def test_plan_mode_restart_resumes_planning_runtime_without_writer(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "plan-restart.db"
+    memory = MemoryService(database)
+    try:
+        task = memory.create_task("PLAN-RESTART", "Plan", repository="C:/repo")
+        bind_task_backend(
+            memory.store,
+            task.task_id,
+            task.revision,
+            workspace_backend="devspace",
+            agent_backend="local_codex_bridge",
+            profile="lightweight",
+        )
+        task = memory.get_task(task.task_id)
+        bind_codex_runtime(
+            memory.store,
+            task.task_id,
+            task.revision,
+            event_type=EventType.CODEX_STARTED,
+            workflow_id="wf-plan",
+            operation_id="op-plan",
+            thread_id="thread-plan",
+            turn_id="turn-plan",
+            remote_status="planning",
+        )
+    finally:
+        memory.close()
+
+    reopened = MemoryService(database)
+    server, state = fake_bridge(resumable=True)
+    session = AgentSessionManager(
+        reopened,
+        lambda: LocalCodexBridgeAgentBackend(server),
+        profile="lightweight",
+        workspace_backend="devspace",
+        agent_backend="local_codex_bridge",
+    )
+    try:
+        async def scenario() -> None:
+            try:
+                outcomes = await session.start()
+                assert [outcome.status for outcome in outcomes] == ["RESUMED"]
+                assert get_agent_safety(reopened.store, "PLAN-RESTART") is None
+            finally:
+                await session.shutdown()
+
+        asyncio.run(scenario())
+        assert [call[0] for call in state["calls"]].count("observe") == 1
+    finally:
+        reopened.close()
+
+
+def test_plan_mode_restart_preserves_chatgpt_writer(tmp_path: Path) -> None:
+    database = tmp_path / "plan-chatgpt-restart.db"
+    memory = MemoryService(database)
+    try:
+        task = memory.create_task(
+            "PLAN-CHATGPT",
+            "Plan while ChatGPT writes",
+            repository="C:/repo",
+        )
+        acquired = acquire_writer(
+            memory.store,
+            task.task_id,
+            task.revision,
+            ActiveWriter.CHATGPT,
+        )
+        bind_task_backend(
+            memory.store,
+            task.task_id,
+            acquired.task.revision,
+            workspace_backend="devspace",
+            agent_backend="local_codex_bridge",
+            profile="lightweight",
+        )
+        task = memory.get_task(task.task_id)
+        bind_codex_runtime(
+            memory.store,
+            task.task_id,
+            task.revision,
+            event_type=EventType.CODEX_STARTED,
+            workflow_id="wf-plan-chatgpt",
+            operation_id="op-plan-chatgpt",
+            thread_id="thread-plan-chatgpt",
+            turn_id="turn-plan-chatgpt",
+            remote_status="planning",
+        )
+        expected_epoch = acquired.execution.writer_epoch
+    finally:
+        memory.close()
+
+    reopened = MemoryService(database)
+    server, state = fake_bridge(resumable=True)
+    session = AgentSessionManager(
+        reopened,
+        lambda: LocalCodexBridgeAgentBackend(server),
+        profile="lightweight",
+        workspace_backend="devspace",
+        agent_backend="local_codex_bridge",
+    )
+    try:
+        async def scenario() -> None:
+            try:
+                outcomes = await session.start()
+                assert [outcome.status for outcome in outcomes] == ["RESUMED"]
+            finally:
+                await session.shutdown()
+
+        asyncio.run(scenario())
+        execution = get_execution_state(reopened.store, "PLAN-CHATGPT")
+        assert execution.active_writer == ActiveWriter.CHATGPT
+        assert execution.writer_epoch == expected_epoch
+        assert [call[0] for call in state["calls"]].count("observe") == 1
+    finally:
+        reopened.close()
+
+
+def test_plan_mode_restart_unknown_resume_fails_closed(tmp_path: Path) -> None:
+    database = tmp_path / "plan-unknown-restart.db"
+    memory = MemoryService(database)
+    try:
+        task = memory.create_task("PLAN-UNKNOWN", "Plan", repository="C:/repo")
+        bind_task_backend(
+            memory.store,
+            task.task_id,
+            task.revision,
+            workspace_backend="devspace",
+            agent_backend="local_codex_bridge",
+            profile="lightweight",
+        )
+        task = memory.get_task(task.task_id)
+        bind_codex_runtime(
+            memory.store,
+            task.task_id,
+            task.revision,
+            event_type=EventType.CODEX_STARTED,
+            workflow_id="wf-plan-unknown",
+            operation_id="op-plan-unknown",
+            thread_id="thread-plan-unknown",
+            turn_id="turn-plan-unknown",
+            remote_status="planning",
+        )
+    finally:
+        memory.close()
+
+    reopened = MemoryService(database)
+    server, state = fake_bridge(resumable=False)
+    session = AgentSessionManager(
+        reopened,
+        lambda: LocalCodexBridgeAgentBackend(server),
+        profile="lightweight",
+        workspace_backend="devspace",
+        agent_backend="local_codex_bridge",
+    )
+    try:
+        async def scenario() -> None:
+            try:
+                outcomes = await session.start()
+                assert [outcome.status for outcome in outcomes] == [
+                    "RECONCILIATION_REQUIRED"
+                ]
+            finally:
+                await session.shutdown()
+
+        asyncio.run(scenario())
+        safety = get_agent_safety(reopened.store, "PLAN-UNKNOWN")
+        assert safety is not None
+        assert safety.state == "RECONCILIATION_REQUIRED"
+        assert [call[0] for call in state["calls"]].count("observe") == 1
+    finally:
+        reopened.close()
+
+
+def test_execution_restart_requires_current_codex_writer_lease(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "execution-writer-fence.db"
+    memory = MemoryService(database)
+    try:
+        task = memory.create_task("EXEC-FENCE", "Execution", repository="C:/repo")
+        acquired = acquire_writer(
+            memory.store,
+            task.task_id,
+            task.revision,
+            ActiveWriter.CHATGPT,
+        )
+        bind_task_backend(
+            memory.store,
+            task.task_id,
+            acquired.task.revision,
+            workspace_backend="devspace",
+            agent_backend="local_codex_bridge",
+            profile="lightweight",
+        )
+        task = memory.get_task(task.task_id)
+        bind_codex_runtime(
+            memory.store,
+            task.task_id,
+            task.revision,
+            event_type=EventType.CODEX_STARTED,
+            workflow_id="wf-exec-fence",
+            operation_id="op-exec-fence",
+            thread_id="thread-exec-fence",
+            turn_id="turn-exec-fence",
+            remote_status="executing",
+        )
+    finally:
+        memory.close()
+
+    reopened = MemoryService(database)
+    server, state = fake_bridge(resumable=True)
+    session = AgentSessionManager(
+        reopened,
+        lambda: LocalCodexBridgeAgentBackend(server),
+        profile="lightweight",
+        workspace_backend="devspace",
+        agent_backend="local_codex_bridge",
+    )
+    try:
+        async def scenario() -> None:
+            try:
+                outcomes = await session.start()
+                assert [outcome.status for outcome in outcomes] == [
+                    "RECONCILIATION_REQUIRED"
+                ]
+            finally:
+                await session.shutdown()
+
+        asyncio.run(scenario())
+        safety = get_agent_safety(reopened.store, "EXEC-FENCE")
+        assert safety is not None
+        assert safety.state == "RECONCILIATION_REQUIRED"
+        assert state["calls"] == []
+    finally:
         reopened.close()
 
 

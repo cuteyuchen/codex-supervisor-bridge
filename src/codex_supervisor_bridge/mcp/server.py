@@ -25,7 +25,7 @@ from codex_supervisor_bridge.integrations.devspace_client import DevSpaceWorkspa
 from codex_supervisor_bridge.integrations.kandev_client import KandevAdapter
 from codex_supervisor_bridge.integrations.kandev_coordinator import KandevCoordinator
 from codex_supervisor_bridge.memory.backend_binding import (
-    list_active_task_backend_bindings,
+    list_runtime_affinity_bindings,
 )
 from codex_supervisor_bridge.memory.service import MemoryService
 from codex_supervisor_bridge.supervisor.agent_facade import (
@@ -441,8 +441,8 @@ def _doctor_health(doctor: object) -> dict[str, BackendHealth]:
 
 
 def _resolve_startup_binding(service: MemoryService):
-    """Force one active task binding, or fail closed on conflicting bindings."""
-    active_bindings = list_active_task_backend_bindings(service.store)
+    """Force one runtime-affinity binding, or fail closed on conflicts."""
+    active_bindings = list_runtime_affinity_bindings(service.store)
     distinct_bindings = {
         (
             binding.workspace_backend,

@@ -577,3 +577,175 @@ def test_startup_uses_persisted_active_binding_not_healthier_profile() -> None:
         assert selection.status == "UNAVAILABLE"
     finally:
         memory.close()
+
+
+def test_plan_mode_binding_forced_even_when_profile_a_healthier() -> None:
+    memory = MemoryService()
+    try:
+        task = memory.create_task("PLAN-BOUND", "Plan", repository="C:/repo")
+        bind_task_backend(
+            memory.store,
+            task.task_id,
+            task.revision,
+            workspace_backend="devspace",
+            agent_backend="local_codex_bridge",
+            profile="lightweight",
+        )
+        task = memory.get_task(task.task_id)
+        bind_codex_runtime(
+            memory.store,
+            task.task_id,
+            task.revision,
+            event_type=EventType.CODEX_STARTED,
+            workflow_id="wf-plan-bound",
+            operation_id="op-plan-bound",
+            thread_id="thread-plan-bound",
+            turn_id="turn-plan-bound",
+            remote_status="planning",
+        )
+
+        forced = _resolve_startup_binding(memory)
+        assert forced is not None
+        assert forced.profile == "lightweight"
+        health = {
+            "devspace": _health("devspace", BackendHealthStatus.DEGRADED),
+            "local_codex_bridge": _health(
+                "local_codex_bridge",
+                BackendHealthStatus.DEGRADED,
+            ),
+            "codex": _health("codex", BackendHealthStatus.DEGRADED),
+            "kandev": _health("kandev"),
+            "control_plane": _health("control_plane"),
+        }
+        selection = RuntimeResolver(health, task_binding=forced).resolve()
+        assert selection.profile == "lightweight"
+        assert selection.binding_forced is True
+        assert selection.fallback_allowed is False
+        assert selection.status == "DEGRADED"
+    finally:
+        memory.close()
+
+
+def test_conflicting_plan_and_execution_runtime_bindings_fail_closed() -> None:
+    memory = MemoryService()
+    try:
+        task = memory.create_task(
+            "CONFLICT-PLAN",
+            "Planning",
+            repository="C:/repo",
+        )
+        bind_task_backend(
+            memory.store,
+            task.task_id,
+            task.revision,
+            workspace_backend="devspace",
+            agent_backend="local_codex_bridge",
+            profile="lightweight",
+        )
+        task = memory.get_task(task.task_id)
+        bind_codex_runtime(
+            memory.store,
+            task.task_id,
+            task.revision,
+            event_type=EventType.CODEX_STARTED,
+            workflow_id="wf-conflict-plan",
+            operation_id="op-conflict-plan",
+            thread_id="thread-conflict-plan",
+            turn_id="turn-conflict-plan",
+            remote_status="planning",
+        )
+
+        task = memory.create_task(
+            "CONFLICT-EXEC",
+            "Executing",
+            repository="C:/repo",
+        )
+        acquired = acquire_writer(
+            memory.store,
+            task.task_id,
+            task.revision,
+            ActiveWriter.CODEX,
+            explicit_user_authorization=True,
+        )
+        bind_task_backend(
+            memory.store,
+            task.task_id,
+            acquired.task.revision,
+            workspace_backend="kandev",
+            agent_backend="control_plane",
+            profile="existing",
+        )
+        task = memory.get_task(task.task_id)
+        bind_codex_runtime(
+            memory.store,
+            task.task_id,
+            task.revision,
+            event_type=EventType.CODEX_STARTED,
+            workflow_id="wf-conflict-exec",
+            operation_id="op-conflict-exec",
+            thread_id="thread-conflict-exec",
+            turn_id="turn-conflict-exec",
+            remote_status="executing",
+        )
+
+        with pytest.raises(RuntimeError, match="STARTUP_RECONCILIATION_REQUIRED"):
+            _resolve_startup_binding(memory)
+    finally:
+        memory.close()
+
+
+def test_plan_mode_unknown_resume_latches_before_ready(tmp_path: Path) -> None:
+    database = tmp_path / "plan-recovery.db"
+    memory = MemoryService(database)
+    try:
+        task = memory.create_task("PLAN-REC", "Plan", repository="C:/repo")
+        bind_task_backend(
+            memory.store,
+            task.task_id,
+            task.revision,
+            workspace_backend="devspace",
+            agent_backend="local_codex_bridge",
+            profile="lightweight",
+        )
+        task = memory.get_task(task.task_id)
+        bind_codex_runtime(
+            memory.store,
+            task.task_id,
+            task.revision,
+            event_type=EventType.CODEX_STARTED,
+            workflow_id="wf-plan-rec",
+            operation_id="op-plan-rec",
+            thread_id="thread-plan-rec",
+            turn_id="turn-plan-rec",
+            remote_status="planning",
+        )
+    finally:
+        memory.close()
+
+    reopened = MemoryService(database)
+    agent = StartupFakeAgent(
+        resume_status="unknown",
+        resume_reconciliation=True,
+    )
+    try:
+        composition, session = _composition_b(reopened, agent=agent)
+
+        async def scenario() -> None:
+            outcomes = await composition.start()
+            readiness = await composition.readiness()
+            assert any(
+                outcome.status == "RECONCILIATION_REQUIRED"
+                for outcome in outcomes
+            )
+            assert readiness.startup_blockers
+            assert readiness.status == "DEGRADED"
+            safety = get_agent_safety(reopened.store, "PLAN-REC")
+            assert safety is not None
+            assert safety.state == AgentSafetyState.RECONCILIATION_REQUIRED
+            await composition.shutdown()
+
+        asyncio.run(scenario())
+        assert session.shutdown_count == 1
+        assert agent.resume_calls == 1
+    finally:
+        reopened.close()

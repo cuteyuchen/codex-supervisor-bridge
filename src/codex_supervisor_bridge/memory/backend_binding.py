@@ -5,6 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from .codex_runtime import ACTIVE_RUNTIME_STATUSES, is_active_runtime
 from .errors import ConflictError
 from .models import Actor, EventType, TaskMemory, utcnow
 from .store import MemoryStore, _dt, _iso
@@ -47,21 +48,70 @@ def get_task_backend_binding(
     return _binding_from_row(row) if row is not None else None
 
 
-def list_active_task_backend_bindings(
+def _runtime_affinity_conditions() -> tuple[str, tuple[str, ...]]:
+    """WHERE conditions selecting tasks whose runtime cannot change backend."""
+    statuses = tuple(sorted(ACTIVE_RUNTIME_STATUSES))
+    placeholders = ", ".join("?" for _ in statuses)
+    return (
+        "e.active_writer <> 'NONE'"
+        f" OR LOWER(r.remote_status) IN ({placeholders})"
+        " OR s.state <> 'NONE'"
+        " OR EXISTS ("
+        "  SELECT 1 FROM direct_workspace_operations d"
+        "  WHERE d.task_id = e.task_id AND d.status = 'PREPARED'"
+        " )"
+        " OR EXISTS ("
+        "  SELECT 1 FROM direct_command_sessions c"
+        "  WHERE c.task_id = e.task_id AND c.status = 'RUNNING'"
+        " )",
+        statuses,
+    )
+
+
+def list_runtime_affinity_bindings(
     store: MemoryStore,
 ) -> list[TaskBackendBinding]:
-    """Return backend bindings for tasks that still hold a writer lease."""
+    """Return bindings for tasks that must keep their backend at startup.
+
+    Runtime affinity is not the same as writer ownership: a read-only Codex
+    plan with no writer, an active CHATGPT writer with a planning runtime, or
+    an unresolved agent safety latch all require the same backend binding on
+    restart. Only bound tasks appear here because unbound tasks have no
+    backend affinity to enforce.
+    """
+    where, params = _runtime_affinity_conditions()
     with store._lock:
         rows = store._conn.execute(
-            """
-            SELECT b.*
+            f"""
+            SELECT DISTINCT b.*
             FROM task_backend_binding AS b
-            JOIN task_execution_state AS e USING (task_id)
-            WHERE e.active_writer <> 'NONE'
+            JOIN task_execution_state AS e ON e.task_id = b.task_id
+            LEFT JOIN codex_runtime_state AS r ON r.task_id = b.task_id
+            LEFT JOIN task_agent_safety AS s ON s.task_id = b.task_id
+            WHERE {where}
             ORDER BY b.task_id
-            """
+            """,
+            params,
         ).fetchall()
     return [_binding_from_row(row) for row in rows]
+
+
+def list_runtime_affinity_task_ids(store: MemoryStore) -> list[str]:
+    """Return every task that requires runtime recovery at startup."""
+    where, params = _runtime_affinity_conditions()
+    with store._lock:
+        rows = store._conn.execute(
+            f"""
+            SELECT DISTINCT e.task_id
+            FROM task_execution_state AS e
+            LEFT JOIN codex_runtime_state AS r ON r.task_id = e.task_id
+            LEFT JOIN task_agent_safety AS s ON s.task_id = e.task_id
+            WHERE {where}
+            ORDER BY e.task_id
+            """,
+            params,
+        ).fetchall()
+    return [row["task_id"] for row in rows]
 
 
 def bind_task_backend(
@@ -195,15 +245,7 @@ def _assert_migration_safe(conn: Any, task_id: str) -> None:
         (task_id,),
     ).fetchone()
     if runtime is not None:
-        status = (runtime["remote_status"] or "").strip().lower()
-        if status in {
-            "planning",
-            "executing",
-            "running",
-            "inprogress",
-            "in_progress",
-            "started",
-        }:
+        if is_active_runtime(runtime["remote_status"]):
             raise ConflictError(
                 "Backend migration is blocked while a Codex runtime is active"
             )

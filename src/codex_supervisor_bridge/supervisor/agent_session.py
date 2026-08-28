@@ -15,13 +15,24 @@ from codex_supervisor_bridge.backends.models import (
     WorkspaceState,
     WriterLeaseToken,
 )
-from codex_supervisor_bridge.memory.agent_safety import record_agent_compensation_required
+from codex_supervisor_bridge.memory.agent_safety import (
+    AgentSafetyState,
+    get_agent_safety,
+    record_agent_compensation_required,
+)
 from codex_supervisor_bridge.memory.backend_binding import (
     TaskBackendBinding,
     get_task_backend_binding,
+    list_runtime_affinity_task_ids,
 )
-from codex_supervisor_bridge.memory.codex_runtime import CodexRuntimeState, get_codex_runtime
+from codex_supervisor_bridge.memory.codex_runtime import (
+    CodexRuntimeState,
+    get_codex_runtime,
+    is_active_runtime,
+    is_execution_runtime,
+)
 from codex_supervisor_bridge.memory.errors import ConflictError
+from codex_supervisor_bridge.memory.execution import get_execution_state
 from codex_supervisor_bridge.memory.models import ActiveWriter
 from codex_supervisor_bridge.memory.service import MemoryService
 
@@ -34,19 +45,6 @@ class SessionRecoveryOutcome(BaseModel):
     task_id: str
     status: str
     detail: str
-
-
-def _active_runtime_status(runtime: CodexRuntimeState | None) -> bool:
-    if runtime is None:
-        return False
-    return (runtime.remote_status or "").strip().lower() in {
-        "planning",
-        "executing",
-        "running",
-        "inprogress",
-        "in_progress",
-        "started",
-    }
 
 
 class AgentSessionManager:
@@ -240,13 +238,8 @@ class AgentSessionManager:
         await self._ensure_started()
         return await self.backend.resume(handle)
 
-    def _task_ids_with_active_codex_writer(self) -> list[str]:
-        with self.memory.store._lock:
-            rows = self.memory.store._conn.execute(
-                "SELECT task_id FROM task_execution_state WHERE active_writer = ?",
-                (ActiveWriter.CODEX.value,),
-            ).fetchall()
-        return [row["task_id"] for row in rows]
+    def _task_ids_requiring_runtime_recovery(self) -> list[str]:
+        return list_runtime_affinity_task_ids(self.memory.store)
 
     def _handle_for_runtime(self, runtime: CodexRuntimeState) -> PlanHandle:
         return PlanHandle(
@@ -262,7 +255,7 @@ class AgentSessionManager:
         if backend is None:
             return []
         outcomes: list[SessionRecoveryOutcome] = []
-        for task_id in self._task_ids_with_active_codex_writer():
+        for task_id in self._task_ids_requiring_runtime_recovery():
             binding = get_task_backend_binding(self.memory.store, task_id)
             if not self._binding_matches(binding):
                 outcomes.append(
@@ -278,9 +271,46 @@ class AgentSessionManager:
                 continue
             try:
                 runtime = get_codex_runtime(self.memory.store, task_id)
+                execution = get_execution_state(self.memory.store, task_id)
+                safety = get_agent_safety(self.memory.store, task_id)
             except ConflictError:
                 continue
-            if not _active_runtime_status(runtime):
+            if safety is not None and safety.state != AgentSafetyState.NONE.value:
+                outcomes.append(
+                    SessionRecoveryOutcome(
+                        task_id=task_id,
+                        status="RECONCILIATION_REQUIRED",
+                        detail=(
+                            "an unresolved agent compensation/reconciliation "
+                            "latch blocks runtime recovery"
+                        ),
+                    )
+                )
+                continue
+            if not is_active_runtime(runtime.remote_status if runtime else None):
+                continue
+            if (
+                is_execution_runtime(runtime.remote_status)
+                and not (
+                    execution.active_writer == ActiveWriter.CODEX
+                    and execution.writer_epoch >= 1
+                )
+            ):
+                await self._latch_reconciliation(
+                    task_id,
+                    runtime,
+                    "workspace-write runtime requires an active CODEX writer lease",
+                )
+                outcomes.append(
+                    SessionRecoveryOutcome(
+                        task_id=task_id,
+                        status="RECONCILIATION_REQUIRED",
+                        detail=(
+                            "execution runtime is not owned by a current "
+                            "CODEX writer lease"
+                        ),
+                    )
+                )
                 continue
             if runtime is None or not any(
                 [runtime.workflow_id, runtime.operation_id, runtime.thread_id, runtime.turn_id]

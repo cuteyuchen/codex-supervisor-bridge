@@ -592,6 +592,7 @@ class AgentSupervisorFacade:
             lease=lease,
             approved_plan_id=approved_plan_id,
             approved_content=approved_content,
+            remote_result=snapshot,
         )
         if reasons:
             await self.coordinator.compensate_remote(
@@ -640,6 +641,22 @@ class AgentSupervisorFacade:
         agent = await self._agent()
         baseline_handle = self._runtime_handle(baseline_runtime)
         snapshot = await agent.interrupt(baseline_handle)
+        interrupt_status = (snapshot.status or "").strip().lower()
+        if snapshot.reconciliation_required or interrupt_status in {
+            "unknown",
+            "reconciliation_required",
+            "compensation_required",
+        }:
+            await self._latch_interrupt_reconciliation(
+                task_id,
+                baseline_runtime,
+                get_codex_runtime(self.memory.store, task_id),
+                f"interrupt returned unknown outcome {snapshot.status!r}",
+            )
+            raise AgentCompensationRequiredError(
+                "COMPENSATION_REQUIRED: interrupt outcome is unknown; "
+                "reconciliation is required before new Codex work"
+            )
 
         current_runtime = get_codex_runtime(self.memory.store, task_id)
         if _runtime_identity(current_runtime) != _runtime_identity(baseline_runtime):
@@ -717,6 +734,75 @@ class AgentSupervisorFacade:
                     else None
                 ),
                 "snapshot": snapshot.model_dump(mode="json"),
+                "stale_runtime_interrupted": True,
+                "profile": self.profile,
+            }
+
+        current_task = self.memory.get_task(task_id)
+        if current_task.revision != expected_revision:
+            if current_runtime is None:
+                await self._latch_interrupt_reconciliation(
+                    task_id,
+                    baseline_runtime,
+                    None,
+                    "revision changed during interrupt and no current runtime is persisted",
+                )
+                raise AgentCompensationRequiredError(
+                    "COMPENSATION_REQUIRED: revision changed during interrupt "
+                    "and the current runtime cannot be confirmed"
+                )
+            current_handle = self._runtime_handle(current_runtime)
+            try:
+                current_snapshot = await agent.observe(current_handle)
+            except Exception as exc:
+                await self._latch_interrupt_reconciliation(
+                    task_id,
+                    baseline_runtime,
+                    current_runtime,
+                    f"revision-only interrupt race; observe failed: {type(exc).__name__}",
+                )
+                raise AgentCompensationRequiredError(
+                    "COMPENSATION_REQUIRED: revision changed during interrupt "
+                    "and the runtime cannot be observed"
+                ) from exc
+            current_status = (current_snapshot.status or "").strip().lower()
+            if (
+                current_snapshot.reconciliation_required
+                or current_status in {
+                    "unknown",
+                    "reconciliation_required",
+                    "compensation_required",
+                }
+                or current_status in _ACTIVE_STATUSES
+            ):
+                await self._latch_interrupt_reconciliation(
+                    task_id,
+                    baseline_runtime,
+                    current_runtime,
+                    f"revision-only interrupt race; current runtime returned {current_snapshot.status!r}",
+                )
+                raise AgentCompensationRequiredError(
+                    "COMPENSATION_REQUIRED: revision changed during interrupt "
+                    "and the current runtime is not confirmed terminal"
+                )
+            _, current_runtime = bind_codex_runtime(
+                self.memory.store,
+                task_id,
+                current_task.revision,
+                event_type=EventType.CODEX_INTERRUPTED,
+                workflow_id=current_runtime.workflow_id,
+                operation_id=current_runtime.operation_id,
+                thread_id=current_runtime.thread_id,
+                turn_id=current_runtime.turn_id,
+                remote_status=current_snapshot.status or "interrupted",
+                task_phase=TaskPhase.PAUSED,
+                current_state=reason or "Codex turn interrupted by Supervisor.",
+                event_payload={"reason": reason, "revision_changed_during_interrupt": True},
+            )
+            return {
+                "task": self.memory.get_task(task_id).model_dump(mode="json"),
+                "runtime": current_runtime.model_dump(mode="json"),
+                "snapshot": current_snapshot.model_dump(mode="json"),
                 "stale_runtime_interrupted": True,
                 "profile": self.profile,
             }
@@ -843,6 +929,7 @@ class AgentSupervisorFacade:
             lease=lease,
             approved_plan_id=approved_plan_id,
             approved_content=approved_content,
+            remote_result=snapshot,
         )
         if reasons:
             await self.coordinator.compensate_remote(

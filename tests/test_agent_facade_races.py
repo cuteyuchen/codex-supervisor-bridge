@@ -48,12 +48,18 @@ class RaceAgent:
         block_respond: bool = False,
         block_interrupt: bool = False,
         observe_new_unknown: bool = False,
+        steer_status: str = "running",
+        respond_status: str = "running",
+        interrupt_status: str = "interrupted",
     ) -> None:
         self.pending = pending or []
         self.block_steer = block_steer
         self.block_respond = block_respond
         self.block_interrupt = block_interrupt
         self.observe_new_unknown = observe_new_unknown
+        self.steer_status = steer_status
+        self.respond_status = respond_status
+        self.interrupt_status = interrupt_status
         self.steer_started = asyncio.Event()
         self.respond_started = asyncio.Event()
         self.interrupt_started = asyncio.Event()
@@ -105,7 +111,7 @@ class RaceAgent:
         del cursor, wait_ms
         if self.observe_new_unknown:
             return AgentSnapshot(status="unknown", **self._identity(handle))
-        return AgentSnapshot(status="running", **self._identity(handle))
+        return AgentSnapshot(status=self.steer_status, **self._identity(handle))
 
     async def steer(
         self,
@@ -127,7 +133,7 @@ class RaceAgent:
         self.interrupt_started.set()
         if self.block_interrupt:
             await self.release_interrupt.wait()
-        return AgentSnapshot(status="interrupted", **self._identity(handle))
+        return AgentSnapshot(status=self.interrupt_status, **self._identity(handle))
 
     async def list_pending_interactions(self, handle: PlanHandle) -> list[PendingInteraction]:
         del handle
@@ -144,7 +150,7 @@ class RaceAgent:
         self.respond_started.set()
         if self.block_respond:
             await self.release_respond.wait()
-        return AgentSnapshot(status="running", **self._identity(handle))
+        return AgentSnapshot(status=self.respond_status, **self._identity(handle))
 
     async def resume(self, handle: PlanHandle) -> AgentSnapshot:
         return AgentSnapshot(status="running", **self._identity(handle))
@@ -499,6 +505,132 @@ def test_stale_interrupt_with_unconfirmable_new_runtime_fails_closed() -> None:
 
         asyncio.run(scenario())
         safety = get_agent_safety(memory.store, "INTERRUPT-UNKNOWN")
+        assert safety is not None
+        assert safety.state == AgentSafetyState.RECONCILIATION_REQUIRED
+    finally:
+        memory.close()
+
+
+def test_soft_steer_unknown_remote_outcome_fails_closed() -> None:
+    memory = MemoryService()
+    agent = RaceAgent(steer_status="unknown")
+    try:
+        _set_up_codex_writer(memory, "STEER-UNKNOWN")
+        facade = _facade(memory, agent)
+
+        async def scenario() -> None:
+            task = memory.get_task("STEER-UNKNOWN")
+            with pytest.raises(AgentStaleContextError, match="STALE_CONTEXT"):
+                await facade.soft_steer("STEER-UNKNOWN", task.revision, "Continue")
+
+        asyncio.run(scenario())
+        assert agent.interrupts == [PlanHandle(
+            operation_id="op-old",
+            workflow_id="wf-old",
+            thread_id="thread-old",
+            turn_id="turn-old",
+            status="executing",
+        )]
+        runtime = get_codex_runtime(memory.store, "STEER-UNKNOWN")
+        assert runtime is not None and runtime.remote_status == "executing"
+        safety = get_agent_safety(memory.store, "STEER-UNKNOWN")
+        assert safety is not None and safety.state == AgentSafetyState.NONE
+    finally:
+        memory.close()
+
+
+def test_answer_interaction_unknown_remote_outcome_fails_closed() -> None:
+    memory = MemoryService()
+    interaction = PendingInteraction(
+        interaction_id="21",
+        kind="command_approval",
+        summary="Run tests?",
+    )
+    agent = RaceAgent(
+        pending=[interaction],
+        respond_status="reconciliation_required",
+    )
+    try:
+        _set_up_codex_writer(memory, "ANSWER-UNKNOWN")
+        facade = _facade(memory, agent)
+
+        async def scenario() -> None:
+            task = memory.get_task("ANSWER-UNKNOWN")
+            with pytest.raises(AgentStaleContextError, match="STALE_CONTEXT"):
+                await facade.answer_interaction(
+                    "ANSWER-UNKNOWN",
+                    task.revision,
+                    "21",
+                    decision="accept",
+                )
+
+        asyncio.run(scenario())
+        assert len(agent.interrupts) == 1
+        safety = get_agent_safety(memory.store, "ANSWER-UNKNOWN")
+        assert safety is not None and safety.state == AgentSafetyState.NONE
+    finally:
+        memory.close()
+
+
+def test_interrupt_unknown_remote_outcome_never_binds_paused() -> None:
+    memory = MemoryService()
+    agent = RaceAgent(interrupt_status="unknown")
+    try:
+        _set_up_codex_writer(memory, "INTERRUPT-UNKNOWN-RETURN")
+        facade = _facade(memory, agent)
+
+        async def scenario() -> None:
+            task = memory.get_task("INTERRUPT-UNKNOWN-RETURN")
+            with pytest.raises(AgentCompensationRequiredError, match="COMPENSATION_REQUIRED"):
+                await facade.interrupt(
+                    "INTERRUPT-UNKNOWN-RETURN",
+                    task.revision,
+                    reason="Stop",
+                )
+
+        asyncio.run(scenario())
+        runtime = get_codex_runtime(memory.store, "INTERRUPT-UNKNOWN-RETURN")
+        assert runtime is not None
+        assert runtime.remote_status == "executing"
+        safety = get_agent_safety(memory.store, "INTERRUPT-UNKNOWN-RETURN")
+        assert safety is not None
+        assert safety.state == AgentSafetyState.RECONCILIATION_REQUIRED
+    finally:
+        memory.close()
+
+
+def test_interrupt_revision_only_race_fails_closed_without_overwriting_runtime() -> None:
+    memory = MemoryService()
+    agent = RaceAgent(block_interrupt=True)
+    try:
+        _set_up_codex_writer(memory, "INTERRUPT-REV-ONLY")
+        facade = _facade(memory, agent)
+
+        async def scenario() -> None:
+            task = memory.get_task("INTERRUPT-REV-ONLY")
+            pending = asyncio.create_task(
+                facade.interrupt(
+                    "INTERRUPT-REV-ONLY",
+                    task.revision,
+                    reason="Stop",
+                )
+            )
+            await agent.interrupt_started.wait()
+            memory.update_intent(
+                "INTERRUPT-REV-ONLY",
+                memory.get_task("INTERRUPT-REV-ONLY").revision,
+                "Hard replan while interrupt is in flight",
+            )
+            agent.release_interrupt.set()
+            with pytest.raises(AgentCompensationRequiredError, match="COMPENSATION_REQUIRED"):
+                await pending
+
+        asyncio.run(scenario())
+        runtime = get_codex_runtime(memory.store, "INTERRUPT-REV-ONLY")
+        assert runtime is not None
+        assert runtime.turn_id == "turn-old"
+        assert runtime.remote_status == "executing"
+        safety = get_agent_safety(memory.store, "INTERRUPT-REV-ONLY")
         assert safety is not None
         assert safety.state == AgentSafetyState.RECONCILIATION_REQUIRED
     finally:

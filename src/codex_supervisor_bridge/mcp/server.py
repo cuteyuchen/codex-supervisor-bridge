@@ -24,6 +24,9 @@ from codex_supervisor_bridge.integrations.control_plane_agent import ControlPlan
 from codex_supervisor_bridge.integrations.devspace_client import DevSpaceWorkspaceAdapter
 from codex_supervisor_bridge.integrations.kandev_client import KandevAdapter
 from codex_supervisor_bridge.integrations.kandev_coordinator import KandevCoordinator
+from codex_supervisor_bridge.memory.backend_binding import (
+    list_active_task_backend_bindings,
+)
 from codex_supervisor_bridge.memory.service import MemoryService
 from codex_supervisor_bridge.supervisor.agent_facade import (
     CodexCoordinatorFacade,
@@ -261,7 +264,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command is not None:
-        bootstrap = BootstrapService()
+        bootstrap = BootstrapService(auto_install=True)
         if args.command in {"doctor", "status"}:
             result = bootstrap.status(project_directory=args.project)
         elif args.command == "repair":
@@ -326,9 +329,11 @@ def main(argv: list[str] | None = None) -> None:
     doctor = bootstrap.doctor.run(
         DoctorOptions(project_directory=config.basic.project_directory)
     )
+    forced_binding = _resolve_startup_binding(service)
     selection = RuntimeResolver(
         _doctor_health(doctor),
         development_style=config.basic.development_style.value,
+        task_binding=forced_binding,
     ).resolve()
     launch_command: list[str] | None = None
     repository = config.advanced.local_codex_repository
@@ -347,6 +352,11 @@ def main(argv: list[str] | None = None) -> None:
             env=lcb_environment(),
             workspace_factory=authenticated_devspace_factory,
         )
+    elif selection.binding_forced and selection.profile == "lightweight":
+        raise RuntimeError(
+            "STARTUP_RECONCILIATION_REQUIRED: the bound task needs Profile B, "
+            "but Local-Codex-Bridge cannot be launched"
+        )
     else:
         composition = RuntimeComposition.profile_a(
             service,
@@ -356,6 +366,7 @@ def main(argv: list[str] | None = None) -> None:
             ),
             kandev_adapter_factory=lambda: KandevAdapter(args.kandev_mcp_url),
         )
+    composition.codex_readiness = _doctor_health(doctor).get("codex")
     kandev = KandevCoordinator(
         service,
         lambda: KandevAdapter(args.kandev_mcp_url),
@@ -406,6 +417,7 @@ def _doctor_health(doctor: object) -> dict[str, BackendHealth]:
         "kandev": "Fallback workspace",
         "control_plane": "Fallback control",
         "github": "GitHub",
+        "codex": "Codex",
     }
     result: dict[str, BackendHealth] = {}
     for name, label in aliases.items():
@@ -426,6 +438,25 @@ def _doctor_health(doctor: object) -> dict[str, BackendHealth]:
             technical_detail=str(item.advanced.get("technical_detail", "")),
         )
     return result
+
+
+def _resolve_startup_binding(service: MemoryService):
+    """Force one active task binding, or fail closed on conflicting bindings."""
+    active_bindings = list_active_task_backend_bindings(service.store)
+    distinct_bindings = {
+        (
+            binding.workspace_backend,
+            binding.agent_backend,
+            binding.profile,
+        )
+        for binding in active_bindings
+    }
+    if len(distinct_bindings) > 1:
+        raise RuntimeError(
+            "STARTUP_RECONCILIATION_REQUIRED: multiple active tasks are bound "
+            "to different backend profiles; do not silently choose one"
+        )
+    return active_bindings[0] if active_bindings else None
 
 
 def _emit_readiness_marker(readiness: ProfileReadiness) -> None:

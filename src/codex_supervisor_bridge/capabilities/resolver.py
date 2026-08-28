@@ -91,6 +91,7 @@ class CapabilityResolver:
     def resolve(self) -> ResolvedBackends:
         workspace = self._best(("devspace", "kandev"))
         agent = self._best(("local_codex_bridge", "control_plane"))
+        codex = self._best(("codex",))
         delivery = self._best(("github", "kandev"))
 
         if workspace == "devspace" and agent == "local_codex_bridge":
@@ -118,7 +119,7 @@ class CapabilityResolver:
                 self._public_capability(
                     CapabilityKind.CODEX,
                     "Codex",
-                    agent,
+                    codex,
                     unavailable_message="Codex control is not ready.",
                     repair_action="repair_codex",
                 ),

@@ -21,6 +21,7 @@ def _profile_b_ready() -> dict[str, BackendHealth]:
     return {
         "devspace": _health("devspace"),
         "local_codex_bridge": _health("local_codex_bridge"),
+        "codex": _health("codex"),
         "github": _health("github"),
     }
 
@@ -42,6 +43,7 @@ def test_profile_a_used_when_profile_b_is_not_ready() -> None:
     health = {
         "devspace": _health("devspace", BackendHealthStatus.UNAVAILABLE),
         "local_codex_bridge": _health("local_codex_bridge", BackendHealthStatus.UNAVAILABLE),
+        "codex": _health("codex", BackendHealthStatus.DEGRADED),
         "kandev": _health("kandev"),
         "control_plane": _health("control_plane"),
     }
@@ -50,13 +52,15 @@ def test_profile_a_used_when_profile_b_is_not_ready() -> None:
     assert selection.profile == "existing"
     assert selection.workspace_backend == "kandev"
     assert selection.agent_backend == "control_plane"
-    assert selection.status == "READY"
+    assert selection.status == "DEGRADED"
+    assert selection.requires_user_action is True
 
 
 def test_no_profile_ready_selects_nearest_repairable_candidate() -> None:
     health = {
         "devspace": _health("devspace", BackendHealthStatus.DEGRADED),
         "local_codex_bridge": _health("local_codex_bridge", BackendHealthStatus.DEGRADED),
+        "codex": _health("codex", BackendHealthStatus.DEGRADED),
         "kandev": _health("kandev", BackendHealthStatus.UNAVAILABLE),
         "control_plane": _health("control_plane", BackendHealthStatus.UNAVAILABLE),
     }
@@ -71,6 +75,7 @@ def test_development_style_web_first_prefers_profile_a_when_both_degraded() -> N
     health = {
         "devspace": _health("devspace", BackendHealthStatus.DEGRADED),
         "local_codex_bridge": _health("local_codex_bridge", BackendHealthStatus.DEGRADED),
+        "codex": _health("codex", BackendHealthStatus.DEGRADED),
         "kandev": _health("kandev", BackendHealthStatus.DEGRADED),
         "control_plane": _health("control_plane", BackendHealthStatus.DEGRADED),
     }
@@ -91,6 +96,7 @@ def test_bound_task_never_silently_falls_back() -> None:
     health = {
         "devspace": _health("devspace", BackendHealthStatus.UNAVAILABLE),
         "local_codex_bridge": _health("local_codex_bridge", BackendHealthStatus.UNAVAILABLE),
+        "codex": _health("codex"),
         "kandev": _health("kandev"),
         "control_plane": _health("control_plane"),
     }

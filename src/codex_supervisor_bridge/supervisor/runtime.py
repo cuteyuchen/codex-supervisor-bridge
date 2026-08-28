@@ -57,6 +57,7 @@ class RuntimeComposition:
     agent_coordinator: AgentExecutionCoordinator
     session_manager: AgentSessionManager | None = None
     checkpoint_service: CheckpointService | None = None
+    codex_readiness: BackendHealth | None = None
     delivery_backend: str = "github"
     started: bool = False
     recovery_outcomes: list[SessionRecoveryOutcome] = field(default_factory=list)
@@ -189,6 +190,7 @@ class RuntimeComposition:
                 repairable=True,
                 technical_detail="no AgentSessionManager is composed",
             )
+        codex_health = self.codex_readiness or agent_health
 
         try:
             workspace_health = await asyncio.wait_for(
@@ -210,6 +212,7 @@ class RuntimeComposition:
             if outcome.status == "RECONCILIATION_REQUIRED"
         ]
         status = self._combined_status(workspace_health.status, agent_health.status)
+        status = self._combined_status(status, codex_health.status)
         if blockers:
             status = BackendHealthStatus.DEGRADED
         return ProfileReadiness(
@@ -219,14 +222,14 @@ class RuntimeComposition:
             agent_backend=self.agent_backend,
             workspace_status=workspace_health.status.value,
             agent_status=agent_health.status.value,
-            codex_status=agent_health.status.value,
+            codex_status=codex_health.status.value,
             recovery_outcomes=recovery,
             startup_blockers=blockers,
             requires_user_action=status != BackendHealthStatus.READY or bool(blockers),
             reason=(
                 "startup reconciliation blocks PROFILE_READY"
                 if blockers
-                else "combined workspace and agent readiness"
+                else "combined workspace, agent and Codex readiness"
             ),
         )
 

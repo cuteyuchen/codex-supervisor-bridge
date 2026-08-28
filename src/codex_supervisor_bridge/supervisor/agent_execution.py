@@ -197,6 +197,7 @@ class AgentExecutionCoordinator:
         lease: WriterLeaseToken | None = None,
         approved_plan_id: str | None = None,
         approved_content: str | None = None,
+        remote_result: AgentSnapshot | None = None,
     ) -> list[str]:
         reasons: list[str] = []
         current = self.memory.get_task(task_id)
@@ -239,6 +240,13 @@ class AgentExecutionCoordinator:
             "compensation_required",
         }:
             reasons.append("remote acknowledgement outcome is unknown")
+        if remote_result is not None:
+            status = (remote_result.status or "").strip().lower()
+            if (
+                remote_result.reconciliation_required
+                or status in {"unknown", "reconciliation_required", "compensation_required"}
+            ):
+                reasons.append(f"remote {operation} outcome is {status!r}")
         return reasons
 
     async def start_plan(

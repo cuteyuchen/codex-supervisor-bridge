@@ -16,6 +16,10 @@ from codex_supervisor_bridge.backends.models import (
     WriterLeaseToken,
 )
 from codex_supervisor_bridge.memory.agent_safety import record_agent_compensation_required
+from codex_supervisor_bridge.memory.backend_binding import (
+    TaskBackendBinding,
+    get_task_backend_binding,
+)
 from codex_supervisor_bridge.memory.codex_runtime import CodexRuntimeState, get_codex_runtime
 from codex_supervisor_bridge.memory.errors import ConflictError
 from codex_supervisor_bridge.memory.models import ActiveWriter
@@ -259,6 +263,19 @@ class AgentSessionManager:
             return []
         outcomes: list[SessionRecoveryOutcome] = []
         for task_id in self._task_ids_with_active_codex_writer():
+            binding = get_task_backend_binding(self.memory.store, task_id)
+            if not self._binding_matches(binding):
+                outcomes.append(
+                    SessionRecoveryOutcome(
+                        task_id=task_id,
+                        status="RECONCILIATION_REQUIRED",
+                        detail=(
+                            "task is bound to a different backend profile; "
+                            "this composition cannot resume its active runtime"
+                        ),
+                    )
+                )
+                continue
             try:
                 runtime = get_codex_runtime(self.memory.store, task_id)
             except ConflictError:
@@ -321,6 +338,15 @@ class AgentSessionManager:
                 )
             )
         return outcomes
+
+    def _binding_matches(self, binding: TaskBackendBinding | None) -> bool:
+        if binding is None:
+            return True
+        return (
+            binding.workspace_backend == self.workspace_backend
+            and binding.agent_backend == self.agent_backend
+            and binding.profile == self.profile
+        )
 
     async def _latch_reconciliation(
         self,

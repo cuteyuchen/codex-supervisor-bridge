@@ -47,6 +47,23 @@ def get_task_backend_binding(
     return _binding_from_row(row) if row is not None else None
 
 
+def list_active_task_backend_bindings(
+    store: MemoryStore,
+) -> list[TaskBackendBinding]:
+    """Return backend bindings for tasks that still hold a writer lease."""
+    with store._lock:
+        rows = store._conn.execute(
+            """
+            SELECT b.*
+            FROM task_backend_binding AS b
+            JOIN task_execution_state AS e USING (task_id)
+            WHERE e.active_writer <> 'NONE'
+            ORDER BY b.task_id
+            """
+        ).fetchall()
+    return [_binding_from_row(row) for row in rows]
+
+
 def bind_task_backend(
     store: MemoryStore,
     task_id: str,

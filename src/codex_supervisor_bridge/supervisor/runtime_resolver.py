@@ -58,7 +58,7 @@ class RuntimeResolver:
     ) -> tuple[BackendHealthStatus, list[str]]:
         statuses: list[BackendHealthStatus] = []
         missing: list[str] = []
-        for name in (workspace_backend, agent_backend):
+        for name in (workspace_backend, agent_backend, "codex"):
             probe = self.health.get(name)
             if probe is None:
                 statuses.append(BackendHealthStatus.UNAVAILABLE)

@@ -18,6 +18,8 @@ from codex_supervisor_bridge.backends.models import (
     WorkspaceState,
     WriterLeaseToken,
 )
+from codex_supervisor_bridge.integrations.devspace_client import DevSpaceWorkspaceAdapter
+from codex_supervisor_bridge.integrations.kandev_workspace import KandevWorkspaceBackend
 from codex_supervisor_bridge.memory.agent_safety import get_agent_safety
 from codex_supervisor_bridge.memory.backend_binding import get_task_backend_binding
 from codex_supervisor_bridge.memory.codex_runtime import get_codex_runtime
@@ -269,6 +271,28 @@ def test_profile_a_runtime_composition_keeps_control_plane_fallback() -> None:
         assert composition.session_manager is not None
         assert composition.agent_backend == "control_plane"
         assert composition.agent_coordinator.agent_backend is composition.session_manager
+    finally:
+        memory.close()
+
+
+def test_profile_workspace_factories_match_canonical_backend_binding() -> None:
+    memory = MemoryService()
+    try:
+        profile_b = RuntimeComposition.profile_b(
+            memory,
+            launch_command=["node", "dist/src/index.js"],
+        )
+        profile_a = RuntimeComposition.profile_a(
+            memory,
+            adapter_factory=lambda: object(),
+        )
+
+        assert isinstance(profile_b.workspace_factory(), DevSpaceWorkspaceAdapter)
+        assert isinstance(profile_a.workspace_factory(), KandevWorkspaceBackend)
+        assert profile_b.workspace_backend == "devspace"
+        assert profile_a.workspace_backend == "kandev"
+        assert profile_b.agent_backend == "local_codex_bridge"
+        assert profile_a.agent_backend == "control_plane"
     finally:
         memory.close()
 

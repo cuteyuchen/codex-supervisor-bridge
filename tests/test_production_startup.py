@@ -16,12 +16,15 @@ from codex_supervisor_bridge.backends.models import (
     WorkspaceState,
     WriterLeaseToken,
 )
-from codex_supervisor_bridge.mcp.server import create_mcp_server
+from codex_supervisor_bridge.mcp.server import _resolve_startup_binding, create_mcp_server
 from codex_supervisor_bridge.memory.agent_safety import (
     AgentSafetyState,
     get_agent_safety,
 )
-from codex_supervisor_bridge.memory.backend_binding import TaskBackendBinding
+from codex_supervisor_bridge.memory.backend_binding import (
+    TaskBackendBinding,
+    bind_task_backend,
+)
 from codex_supervisor_bridge.memory.codex_runtime import bind_codex_runtime
 from codex_supervisor_bridge.memory.errors import ConflictError
 from codex_supervisor_bridge.memory.execution import (
@@ -236,6 +239,7 @@ def _profile_b_health() -> dict[str, BackendHealth]:
     return {
         "devspace": _health("devspace"),
         "local_codex_bridge": _health("local_codex_bridge"),
+        "codex": _health("codex"),
         "github": _health("github"),
     }
 
@@ -330,6 +334,7 @@ def test_startup_e2e_profile_a_fallback_when_profile_b_broken() -> None:
                 "local_codex_bridge",
                 BackendHealthStatus.UNAVAILABLE,
             ),
+            "codex": _health("codex", BackendHealthStatus.DEGRADED),
             "kandev": _health("kandev"),
             "control_plane": _health("control_plane"),
         }
@@ -384,6 +389,7 @@ def test_startup_e2e_bound_task_never_falls_back_when_profile_b_temporarily_brok
             "local_codex_bridge",
             BackendHealthStatus.UNAVAILABLE,
         ),
+        "codex": _health("codex"),
         "kandev": _health("kandev"),
         "control_plane": _health("control_plane"),
     }
@@ -470,3 +476,104 @@ def test_startup_reconciliation_happens_before_ready(tmp_path: Path) -> None:
         assert agent.resume_calls == 1
     finally:
         reopened.close()
+
+
+def test_runtime_readiness_codex_not_ready_degrades_profile() -> None:
+    memory = MemoryService()
+    try:
+        agent = StartupFakeAgent()
+        composition, session = _composition_b(memory, agent=agent)
+        composition.codex_readiness = _health(
+            "codex",
+            BackendHealthStatus.DEGRADED,
+        )
+
+        async def scenario() -> None:
+            await composition.start()
+            readiness = await composition.readiness()
+            assert readiness.workspace_status == "READY"
+            assert readiness.agent_status == "READY"
+            assert readiness.codex_status == "DEGRADED"
+            assert readiness.status == "DEGRADED"
+            assert readiness.requires_user_action is True
+            await composition.shutdown()
+
+        asyncio.run(scenario())
+        assert session.shutdown_count == 1
+    finally:
+        memory.close()
+
+
+def test_conflicting_active_task_bindings_fail_closed() -> None:
+    memory = MemoryService()
+    try:
+        for index, binding in enumerate(
+            (
+                ("devspace", "local_codex_bridge", "lightweight"),
+                ("kandev", "control_plane", "existing"),
+            )
+        ):
+            task = memory.create_task(
+                f"CONFLICT-{index}",
+                "Conflict",
+                repository="C:/repo",
+            )
+            acquired = acquire_writer(
+                memory.store,
+                task.task_id,
+                task.revision,
+                ActiveWriter.CODEX,
+                explicit_user_authorization=True,
+            )
+            bind_task_backend(
+                memory.store,
+                task.task_id,
+                acquired.task.revision,
+                workspace_backend=binding[0],
+                agent_backend=binding[1],
+                profile=binding[2],
+            )
+
+        with pytest.raises(RuntimeError, match="STARTUP_RECONCILIATION_REQUIRED"):
+            _resolve_startup_binding(memory)
+    finally:
+        memory.close()
+
+
+def test_startup_uses_persisted_active_binding_not_healthier_profile() -> None:
+    memory = MemoryService()
+    try:
+        task = memory.create_task("BOUND-ACTIVE", "Bound", repository="C:/repo")
+        acquired = acquire_writer(
+            memory.store,
+            task.task_id,
+            task.revision,
+            ActiveWriter.CHATGPT,
+        )
+        bind_task_backend(
+            memory.store,
+            task.task_id,
+            acquired.task.revision,
+            workspace_backend="kandev",
+            agent_backend="control_plane",
+            profile="existing",
+        )
+        forced = _resolve_startup_binding(memory)
+        assert forced is not None
+        assert forced.profile == "existing"
+        health = {
+            "devspace": _health("devspace"),
+            "local_codex_bridge": _health("local_codex_bridge"),
+            "codex": _health("codex"),
+            "kandev": _health("kandev", BackendHealthStatus.UNAVAILABLE),
+            "control_plane": _health(
+                "control_plane",
+                BackendHealthStatus.UNAVAILABLE,
+            ),
+        }
+        selection = RuntimeResolver(health, task_binding=forced).resolve()
+        assert selection.profile == "existing"
+        assert selection.binding_forced is True
+        assert selection.status == "UNAVAILABLE"
+    finally:
+        memory.close()

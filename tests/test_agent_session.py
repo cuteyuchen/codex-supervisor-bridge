@@ -15,6 +15,7 @@ from codex_supervisor_bridge.integrations.local_codex_bridge_client import (
     LocalCodexBridgeAgentBackend,
 )
 from codex_supervisor_bridge.memory.agent_safety import get_agent_safety
+from codex_supervisor_bridge.memory.backend_binding import bind_task_backend
 from codex_supervisor_bridge.memory.codex_runtime import bind_codex_runtime
 from codex_supervisor_bridge.memory.execution import acquire_writer
 from codex_supervisor_bridge.memory.models import ActiveWriter, EventType, TaskPhase
@@ -212,6 +213,80 @@ def test_restart_resume_confirmed_or_fail_closed(tmp_path: Path) -> None:
     assert resumed in {None, "NONE"}
     reconciled = asyncio.run(inspect_restart(resumable=False))
     assert reconciled == "RECONCILIATION_REQUIRED"
+
+
+def test_recovery_is_scoped_to_current_composition_binding(tmp_path: Path) -> None:
+    database = tmp_path / "binding-scope.db"
+    memory = MemoryService(database)
+    try:
+        task = memory.create_task("BINDING-SCOPE", "Bound", repository="C:/repo")
+        acquired = acquire_writer(
+            memory.store,
+            task.task_id,
+            task.revision,
+            ActiveWriter.CODEX,
+            explicit_user_authorization=True,
+        )
+        bind_task_backend(
+            memory.store,
+            task.task_id,
+            acquired.task.revision,
+            workspace_backend="kandev",
+            agent_backend="control_plane",
+            profile="existing",
+        )
+        task = memory.get_task(task.task_id)
+        bind_codex_runtime(
+            memory.store,
+            task.task_id,
+            task.revision,
+            event_type=EventType.CODEX_STARTED,
+            workflow_id="wf-bound",
+            operation_id="op-bound",
+            thread_id="thread-bound",
+            turn_id="turn-bound",
+            remote_status="executing",
+        )
+    finally:
+        memory.close()
+
+    class ScopedProbeAgent:
+        def __init__(self) -> None:
+            self.resume_calls = 0
+
+        async def __aenter__(self) -> "ScopedProbeAgent":
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        async def resume(self, handle: Any) -> Any:
+            self.resume_calls += 1
+            return handle
+
+    reopened = MemoryService(database)
+    agent = ScopedProbeAgent()
+    try:
+        session = AgentSessionManager(
+            reopened,
+            lambda: agent,
+            profile="lightweight",
+            workspace_backend="devspace",
+            agent_backend="local_codex_bridge",
+        )
+
+        async def scenario() -> None:
+            outcomes = await session.start()
+            assert [outcome.status for outcome in outcomes] == [
+                "RECONCILIATION_REQUIRED"
+            ]
+            assert "different backend profile" in outcomes[0].detail
+
+        asyncio.run(scenario())
+        assert agent.resume_calls == 0
+    finally:
+        asyncio.run(session.shutdown())
+        reopened.close()
 
 
 def _counting_client(counts: dict[str, int], server: MCPServer) -> Any:

@@ -4,8 +4,11 @@ import asyncio
 import json
 import subprocess
 import sys
+import threading
 from contextlib import asynccontextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from mcp.client.auth.oauth2 import OAuthClientProvider
@@ -747,6 +750,10 @@ def test_devspace_oauth_tokens_are_secret_store_backed_and_redacted() -> None:
         rendered = json.dumps(redact_oauth_payload(token.model_dump()))
         assert "access-do-not-log" not in rendered
         assert "refresh-do-not-log" not in rendered
+        rendered_client = json.dumps(
+            redact_oauth_payload({"client_secret": "client-secret-do-not-log"})
+        )
+        assert "client-secret-do-not-log" not in rendered_client
 
     asyncio.run(scenario())
 
@@ -807,6 +814,158 @@ def test_devspace_local_oauth_uses_mcp_provider_and_owner_form() -> None:
         assert isinstance(providers[0], OAuthClientProvider)
 
     asyncio.run(scenario())
+
+
+class _FakeDevSpaceOAuthHandler(BaseHTTPRequestHandler):
+    authorize_calls = 0
+    register_calls = 0
+    token_calls = 0
+
+    def log_message(self, format: str, *args: object) -> None:
+        del format, args
+
+    def _send_json(self, payload: dict[str, object], *, status: int = 200) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        path = urlparse(self.path).path
+        base_url = getattr(self.server, "base_url")
+        if path == "/mcp":
+            if self.headers.get("Authorization") == "Bearer fake-access-token":
+                self._send_json({})
+            else:
+                self.send_response(401)
+                self.send_header(
+                    "WWW-Authenticate",
+                    f'Bearer resource_metadata="{base_url}/.well-known/oauth-protected-resource", scope="devspace"',
+                )
+                self.end_headers()
+        elif path == "/.well-known/oauth-protected-resource":
+            self._send_json(
+                {
+                    "resource": f"{base_url}/mcp",
+                    "authorization_servers": [base_url],
+                    "scopes_supported": ["devspace"],
+                }
+            )
+        elif path == "/.well-known/oauth-authorization-server":
+            self._send_json(
+                {
+                    "issuer": base_url,
+                    "authorization_endpoint": f"{base_url}/authorize",
+                    "token_endpoint": f"{base_url}/token",
+                    "registration_endpoint": f"{base_url}/register",
+                    "scopes_supported": ["devspace"],
+                    "response_types_supported": ["code"],
+                    "grant_types_supported": ["authorization_code", "refresh_token"],
+                    "token_endpoint_auth_methods_supported": ["none"],
+                    "code_challenge_methods_supported": ["S256"],
+                }
+            )
+        else:
+            self.send_error(404)
+
+    def do_POST(self) -> None:
+        path = urlparse(self.path).path
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length).decode("utf-8")
+        if path == "/register":
+            type(self).register_calls += 1
+            registration = json.loads(body)
+            self._send_json(
+                {
+                    "client_id": "fake-client",
+                    "redirect_uris": registration.get("redirect_uris"),
+                    "token_endpoint_auth_method": "none",
+                    "grant_types": ["authorization_code", "refresh_token"],
+                    "scope": registration.get("scope"),
+                },
+                status=201,
+            )
+            return
+        if path == "/authorize":
+            type(self).authorize_calls += 1
+            form = parse_qs(body)
+            if form.get("owner_token", [""])[0] != "owner-secret-not-logged":
+                self.send_error(403)
+                return
+            query = parse_qs(urlparse(self.path).query)
+            state = query.get("state", [""])[0]
+            redirect_uri = query.get(
+                "redirect_uri",
+                ["http://127.0.0.1/codex-supervisor-callback"],
+            )[0]
+            self.send_response(302)
+            self.send_header("Location", f"{redirect_uri}?code=fake-code&state={state}")
+            self.end_headers()
+            return
+        if path == "/token":
+            type(self).token_calls += 1
+            form = parse_qs(body)
+            grant_type = form.get("grant_type", [""])[0]
+            assert grant_type in {"authorization_code", "refresh_token"}
+            self._send_json(
+                {
+                    "access_token": "fake-access-token",
+                    "token_type": "Bearer",
+                    "refresh_token": "fake-refresh-token",
+                    "expires_in": 3600,
+                    "scope": "devspace",
+                }
+            )
+            return
+        self.send_error(404)
+
+
+def test_devspace_local_oauth_real_loopback_protocol() -> None:
+    _FakeDevSpaceOAuthHandler.authorize_calls = 0
+    _FakeDevSpaceOAuthHandler.register_calls = 0
+    _FakeDevSpaceOAuthHandler.token_calls = 0
+    secrets = MemorySecretStore()
+    secrets.set("devspace-owner-token", "owner-secret-not-logged")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeDevSpaceOAuthHandler)
+    server.base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        result = asyncio.run(
+            DevSpaceLocalOAuthDriver().authorize(
+                mcp_url=f"{server.base_url}/mcp",
+                secret_store=secrets,
+            )
+        )
+        resumed = asyncio.run(
+            DevSpaceLocalOAuthDriver().authorize(
+                mcp_url=f"{server.base_url}/mcp",
+                secret_store=secrets,
+            )
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert result.status == "AUTHORIZED"
+    stored = json.loads(secrets.get("devspace-oauth") or "{}")
+    assert stored["access_token"] == "fake-access-token"
+    assert stored["refresh_token"] == "fake-refresh-token"
+    assert _FakeDevSpaceOAuthHandler.authorize_calls == 1
+    assert _FakeDevSpaceOAuthHandler.register_calls == 1
+    assert _FakeDevSpaceOAuthHandler.token_calls == 1
+
+    assert resumed.status == "AUTHORIZED"
+    assert _FakeDevSpaceOAuthHandler.authorize_calls == 1
+    assert _FakeDevSpaceOAuthHandler.register_calls == 1
+    assert _FakeDevSpaceOAuthHandler.token_calls == 1
+
+    redacted = json.dumps(redact_oauth_payload(stored))
+    assert "fake-access-token" not in redacted
+    assert "fake-refresh-token" not in redacted
 
 
 def test_codex_readiness_requires_more_than_an_executable() -> None:

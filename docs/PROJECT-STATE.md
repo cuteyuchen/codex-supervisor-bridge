@@ -361,8 +361,9 @@ The first implementation slice is intentionally backend-neutral and layered:
   `~/.devspace` source, and no stale managed `config.jsonc`;
 - a local-only Supervisor -> DevSpace OAuth driver using the MCP Python SDK
   OAuth client (discovery, dynamic registration, PKCE, bearer injection, and
-  refresh) with SecretStore-backed owner/OAuth credentials and redacted
-  diagnostics;
+  refresh) with SecretStore-backed owner/OAuth credentials, redacted
+  diagnostics, and a fake loopback OAuth protocol test that also proves
+  restart reuse of persisted tokens;
 - Local-Codex-Bridge canonical `node <repository>/dist/src/index.js` launch
   validation with npm-family launchers explicitly rejected at the stdio
   boundary, plus repository-driven Doctor and `start` resolution through

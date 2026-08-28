@@ -56,7 +56,7 @@ class SecretTokenStorage:
         return json.loads(raw)
 
     async def set_client_info(self, client_info: Any) -> None:
-        payload = client_info.model_dump_json(exclude_none=True, mode="json")
+        payload = json.dumps(client_info.model_dump(mode="json", exclude_none=True))
         self.secret_store.set(f"{self.secret_ref}-client", payload)
 
 
@@ -222,7 +222,15 @@ def redact_oauth_payload(value: Any) -> Any:
         return {
             key: redact_oauth_payload(item)
             for key, item in value.items()
-            if key not in {"access_token", "refresh_token", "code", "code_verifier", "owner_token"}
+            if key
+            not in {
+                "access_token",
+                "refresh_token",
+                "code",
+                "code_verifier",
+                "owner_token",
+                "client_secret",
+            }
         }
     if isinstance(value, list):
         return [redact_oauth_payload(item) for item in value]

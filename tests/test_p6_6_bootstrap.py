@@ -53,6 +53,7 @@ from codex_supervisor_bridge.bootstrap import (
 )
 from codex_supervisor_bridge.bootstrap.service import _find_executable
 from codex_supervisor_bridge.mcp.server import _is_loopback_host, build_parser
+from codex_supervisor_bridge.mcp.server import main as cli_main
 from codex_supervisor_bridge.memory.models import ActiveWriter
 
 
@@ -1177,3 +1178,314 @@ def test_profile_scenario_runner_executes_all_required_steps_without_raw_payload
     assert trace.steps == list(HarnessStep)
     assert len(trace.evidence) == len(HarnessStep)
     assert not hasattr(trace, "raw_payload")
+
+
+class SlowStopProcess(DummyProcess):
+    def __init__(self) -> None:
+        super().__init__()
+        self.kill_calls = 0
+        self._killed = False
+
+    def terminate(self) -> None:
+        return None
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self._killed = True
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        if not self._killed:
+            raise subprocess.TimeoutExpired(cmd=["dummy"], timeout=timeout or 0)
+        return int(self.returncode)
+
+
+def test_process_manager_does_not_launch_duplicate_while_running(tmp_path: Path) -> None:
+    launched: list[DummyProcess] = []
+
+    def launch(*args: object, **kwargs: object) -> DummyProcess:
+        del args, kwargs
+        process = DummyProcess()
+        launched.append(process)
+        return process
+
+    manager = ProcessManager(tmp_path / "runtime", tmp_path / "logs", launcher=launch)
+    spec = ManagedProcessSpec(name="bridge", command=["dummy"])
+
+    first = manager.start(spec)
+    second = manager.start(spec)
+
+    assert first.status == "RUNNING"
+    assert second is first
+    assert len(launched) == 1
+
+
+def test_process_manager_detects_crash_on_next_health_check(tmp_path: Path) -> None:
+    launched: list[DummyProcess] = []
+
+    def launch(*args: object, **kwargs: object) -> DummyProcess:
+        del args, kwargs
+        process = DummyProcess()
+        launched.append(process)
+        return process
+
+    manager = ProcessManager(tmp_path / "runtime", tmp_path / "logs", launcher=launch)
+    spec = ManagedProcessSpec(name="bridge", command=["dummy"])
+
+    assert manager.start(spec).status == "RUNNING"
+    launched[0].returncode = 1
+    crashed = manager.health("bridge")
+
+    assert crashed.status == "CRASHED"
+    assert crashed.last_exit == 1
+    assert manager.health("bridge").status == "CRASHED"
+    repaired = manager.repair_stale("bridge")
+    assert repaired.status == "STOPPED"
+    assert not (tmp_path / "runtime" / "bridge.lock").exists()
+
+
+def test_process_manager_restart_limit_is_bounded(tmp_path: Path) -> None:
+    launched: list[DummyProcess] = []
+
+    def launch(*args: object, **kwargs: object) -> DummyProcess:
+        del args, kwargs
+        process = DummyProcess()
+        process.returncode = 1
+        launched.append(process)
+        return process
+
+    manager = ProcessManager(tmp_path / "runtime", tmp_path / "logs", launcher=launch)
+    spec = ManagedProcessSpec(name="bridge", command=["dummy"], max_restarts=2)
+
+    assert manager.start(spec).status == "CRASHED"
+    assert manager.restart(spec).restart_count == 1
+    assert manager.restart(spec).restart_count == 2
+    blocked = manager.restart(spec)
+
+    assert blocked.status == "UNAVAILABLE"
+    assert blocked.restart_count == 3
+    assert blocked.technical_detail == "restart limit reached"
+    assert len(launched) == 3
+
+
+def test_process_manager_restart_reuses_log_and_persists_count(tmp_path: Path) -> None:
+    launched: list[DummyProcess] = []
+
+    def launch(*args: object, **kwargs: object) -> DummyProcess:
+        del args, kwargs
+        process = DummyProcess()
+        launched.append(process)
+        return process
+
+    manager = ProcessManager(tmp_path / "runtime", tmp_path / "logs", launcher=launch)
+    spec = ManagedProcessSpec(name="bridge", command=["dummy"])
+
+    running = manager.start(spec)
+    restarted = manager.restart(spec)
+
+    assert restarted.status == "RUNNING"
+    assert restarted.log_path == running.log_path
+    assert restarted.restart_count == 1
+    persisted = json.loads((tmp_path / "runtime" / "processes.json").read_text(encoding="utf-8"))
+    assert persisted["bridge"]["restart_count"] == 1
+    assert persisted["bridge"]["pid"] == restarted.pid
+
+
+def test_process_manager_readiness_probe_can_succeed(tmp_path: Path) -> None:
+    launched: list[DummyProcess] = []
+
+    def launch(*args: object, **kwargs: object) -> DummyProcess:
+        del args, kwargs
+        process = DummyProcess()
+        launched.append(process)
+        return process
+
+    manager = ProcessManager(tmp_path / "runtime", tmp_path / "logs", launcher=launch)
+    state = manager.start(
+        ManagedProcessSpec(
+            name="bridge",
+            command=["dummy"],
+            readiness_probe=lambda: True,
+        )
+    )
+
+    assert state.status == "RUNNING"
+    assert state.pid == launched[0].pid
+
+
+def test_process_manager_graceful_stop_falls_back_to_hard_kill(tmp_path: Path) -> None:
+    launched: list[SlowStopProcess] = []
+
+    def launch(*args: object, **kwargs: object) -> SlowStopProcess:
+        del args, kwargs
+        process = SlowStopProcess()
+        launched.append(process)
+        return process
+
+    manager = ProcessManager(tmp_path / "runtime", tmp_path / "logs", launcher=launch)
+    assert manager.start(ManagedProcessSpec(name="bridge", command=["dummy"])).status == "RUNNING"
+    stopped = manager.stop("bridge")
+
+    assert stopped.status == "STOPPED"
+    assert stopped.last_exit == -9
+    assert launched[0].kill_calls == 1
+    assert not (tmp_path / "runtime" / "bridge.lock").exists()
+
+
+def test_codex_readiness_full_probe_matrix(tmp_path: Path) -> None:
+    def completed(
+        command: list[str],
+        *,
+        stdout: str = "",
+        stderr: str = "",
+        returncode: int = 0,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+    calls: list[list[str]] = []
+
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        calls.append(command)
+        return completed(command)
+
+    missing = CodexReadinessDetector(finder=lambda name: None, runner=runner).probe()
+    assert missing.status == HealthStatus.UNAVAILABLE
+    assert missing.process_launchable is False
+    assert missing.technical_detail == "executable not found"
+    assert calls == []
+
+    version_failed = CodexReadinessDetector(
+        finder=lambda name: "C:/tools/codex.exe",
+        runner=lambda command, **kwargs: completed(command, returncode=1, stderr="panic"),
+    ).probe()
+    assert version_failed.status == HealthStatus.DEGRADED
+    assert version_failed.process_launchable is False
+    assert version_failed.user_message == "Codex needs sign-in or runtime repair."
+
+    def raising_runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del command, kwargs
+        raise OSError("cannot launch")
+
+    launch_failed = CodexReadinessDetector(
+        finder=lambda name: "C:/tools/codex.exe",
+        runner=raising_runner,
+    ).probe()
+    assert launch_failed.status == HealthStatus.DEGRADED
+    assert launch_failed.process_launchable is False
+    assert "cannot launch" in (launch_failed.technical_detail or "")
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".git").mkdir()
+
+    not_logged_in = CodexReadinessDetector(
+        finder=lambda name: "C:/tools/codex.exe",
+        runner=lambda command, **kwargs: completed(
+            command,
+            stdout="codex 1.2.3\n",
+            stderr="not logged in\n",
+        ),
+    ).probe(workspace=workspace)
+    assert not_logged_in.status == HealthStatus.DEGRADED
+    assert not_logged_in.authentication_ready is False
+    assert not_logged_in.workspace_ready is True
+
+    no_git = CodexReadinessDetector(
+        finder=lambda name: "C:/tools/codex.exe",
+        runner=lambda command, **kwargs: completed(command, stdout="codex 1.2.3\n"),
+    ).probe(workspace=tmp_path / "not-a-git-project")
+    assert no_git.status == HealthStatus.DEGRADED
+    assert no_git.workspace_ready is False
+    assert no_git.user_message == "Codex is ready, but the selected project is unavailable."
+
+    ready = CodexReadinessDetector(
+        finder=lambda name: "C:/tools/codex.exe",
+        runner=lambda command, **kwargs: completed(command, stdout="codex 1.2.3\nlogged in\n"),
+    ).probe(workspace=workspace)
+    assert ready.status == HealthStatus.READY
+    assert ready.process_launchable is True
+    assert ready.authentication_ready is True
+    assert ready.workspace_ready is True
+    assert ready.version == "codex 1.2.3"
+    assert ready.executable == "C:/tools/codex.exe"
+
+    explicit = tmp_path / "codex.exe"
+    explicit.write_text("placeholder", encoding="utf-8")
+    explicit_probe = CodexReadinessDetector(
+        finder=lambda name: None,
+        runner=lambda command, **kwargs: completed(command, stdout="codex 9.9.9\nready\n"),
+    ).probe(executable=str(explicit), workspace=workspace)
+    assert explicit_probe.status == HealthStatus.READY
+    assert explicit_probe.executable == str(explicit)
+
+
+def test_configure_cli_persists_user_intent_end_to_end(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from codex_supervisor_bridge.bootstrap.configuration import CommandPolicy, DevelopmentStyle
+
+    app = tmp_path / "app"
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("CODEX_SUPERVISOR_DATA_DIR", str(app))
+    monkeypatch.setenv("SUPERVISOR_DB_PATH", str(app / "data" / "supervisor.db"))
+
+    cli_main(
+        [
+            "configure",
+            "--project",
+            str(project),
+            "--style",
+            "web_first",
+            "--command-policy",
+            "ASK",
+            "--no-allow-codex-delegation",
+            "--auto-commit",
+            "--no-auto-pr",
+            "--json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    config = ConfigStore(paths=AppDataPaths.from_environment()).load().config
+    assert payload["project_directory"] == str(project.resolve())
+    assert config.basic.project_directory == project.resolve()
+    assert config.basic.development_style == DevelopmentStyle.WEB_FIRST
+    assert config.basic.local_command_policy == CommandPolicy.ASK
+    assert config.basic.allow_chatgpt_codex_delegation is False
+    assert config.basic.automatic_git_commit is True
+    assert config.basic.automatic_pull_request is False
+    rendered = json.dumps(payload, ensure_ascii=False).lower()
+    assert "devspace" not in rendered
+    assert "local-codex-bridge" not in rendered
+
+
+def test_configure_cli_advanced_json_keeps_gui_diagnostics(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    app = tmp_path / "app"
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("CODEX_SUPERVISOR_DATA_DIR", str(app))
+    monkeypatch.setenv("SUPERVISOR_DB_PATH", str(app / "data" / "supervisor.db"))
+
+    cli_main(
+        [
+            "configure",
+            "--project",
+            str(project),
+            "--advanced",
+            "--json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["project_directory"] == str(project.resolve())
+    assert "selected_profile" in payload
+    assert "diagnostics" in payload
+    assert any(item["capability"] == "Project directory" for item in payload["diagnostics"])

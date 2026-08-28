@@ -373,7 +373,19 @@ The first implementation slice is intentionally backend-neutral and layered:
   boundary, plus repository-driven Doctor and `start` resolution through
   `local_codex_repository` / `executable_paths.node` and Node.js 24+ version
   enforcement;
-- fake process/provider harnesses for Profile A/B semantic comparison.
+- fake process/provider harnesses for Profile A/B semantic comparison;
+- ProcessManager watchdog behavior is now covered end to end: crashed-process
+  detection clears the dead PID so later health checks remain CRASHED instead
+  of degrading to STALE, bounded restarts fail closed at `max_restarts`, restart
+  reuses the same log path, graceful stop falls back to hard kill on timeout,
+  and a running component is never launched twice;
+- CodexReadinessDetector is covered by the full probe matrix: missing
+  executable, version-command failure with preserved diagnostic detail,
+  launch exception, missing/uninitialized workspace, sign-in inference, and
+  explicit absolute executable resolution;
+- the `configure` CLI is covered by an end-to-end `main()` test that persists
+  Basic user intent into the versioned settings file and emits normal UX JSON
+  without provider names, plus an advanced JSON test for future GUI consumers.
 
 The current code-level work does not claim real Windows OAuth, ChatGPT Web
 Remote MCP attachment, tunnel-provider login, or authenticated Codex runtime

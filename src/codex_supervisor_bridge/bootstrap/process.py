@@ -142,6 +142,7 @@ class ProcessManager:
         if process.poll() is not None:
             state.status = "CRASHED" if process.returncode else "STOPPED"
             state.last_exit = process.returncode
+            state.pid = None
             state._process = None
             lock_path.unlink(missing_ok=True)
         elif spec.readiness_probe is not None:
@@ -163,6 +164,7 @@ class ProcessManager:
             process.wait(timeout=2)
         state.status = "STOPPED"
         state.last_exit = process.returncode
+        state.pid = None
         state._process = None
         self._lock_path(name).unlink(missing_ok=True)
         return self._record(state)
@@ -183,8 +185,11 @@ class ProcessManager:
                 return state
             state.status = "CRASHED" if returncode else "STOPPED"
             state.last_exit = returncode
+            state.pid = None
             state._process = None
             return self._record(state)
+        if state.pid is None:
+            return state
         if state.pid and _pid_exists(state.pid):
             state.status = "UNKNOWN"
             state.technical_detail = "persisted PID is alive without an attached process handle"
@@ -247,7 +252,12 @@ class ProcessManager:
         state = ProcessState(
             name=name,
             status=str(item.get("status", "STOPPED")),
-            pid=item.get("pid") if isinstance(item.get("pid"), int) else None,
+            pid=(
+                item.get("pid")
+                if isinstance(item.get("pid"), int)
+                and str(item.get("status", "STOPPED")) not in {"CRASHED", "STOPPED"}
+                else None
+            ),
             last_exit=item.get("last_exit") if isinstance(item.get("last_exit"), int) else None,
             log_path=Path(item["log_path"]) if item.get("log_path") else None,
             restart_count=int(item.get("restart_count", 0)),
@@ -274,6 +284,7 @@ class ProcessManager:
             if returncode is not None:
                 state.status = "CRASHED" if returncode else "STOPPED"
                 state.last_exit = returncode
+                state.pid = None
                 state._process = None
                 lock_path.unlink(missing_ok=True)
                 return state
@@ -288,6 +299,7 @@ class ProcessManager:
                 self._terminate(process, spec.shutdown_timeout)
                 state.status = "UNAVAILABLE"
                 state.last_exit = process.returncode
+                state.pid = None
                 state._process = None
                 state.technical_detail = "startup timeout"
                 lock_path.unlink(missing_ok=True)

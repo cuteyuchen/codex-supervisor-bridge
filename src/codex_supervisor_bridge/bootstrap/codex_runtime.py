@@ -48,7 +48,8 @@ class CodexReadinessDetector:
                 executable=resolved,
                 process_launchable=False,
                 user_message="Codex needs sign-in or runtime repair.",
-                technical_detail="version command failed",
+                technical_detail=_first_line(version.stderr or version.stdout)
+                or "version command failed",
             )
         workspace_ready = workspace is None or (workspace.is_dir() and (workspace / ".git").exists())
         auth_ready = _auth_from_output(version.stdout, version.stderr)

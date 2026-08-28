@@ -64,6 +64,8 @@ class BootstrapService:
         allow_chatgpt_codex_delegation: bool | None = None,
         automatic_git_commit: bool | None = None,
         automatic_pull_request: bool | None = None,
+        local_codex_repository: Path | None = None,
+        node_executable: str | None = None,
     ) -> BootstrapStatus:
         config = self.config_store.load().config
         if project_directory is not None:
@@ -78,6 +80,10 @@ class BootstrapService:
             config.basic.automatic_git_commit = automatic_git_commit
         if automatic_pull_request is not None:
             config.basic.automatic_pull_request = automatic_pull_request
+        if local_codex_repository is not None:
+            config.advanced.local_codex_repository = local_codex_repository.expanduser().resolve()
+        if node_executable is not None:
+            config.advanced.executable_paths["node"] = node_executable
         self.config_store.save(config)
         return self.status(project_directory=project_directory or config.basic.project_directory)
 

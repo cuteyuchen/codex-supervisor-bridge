@@ -177,6 +177,17 @@ def build_parser(settings: Settings | None = None) -> argparse.ArgumentParser:
         help="Automatically create draft pull requests",
     )
     parser.add_argument(
+        "--local-codex-repository",
+        type=Path,
+        default=None,
+        help="Local-Codex-Bridge repository path for configure",
+    )
+    parser.add_argument(
+        "--node",
+        default=None,
+        help="Node.js executable path for configure",
+    )
+    parser.add_argument(
         "--database",
         type=Path,
         default=settings.database_path,
@@ -239,6 +250,8 @@ def main(argv: list[str] | None = None) -> None:
                 allow_chatgpt_codex_delegation=args.allow_codex_delegation,
                 automatic_git_commit=args.auto_commit,
                 automatic_pull_request=args.auto_pr,
+                local_codex_repository=args.local_codex_repository,
+                node_executable=args.node,
             )
         else:
             result = bootstrap.start(project_directory=args.project)

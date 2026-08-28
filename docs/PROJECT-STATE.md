@@ -338,8 +338,9 @@ The first implementation slice is intentionally backend-neutral and layered:
 
 - persistent versioned user configuration with Basic / Advanced projections;
 - `codex-supervisor configure` persists project directory and Basic user intent
-  (development style, command policy, delegation, auto commit/PR) without
-  exposing backend names;
+  (development style, command policy, delegation, auto commit/PR), plus the
+  Local-Codex-Bridge repository and Node executable, without exposing backend
+  names in the normal workflow;
 - Windows-aware application data directories under `%LOCALAPPDATA%` with
   portable test overrides;
 - platform, executable, runtime, project, GitHub, port, and local bind probes;

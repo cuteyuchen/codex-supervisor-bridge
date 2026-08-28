@@ -106,6 +106,8 @@ def test_configure_persists_user_intent_and_cli_flags(tmp_path: Path) -> None:
     )
     project = tmp_path / "project"
     project.mkdir()
+    local_repository = tmp_path / "Local-Codex-Bridge"
+    local_repository.mkdir()
     service = BootstrapService(paths=paths)
     result = service.configure(
         project_directory=project,
@@ -114,6 +116,8 @@ def test_configure_persists_user_intent_and_cli_flags(tmp_path: Path) -> None:
         allow_chatgpt_codex_delegation=True,
         automatic_git_commit=True,
         automatic_pull_request=False,
+        local_codex_repository=local_repository,
+        node_executable="C:/Program Files/nodejs/node.exe",
     )
 
     config = ConfigStore(paths=paths).load().config
@@ -123,6 +127,8 @@ def test_configure_persists_user_intent_and_cli_flags(tmp_path: Path) -> None:
     assert config.basic.allow_chatgpt_codex_delegation is True
     assert config.basic.automatic_git_commit is True
     assert config.basic.automatic_pull_request is False
+    assert config.advanced.local_codex_repository == local_repository.resolve()
+    assert config.advanced.executable_paths["node"] == "C:/Program Files/nodejs/node.exe"
     assert result.project_directory == str(project.resolve())
 
     namespace = build_parser().parse_args(
@@ -134,12 +140,18 @@ def test_configure_persists_user_intent_and_cli_flags(tmp_path: Path) -> None:
             "web_first",
             "--allow-codex-delegation",
             "--no-auto-commit",
+            "--local-codex-repository",
+            str(local_repository),
+            "--node",
+            "C:/Program Files/nodejs/node.exe",
         ]
     )
     assert namespace.command == "configure"
     assert namespace.style == "web_first"
     assert namespace.allow_codex_delegation is True
     assert namespace.auto_commit is False
+    assert namespace.local_codex_repository == local_repository
+    assert namespace.node == "C:/Program Files/nodejs/node.exe"
 
 
 def test_port_allocator_prefers_configured_port_then_recovers_conflict() -> None:

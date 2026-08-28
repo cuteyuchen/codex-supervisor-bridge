@@ -27,6 +27,9 @@ from .remote import SecureRemoteAccessConfig, SecureRemoteAccessValidator
 
 CommandRunner = Callable[[list[str]], subprocess.CompletedProcess[str]]
 
+NODE_PROFILE_B_MIN_MAJOR = 24
+NODE_PROFILE_B_MAX_EXCLUSIVE_MAJOR = 27
+
 
 @dataclass(frozen=True)
 class DoctorOptions:
@@ -370,19 +373,28 @@ class Doctor:
         node_version = _first_line(version_result.stdout or version_result.stderr) if version_result.returncode == 0 else None
         match = re.search(r"(\d+)", node_version or "")
         node_major = int(match.group(1)) if match else None
-        if node_major is None or node_major < 24:
+        if (
+            node_major is None
+            or node_major < NODE_PROFILE_B_MIN_MAJOR
+            or node_major >= NODE_PROFILE_B_MAX_EXCLUSIVE_MAJOR
+        ):
             return ComponentHealth(
                 capability="Codex control",
                 status=HealthStatus.DEGRADED,
                 repairable=True,
-                user_message="Codex control needs Node.js 24 or newer.",
+                user_message=(
+                    "Codex control needs a compatible Node.js runtime."
+                ),
                 recommended_action="repair_codex_control",
                 advanced={
                     "provider": "local-codex-bridge",
                     "repository": str(resolved),
                     "entrypoint": str(entrypoint),
                     "node_version": node_version,
-                    "technical_detail": "Local-Codex-Bridge requires Node.js 24+",
+                    "node_required_range": ">=24, <27",
+                    "technical_detail": (
+                        "Profile B common runtime floor is Node.js >=24 and <27"
+                    ),
                 },
             )
         return ComponentHealth(

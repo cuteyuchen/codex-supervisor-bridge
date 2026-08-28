@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shlex
 import shutil
 import sys
@@ -11,7 +12,7 @@ from codex_supervisor_bridge.capabilities import CapabilityResolver
 from .configuration import AppConfig, CommandPolicy, ConfigStore, DevelopmentStyle
 from .devspace import DevSpaceBootstrap
 from .doctor import Doctor, DoctorOptions
-from .local_codex import LocalCodexBridgeBootstrap, LocalCodexBridgeBootstrapConfig
+from .local_codex import LocalCodexBridgeBootstrap
 from .models import BootstrapStatus, DoctorStatus, HealthStatus, RepairAction
 from .paths import AppDataPaths
 from .process import ManagedProcessSpec, ProcessManager
@@ -117,6 +118,9 @@ class BootstrapService:
             ],
             startup_timeout=config.advanced.startup_timeout_seconds,
             shutdown_timeout=config.advanced.shutdown_timeout_seconds,
+            readiness_probe=lambda: _readiness_marker_present(
+                self.paths.logs / "supervisor.log"
+            ),
         )
         try:
             state = self.process_manager.start(spec)
@@ -131,11 +135,25 @@ class BootstrapService:
                 )
             )
             return result
+        readiness = _read_readiness_marker(state.log_path)
+        start_status = (
+            HealthStatus.READY
+            if state.status == "RUNNING" and (readiness is None or readiness == HealthStatus.READY)
+            else HealthStatus.DEGRADED
+            if state.status == "RUNNING"
+            else HealthStatus.UNAVAILABLE
+        )
         start_action = RepairAction(
             action="start_supervisor",
-            status=HealthStatus.READY if state.status == "RUNNING" else HealthStatus.UNAVAILABLE,
-            message="Local development environment started." if state.status == "RUNNING" else "Local development environment could not start.",
-            advanced=state.as_dict(),
+            status=start_status,
+            message=(
+                "Local development environment started."
+                if state.status == "RUNNING" and readiness == HealthStatus.READY
+                else "Local development environment started with a repair needed."
+                if state.status == "RUNNING"
+                else "Local development environment could not start."
+            ),
+            advanced={**state.as_dict(), "readiness": readiness.value if readiness else None},
         )
         result.repairs.append(start_action)
         devspace_executable = config.advanced.executable_paths.get("devspace", "devspace")
@@ -181,66 +199,51 @@ class BootstrapService:
                         advanced={"technical_detail": str(exc)},
                     )
                 )
-        local_codex_command = config.advanced.process_commands.get("local_codex_bridge")
-        local_codex_bootstrap: LocalCodexBridgeBootstrap | None = None
-        if local_codex_command and local_codex_command.strip():
-            local_codex_bootstrap = LocalCodexBridgeBootstrap(
-                LocalCodexBridgeBootstrapConfig(
-                    launch_command=shlex.split(local_codex_command, posix=False)
-                )
-            )
+        control_health = result.doctor.component("Codex control")
+        lcb_command = config.advanced.process_commands.get("local_codex_bridge")
+        launch: list[str] | None = None
+        if lcb_command and lcb_command.strip():
+            launch = shlex.split(lcb_command, posix=False)
         elif config.advanced.local_codex_repository:
-            control_health = result.doctor.component("Codex control")
-            if control_health is not None and control_health.status != HealthStatus.READY:
-                result.repairs.append(
-                    RepairAction(
-                        action="start_process:local_codex_bridge",
-                        status=control_health.status,
-                        message=control_health.user_message,
-                        requires_user_action=True,
-                        advanced=dict(control_health.advanced),
-                    )
-                )
-            else:
-                try:
-                    local_codex_bootstrap = LocalCodexBridgeBootstrap.from_repository(
-                        config.advanced.local_codex_repository,
-                        node_executable=config.advanced.executable_paths.get("node", "node"),
-                    )
-                except FileNotFoundError as exc:
-                    result.repairs.append(
-                        RepairAction(
-                            action="start_process:local_codex_bridge",
-                            status=HealthStatus.UNAVAILABLE,
-                            message="Codex control needs an update or build.",
-                            requires_user_action=True,
-                            advanced={"technical_detail": str(exc)},
-                        )
-                    )
-        if local_codex_bootstrap is not None:
             try:
-                component = self.process_manager.start(
-                    local_codex_bootstrap.process_spec(
-                        startup_timeout=config.advanced.startup_timeout_seconds,
-                        shutdown_timeout=config.advanced.shutdown_timeout_seconds,
-                    )
-                )
-            except (OSError, ValueError) as exc:
+                launch = LocalCodexBridgeBootstrap.from_repository(
+                    config.advanced.local_codex_repository,
+                    node_executable=config.advanced.executable_paths.get("node", "node"),
+                ).config.launch_command
+            except FileNotFoundError as exc:
+                launch = None
                 result.repairs.append(
                     RepairAction(
-                        action="start_process:local_codex_bridge",
+                        action="agent_session:local_codex_bridge",
                         status=HealthStatus.UNAVAILABLE,
-                        message="Codex control could not start.",
+                        message="Codex control needs an update or build.",
+                        requires_user_action=True,
                         advanced={"technical_detail": str(exc)},
                     )
                 )
+        if launch:
+            if control_health is not None and control_health.status != HealthStatus.READY:
+                result.repairs.append(
+                    RepairAction(
+                        action="agent_session:local_codex_bridge",
+                        status=control_health.status,
+                        message=control_health.user_message,
+                        requires_user_action=True,
+                        advanced={**dict(control_health.advanced), "launch_command": launch},
+                    )
+                )
             else:
                 result.repairs.append(
                     RepairAction(
-                        action="start_process:local_codex_bridge",
-                        status=HealthStatus.READY if component.status == "RUNNING" else HealthStatus.UNAVAILABLE,
-                        message="Codex control started." if component.status == "RUNNING" else "Codex control could not start.",
-                        advanced=component.as_dict(),
+                        action="agent_session:local_codex_bridge",
+                        status=HealthStatus.READY,
+                        message="Codex control is ready.",
+                        requires_user_action=False,
+                        advanced={
+                            "managed_by": "agent_session_manager",
+                            "daemon": False,
+                            "launch_command": launch,
+                        },
                     )
                 )
         for name, command in config.advanced.process_commands.items():
@@ -278,6 +281,9 @@ class BootstrapService:
                 )
             )
         final = self.status(project_directory=project_directory)
+        if readiness is not None and readiness != HealthStatus.READY:
+            final.status = readiness
+            final.summary = _summary(readiness)
         final.repairs = [*result.repairs]
         return final
 
@@ -327,3 +333,27 @@ def _profile(config: AppConfig, doctor: DoctorStatus) -> str:
 
 def _find_executable(value: str) -> str | None:
     return value if Path(value).is_file() else shutil.which(value)
+
+
+def _read_readiness_marker(log_path: Path | None) -> HealthStatus | None:
+    if log_path is None or not log_path.exists():
+        return None
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in reversed(text.splitlines()):
+        if "SUPERVISOR_READY" not in line:
+            continue
+        match = re.search(r"status=([A-Z_]+)", line)
+        if match is None:
+            return None
+        try:
+            return HealthStatus(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _readiness_marker_present(log_path: Path | None) -> bool:
+    return _read_readiness_marker(log_path) is not None

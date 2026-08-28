@@ -571,9 +571,15 @@ def test_bootstrap_start_uses_local_codex_protocol_bootstrap(tmp_path: Path) -> 
         ),
     ).start(project_directory=tmp_path)
 
-    local = next(item for item in process_manager.started if item.name == "local_codex_bridge")
-    assert list(local.command) == ["node", "bridge.js"]
-    assert any(item.action == "start_process:local_codex_bridge" for item in result.repairs)
+    assert not any(spec.name == "local_codex_bridge" for spec in process_manager.started)
+    action = next(
+        item
+        for item in result.repairs
+        if item.action == "agent_session:local_codex_bridge"
+    )
+    assert action.status == HealthStatus.READY
+    assert action.advanced["launch_command"] == ["node", "bridge.js"]
+    assert action.advanced["daemon"] is False
 
 
 def test_bootstrap_start_uses_local_codex_repository_launch(tmp_path: Path) -> None:
@@ -629,9 +635,18 @@ def test_bootstrap_start_uses_local_codex_repository_launch(tmp_path: Path) -> N
         ),
     ).start(project_directory=tmp_path)
 
-    local = next(item for item in process_manager.started if item.name == "local_codex_bridge")
-    assert list(local.command) == ["C:/Program Files/nodejs/node.exe", str(entrypoint.resolve())]
-    assert any(item.action == "start_process:local_codex_bridge" for item in result.repairs)
+    assert not any(spec.name == "local_codex_bridge" for spec in process_manager.started)
+    action = next(
+        item
+        for item in result.repairs
+        if item.action == "agent_session:local_codex_bridge"
+    )
+    assert action.status == HealthStatus.READY
+    assert action.advanced["launch_command"] == [
+        "C:/Program Files/nodejs/node.exe",
+        str(entrypoint.resolve()),
+    ]
+    assert action.advanced["managed_by"] == "agent_session_manager"
 
 
 def test_bootstrap_start_skips_incompatible_devspace_release(tmp_path: Path) -> None:
@@ -746,7 +761,7 @@ def test_bootstrap_start_skips_local_codex_bridge_with_old_node(tmp_path: Path) 
     ).start(project_directory=tmp_path)
 
     control_action = next(
-        item for item in result.repairs if item.action == "start_process:local_codex_bridge"
+        item for item in result.repairs if item.action == "agent_session:local_codex_bridge"
     )
     assert control_action.status == HealthStatus.DEGRADED
     assert control_action.requires_user_action is True
@@ -810,17 +825,14 @@ def test_bootstrap_start_launches_all_healthy_components(tmp_path: Path) -> None
         doctor=doctor,
     ).start(project_directory=tmp_path)
 
-    assert [spec.name for spec in process_manager.started] == [
-        "supervisor",
-        "devspace",
-        "local_codex_bridge",
-    ]
+    assert [spec.name for spec in process_manager.started] == ["supervisor", "devspace"]
     devspace_spec = next(spec for spec in process_manager.started if spec.name == "devspace")
     assert list(devspace_spec.command) == [str(devspace_executable), "serve"]
     assert devspace_spec.env is not None
     assert devspace_spec.env["DEVSPACE_CONFIG_DIR"] == str(paths.config / "devspace")
     assert any(item.action == "start_process:devspace" for item in result.repairs)
-    assert any(item.action == "start_process:local_codex_bridge" for item in result.repairs)
+    assert any(item.action == "agent_session:local_codex_bridge" for item in result.repairs)
+    assert not any(spec.name == "local_codex_bridge" for spec in process_manager.started)
 
 
 def test_http_mcp_bind_must_be_loopback() -> None:

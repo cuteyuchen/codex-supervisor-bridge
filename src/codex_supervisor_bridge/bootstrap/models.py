@@ -97,6 +97,8 @@ class BootstrapStatus(BaseModel):
 
 
 def _public_repair_action(action: str) -> str:
+    if action.startswith("agent_session:"):
+        return "start_codex_control"
     if action.startswith("start_process:") or action.startswith("repair_process:"):
         return "repair_local_component"
     return {

@@ -41,6 +41,12 @@ from .harness import (
     ProfileScenarioRunner,
     ScenarioObservation,
 )
+from .installer import (
+    ComponentInstaller,
+    ComponentManifest,
+    InstallPlan,
+    InstallResult,
+)
 from .local_codex import LocalCodexBridgeBootstrap, LocalCodexBridgeBootstrapConfig
 from .models import (
     BootstrapStatus,
@@ -80,6 +86,8 @@ __all__ = [
     "CommandSessionStatus",
     "CommandVerdict",
     "ComponentHealth",
+    "ComponentInstaller",
+    "ComponentManifest",
     "ConfigLoadResult",
     "ConfigStore",
     "CodexReadiness",
@@ -97,6 +105,8 @@ __all__ = [
     "HarnessStep",
     "HarnessTrace",
     "HealthStatus",
+    "InstallPlan",
+    "InstallResult",
     "ManagedProcessSpec",
     "LocalCodexBridgeBootstrap",
     "LocalCodexBridgeBootstrapConfig",

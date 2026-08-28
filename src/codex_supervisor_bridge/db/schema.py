@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA_SQL = r"""
 PRAGMA foreign_keys = ON;
@@ -434,6 +434,21 @@ CREATE TABLE IF NOT EXISTS task_agent_safety (
 
 CREATE INDEX IF NOT EXISTS idx_task_agent_safety_state
 ON task_agent_safety(state, updated_at DESC);
+"""
+
+BACKEND_BINDING_MIGRATION_SQL = r"""
+CREATE TABLE IF NOT EXISTS task_backend_binding (
+    task_id TEXT PRIMARY KEY REFERENCES supervised_tasks(task_id) ON DELETE CASCADE,
+    workspace_backend TEXT NOT NULL,
+    agent_backend TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    bound_revision INTEGER NOT NULL CHECK (bound_revision >= 0),
+    bound_epoch INTEGER NOT NULL DEFAULT 1 CHECK (bound_epoch >= 1),
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_backend_binding_backends
+ON task_backend_binding(workspace_backend, agent_backend);
 """
 
 OPTIONAL_FTS_SQL = r"""

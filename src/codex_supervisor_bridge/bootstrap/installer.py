@@ -17,6 +17,8 @@ from pydantic import BaseModel, Field, field_validator
 from .archive import extract_tar_safe, extract_zip_safe
 from .download import HttpsDownloader
 
+INSTALL_COMMAND_TIMEOUT_SECONDS = 300.0
+
 
 class ComponentManifest(BaseModel):
     """Pinned, user-safe component descriptor managed by the Bridge."""
@@ -198,14 +200,20 @@ class ComponentInstaller:
 
     @staticmethod
     def _default_runner(command: list[str], cwd: Path) -> int:
-        result = subprocess.run(
-            list(command),
-            cwd=str(cwd),
-            shell=False,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                list(command),
+                cwd=str(cwd),
+                shell=False,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=INSTALL_COMMAND_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"install command timed out after {INSTALL_COMMAND_TIMEOUT_SECONDS:g} seconds"
+            ) from exc
         return result.returncode
 
     def _current_version(self, component_root: Path) -> dict[str, object] | None:

@@ -340,7 +340,7 @@ def main(argv: list[str] | None = None) -> None:
     if repository is not None:
         try:
             launch_command = lcb_launch_from_config(
-                repository,
+                repository=repository,
                 node_executable=config.advanced.executable_paths.get("node", "node"),
             )
         except FileNotFoundError:

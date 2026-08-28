@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import subprocess
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+import codex_supervisor_bridge.bootstrap.installer as installer_module
 from codex_supervisor_bridge.bootstrap import (
     ManagedComponentRegistry,
 )
@@ -269,6 +271,21 @@ def test_installer_uses_managed_node_for_npm_commands(tmp_path: Path) -> None:
     assert commands[0][2:] == ["ci"]
 
 
+def test_default_install_runner_has_a_bounded_timeout(tmp_path: Path, monkeypatch) -> None:
+    observed: dict[str, object] = {}
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed.update(kwargs)
+        raise subprocess.TimeoutExpired(cmd=command, timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(installer_module.subprocess, "run", run)
+
+    with pytest.raises(RuntimeError, match="install command timed out"):
+        ComponentInstaller._default_runner(["npm", "ci"], tmp_path)
+
+    assert observed["timeout"] == installer_module.INSTALL_COMMAND_TIMEOUT_SECONDS
+
+
 def test_builtin_registry_uses_pinned_versions_and_no_floating_latest() -> None:
     registry = ManagedComponentRegistry()
     node = registry.manifest("nodejs")
@@ -427,6 +444,65 @@ def test_repair_exposes_install_plan_only_in_advanced_diagnostics(tmp_path: Path
         for item in advanced
     }
     assert planned_names == {"nodejs", "devspace", "local-codex-bridge"}
+
+
+def test_repair_plans_managed_node_even_when_system_node_is_ready(tmp_path: Path) -> None:
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Windows",
+    )
+
+    class SystemNodeDoctor:
+        def run(self, options: object | None = None) -> DoctorStatus:
+            del options
+            return DoctorStatus(
+                status=HealthStatus.DEGRADED,
+                components=[
+                    ComponentHealth(
+                        capability="Node.js",
+                        status=HealthStatus.READY,
+                        user_message="Node.js is ready.",
+                        advanced={"executable": "C:/node/node.exe", "version": "v24.9.0"},
+                    ),
+                    ComponentHealth(
+                        capability="Local workspace",
+                        status=HealthStatus.UNAVAILABLE,
+                        user_message="Local workspace is not installed.",
+                        repairable=True,
+                    ),
+                    ComponentHealth(
+                        capability="Codex control",
+                        status=HealthStatus.UNAVAILABLE,
+                        user_message="Codex control is not installed.",
+                        repairable=True,
+                    ),
+                ],
+            )
+
+    registry = ManagedComponentRegistry()
+    service = RepairService(
+        paths=paths,
+        doctor=SystemNodeDoctor(),  # type: ignore[arg-type]
+        installer=ComponentInstaller(
+            paths.components,
+            trusted_manifests=registry.manifests(),
+        ),
+        registry=registry,
+        secret_store=MemorySecretStore(),
+    )
+
+    actions = service.repair(project_directory=tmp_path)
+    install_actions = {
+        action.action
+        for action in actions
+        if action.action.startswith("install_component:")
+    }
+
+    assert install_actions == {
+        "install_component:nodejs",
+        "install_component:devspace",
+        "install_component:local-codex-bridge",
+    }
 
 
 def test_repair_executes_trusted_install_and_registers_managed_paths(

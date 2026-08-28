@@ -37,7 +37,7 @@ from codex_supervisor_bridge.memory.service import MemoryService
 from codex_supervisor_bridge.memory.workspace import bind_workspace
 from codex_supervisor_bridge.supervisor.agent_execution import AgentExecutionCoordinator
 from codex_supervisor_bridge.supervisor.agent_session import AgentSessionManager
-from codex_supervisor_bridge.supervisor.runtime import RuntimeComposition
+from codex_supervisor_bridge.supervisor.runtime import RuntimeComposition, lcb_launch_from_config
 from codex_supervisor_bridge.supervisor.runtime_resolver import RuntimeResolver
 
 
@@ -152,6 +152,19 @@ class StartupFakeAgent:
             "thread_id": handle.thread_id,
             "turn_id": handle.turn_id,
         }
+
+
+def test_lcb_launch_from_config_resolves_keyword_only_repository(tmp_path: Path) -> None:
+    entrypoint = tmp_path / "dist" / "src" / "index.js"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("console.log('ready')\n", encoding="utf-8")
+
+    command = lcb_launch_from_config(
+        repository=tmp_path,
+        node_executable="managed-node.exe",
+    )
+
+    assert command == ["managed-node.exe", str(entrypoint.resolve())]
 
 
 class StartupFakeWorkspace:

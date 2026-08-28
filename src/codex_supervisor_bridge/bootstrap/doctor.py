@@ -25,7 +25,7 @@ from .ports import PortAllocator
 from .process import ProcessManager
 from .remote import SecureRemoteAccessConfig, SecureRemoteAccessValidator
 
-CommandRunner = Callable[[list[str]], subprocess.CompletedProcess[str]]
+CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 NODE_PROFILE_B_MIN_MAJOR = 24
 NODE_PROFILE_B_MAX_EXCLUSIVE_MAJOR = 27
@@ -465,7 +465,7 @@ class Doctor:
         configured = config.advanced.executable_paths.get("codex")
         detector = CodexReadinessDetector(
             finder=self._find,
-            runner=lambda command, **kwargs: self._run(command),
+            runner=lambda command, **kwargs: self._run(command, **kwargs),
         )
         config_path = config.advanced.backend_detail.get("codex_config_path")
         readiness = detector.probe(
@@ -607,7 +607,20 @@ class Doctor:
         )
 
     @staticmethod
-    def _run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
+    def _run_command(
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if kwargs:
+            return subprocess.run(
+                command,
+                capture_output=bool(kwargs.get("capture_output", True)),
+                text=bool(kwargs.get("text", True)),
+                encoding=str(kwargs.get("encoding", "utf-8")),
+                errors=str(kwargs.get("errors", "replace")),
+                timeout=float(kwargs.get("timeout", 5)),
+                check=bool(kwargs.get("check", False)),
+            )
         try:
             return subprocess.run(
                 command,

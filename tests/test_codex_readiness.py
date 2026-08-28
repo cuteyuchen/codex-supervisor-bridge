@@ -13,6 +13,7 @@ from codex_supervisor_bridge.bootstrap import (
 )
 from codex_supervisor_bridge.bootstrap.configuration import ConfigStore
 from codex_supervisor_bridge.bootstrap.doctor import Doctor
+from codex_supervisor_bridge.bootstrap.models import HealthStatus
 from codex_supervisor_bridge.bootstrap.paths import AppDataPaths
 from codex_supervisor_bridge.supervisor.runtime import RuntimeComposition
 
@@ -310,6 +311,45 @@ def test_secret_sentinel_is_absent_from_full_doctor_output(
     rendered = json.dumps(status.model_dump(mode="json"), ensure_ascii=True)
     assert SENTINEL not in rendered
     assert "SUPER_SECRET_PROVIDER_KEY" not in rendered
+
+
+def test_doctor_preserves_runtime_smoke_timeout_budget(tmp_path: Path) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    write_custom_config(codex_home / "config.toml")
+    app_root = tmp_path / "app"
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    commands: list[tuple[list[str], dict[str, object]]] = []
+
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append((list(command), dict(kwargs)))
+        if "--version" in command:
+            return subprocess.CompletedProcess(command, 0, "codex 1.2.3\n", "")
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        output_path.write_text("CODEX_RUNTIME_READY", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    doctor = Doctor(
+        paths=AppDataPaths.from_environment(
+            environ={
+                "CODEX_SUPERVISOR_DATA_DIR": str(app_root),
+                "CODEX_HOME": str(codex_home),
+                "THIRD_PARTY_API_KEY": "present-but-never-rendered",
+            },
+            system="Windows",
+        ),
+        executable_finder=lambda name: "C:/tools/codex.exe" if name == "codex" else None,
+        command_runner=runner,
+    )
+    status = doctor.run()
+    codex = status.component("Codex")
+
+    assert codex is not None
+    assert codex.status == HealthStatus.READY
+    smoke_calls = [kwargs for command, kwargs in commands if "--output-last-message" in command]
+    assert smoke_calls
+    assert smoke_calls[0]["timeout"] == 30.0
 
 
 class FakeWorkspace:

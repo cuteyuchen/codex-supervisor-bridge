@@ -128,7 +128,15 @@ class RepairService:
             )
         )
         node_item = node_required.component("Node.js")
-        if node_item is not None and node_item.status != HealthStatus.READY:
+        # Profile B dependencies must use the pinned managed Node runtime. A
+        # compatible system Node is still insufficient because npm lifecycle
+        # commands are launched through that managed runtime on Windows.
+        managed_node_ready = bool(
+            node_item is not None
+            and isinstance(node_item.advanced, dict)
+            and node_item.advanced.get("managed") is True
+        )
+        if node_item is not None and (node_item.status != HealthStatus.READY or not managed_node_ready):
             actions.append(self._install_action("nodejs", node_item))
         for name, label in (
             ("devspace", "Local workspace"),

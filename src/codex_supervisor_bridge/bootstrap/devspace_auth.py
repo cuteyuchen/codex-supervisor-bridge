@@ -4,7 +4,7 @@ import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, AsyncContextManager, AsyncIterator, Callable, Protocol
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlparse
 
 import httpx2
 from mcp.client.auth.oauth2 import OAuthClientInformationFull, OAuthClientProvider
@@ -89,9 +89,13 @@ class DevSpaceLocalOAuthDriver:
         authorization_url: str,
         owner_token: str,
     ) -> AuthorizationCodeResult:
+        authorization_fields = dict(
+            parse_qsl(urlparse(authorization_url).query, keep_blank_values=True)
+        )
+        authorization_fields["owner_token"] = owner_token
         response = await client.post(
             authorization_url,
-            data={"owner_token": owner_token},
+            data=authorization_fields,
             follow_redirects=False,
         )
         if response.status_code not in {301, 302, 303, 307, 308}:

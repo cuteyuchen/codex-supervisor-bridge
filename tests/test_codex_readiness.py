@@ -146,6 +146,20 @@ def test_config_inspector_distinguishes_auth_mode_categories(tmp_path: Path) -> 
     custom_inspection = CodexConfigInspector(config_path=custom).inspect()
     assert custom_inspection.auth_mode == CodexAuthMode.CUSTOM_PROVIDER
 
+    custom_openai_auth = tmp_path / "custom-openai-auth.toml"
+    write_custom_config(
+        custom_openai_auth,
+        provider="custom",
+        env_key=None,
+        requires_openai_auth=True,
+    )
+    custom_openai_auth_inspection = CodexConfigInspector(
+        config_path=custom_openai_auth
+    ).inspect()
+    assert custom_openai_auth_inspection.auth_mode == CodexAuthMode.CUSTOM_PROVIDER
+    assert custom_openai_auth_inspection.credential_source_type == "unknown"
+    assert custom_openai_auth_inspection.requires_openai_account is True
+
 
 def test_custom_provider_runtime_success_is_ready_without_login(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"

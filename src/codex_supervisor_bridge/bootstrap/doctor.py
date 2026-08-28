@@ -29,6 +29,7 @@ CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 NODE_PROFILE_B_MIN_MAJOR = 24
 NODE_PROFILE_B_MAX_EXCLUSIVE_MAJOR = 27
+DEVSPACE_VERSION_TIMEOUT_SECONDS = 15.0
 
 
 @dataclass(frozen=True)
@@ -320,7 +321,10 @@ class Doctor:
                 config.advanced.executable_paths.get("node", "node")
             )
             if node is not None and entrypoint.is_file():
-                version_result = self._run([node, str(entrypoint), "--version"])
+                version_result = self._run(
+                    [node, str(entrypoint), "--version"],
+                    timeout=DEVSPACE_VERSION_TIMEOUT_SECONDS,
+                )
                 version = (
                     _first_line(version_result.stdout or version_result.stderr)
                     if version_result.returncode == 0

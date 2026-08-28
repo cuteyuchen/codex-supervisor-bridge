@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,6 +31,7 @@ class ProcessState:
     log_path: Path | None = None
     restart_count: int = 0
     technical_detail: str | None = None
+    process_identity: dict[str, Any] | None = None
     _process: Any = field(default=None, repr=False, compare=False)
 
     def as_dict(self) -> dict[str, Any]:
@@ -41,6 +43,7 @@ class ProcessState:
             "log_path": str(self.log_path) if self.log_path else None,
             "restart_count": self.restart_count,
             "technical_detail": self.technical_detail,
+            "process_identity": self.process_identity,
         }
 
 
@@ -90,7 +93,10 @@ class ProcessManager:
                     last_exit=current.last_exit,
                     log_path=current.log_path,
                     restart_count=current.restart_count,
-                    technical_detail="persisted PID is alive without an attached process handle",
+                    technical_detail=(
+                        "persisted PID is alive without a verified managed identity"
+                    ),
+                    process_identity=current.process_identity,
                 )
             )
         if current.status == "RUNNING":
@@ -137,6 +143,7 @@ class ProcessManager:
             pid=int(process.pid),
             log_path=log_path,
             restart_count=restart_count,
+            process_identity=_process_identity(int(process.pid)),
             _process=process,
         )
         if process.poll() is not None:
@@ -191,8 +198,13 @@ class ProcessManager:
         if state.pid is None:
             return state
         if state.pid and _pid_exists(state.pid):
-            state.status = "UNKNOWN"
-            state.technical_detail = "persisted PID is alive without an attached process handle"
+            current_identity = _process_identity(state.pid)
+            if _same_process_identity(state.process_identity, current_identity):
+                state.status = "RUNNING"
+                state.technical_detail = "recovered persisted managed process"
+            else:
+                state.status = "UNKNOWN"
+                state.technical_detail = "persisted PID is alive without a verified managed identity"
         else:
             state.status = "STALE"
             state.technical_detail = "persisted PID is no longer running"
@@ -262,6 +274,11 @@ class ProcessManager:
             log_path=Path(item["log_path"]) if item.get("log_path") else None,
             restart_count=int(item.get("restart_count", 0)),
             technical_detail=item.get("technical_detail"),
+            process_identity=(
+                item.get("process_identity")
+                if isinstance(item.get("process_identity"), dict)
+                else None
+            ),
         )
         self._processes[name] = state
         return state
@@ -319,6 +336,8 @@ class ProcessManager:
 def _pid_exists(pid: int) -> bool:
     if pid <= 0:
         return False
+    if sys.platform == "win32":
+        return _windows_process_identity(pid) is not None
     try:
         os.kill(pid, 0)
     except PermissionError:
@@ -326,6 +345,97 @@ def _pid_exists(pid: int) -> bool:
     except (OSError, ProcessLookupError):
         return False
     return True
+
+
+def _process_identity(pid: int) -> dict[str, Any] | None:
+    if pid <= 0:
+        return None
+    if sys.platform == "win32":
+        return _windows_process_identity(pid)
+    proc_root = Path("/proc") / str(pid)
+    try:
+        executable = str((proc_root / "exe").resolve(strict=True))
+        fields = (proc_root / "stat").read_text(encoding="utf-8").split()
+        started_at = int(fields[21])
+    except (OSError, ValueError, IndexError):
+        return None
+    return {"executable": executable, "started_at": started_at}
+
+
+def _windows_process_identity(pid: int) -> dict[str, Any] | None:
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return None
+    try:
+        size = wintypes.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(
+            handle,
+            0,
+            buffer,
+            ctypes.byref(size),
+        ):
+            return None
+        created = wintypes.FILETIME()
+        exited = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(created),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            return None
+        started_at = (created.dwHighDateTime << 32) | created.dwLowDateTime
+        return {"executable": buffer.value, "started_at": started_at}
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _same_process_identity(
+    expected: dict[str, Any] | None,
+    current: dict[str, Any] | None,
+) -> bool:
+    if expected is None or current is None:
+        return False
+    expected_executable = expected.get("executable")
+    current_executable = current.get("executable")
+    expected_started_at = expected.get("started_at")
+    current_started_at = current.get("started_at")
+    if not isinstance(expected_executable, str) or not isinstance(current_executable, str):
+        return False
+    if not isinstance(expected_started_at, int) or not isinstance(current_started_at, int):
+        return False
+    return (
+        os.path.normcase(expected_executable) == os.path.normcase(current_executable)
+        and expected_started_at == current_started_at
+    )
 
 
 def _safe_name(name: str) -> str:

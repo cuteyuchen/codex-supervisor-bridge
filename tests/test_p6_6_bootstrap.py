@@ -54,7 +54,10 @@ from codex_supervisor_bridge.bootstrap import (
     authorize_command,
     redact_oauth_payload,
 )
-from codex_supervisor_bridge.bootstrap.service import _find_executable
+from codex_supervisor_bridge.bootstrap.service import (
+    _find_executable,
+    _read_readiness_marker,
+)
 from codex_supervisor_bridge.mcp.server import _is_loopback_host, build_parser
 from codex_supervisor_bridge.mcp.server import main as cli_main
 from codex_supervisor_bridge.memory.models import ActiveWriter
@@ -306,6 +309,97 @@ def test_process_manager_does_not_start_duplicate_for_ambiguous_live_pid(tmp_pat
     assert launched == []
 
 
+def test_process_manager_recovers_verified_persisted_process(tmp_path: Path, monkeypatch) -> None:
+    launched: list[object] = []
+    identity = {"executable": "C:/managed/node.exe", "started_at": 123456}
+    manager = ProcessManager(
+        tmp_path / "runtime",
+        tmp_path / "logs",
+        launcher=lambda *args, **kwargs: launched.append((args, kwargs)),
+    )
+    (tmp_path / "runtime" / "processes.json").write_text(
+        json.dumps(
+            {
+                "bridge": {
+                    "status": "RUNNING",
+                    "pid": 42,
+                    "restart_count": 0,
+                    "process_identity": identity,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("codex_supervisor_bridge.bootstrap.process._pid_exists", lambda pid: pid == 42)
+    monkeypatch.setattr(
+        "codex_supervisor_bridge.bootstrap.process._process_identity",
+        lambda pid: identity if pid == 42 else None,
+    )
+
+    state = manager.start(ManagedProcessSpec(name="bridge", command=["dummy"]))
+
+    assert state.status == "RUNNING"
+    assert state.technical_detail == "recovered persisted managed process"
+    assert launched == []
+
+
+def test_process_manager_rejects_reused_pid_with_different_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    manager = ProcessManager(tmp_path / "runtime", tmp_path / "logs")
+    (tmp_path / "runtime" / "processes.json").write_text(
+        json.dumps(
+            {
+                "bridge": {
+                    "status": "RUNNING",
+                    "pid": 42,
+                    "restart_count": 0,
+                    "process_identity": {
+                        "executable": "C:/managed/node.exe",
+                        "started_at": 123456,
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("codex_supervisor_bridge.bootstrap.process._pid_exists", lambda pid: pid == 42)
+    monkeypatch.setattr(
+        "codex_supervisor_bridge.bootstrap.process._process_identity",
+        lambda pid: {
+            "executable": "C:/other/node.exe",
+            "started_at": 654321,
+        },
+    )
+
+    state = manager.health("bridge")
+
+    assert state.status == "UNKNOWN"
+    assert state.technical_detail == "persisted PID is alive without a verified managed identity"
+
+
+def test_windows_pid_probe_uses_process_identity(monkeypatch) -> None:
+    from codex_supervisor_bridge.bootstrap import process as process_module
+
+    monkeypatch.setattr(process_module.sys, "platform", "win32")
+    monkeypatch.setattr(
+        process_module,
+        "_windows_process_identity",
+        lambda pid: {"executable": "managed.exe", "started_at": 1}
+        if pid == 42
+        else None,
+    )
+    monkeypatch.setattr(
+        process_module.os,
+        "kill",
+        lambda pid, signal: (_ for _ in ()).throw(AssertionError((pid, signal))),
+    )
+
+    assert process_module._pid_exists(42) is True
+    assert process_module._pid_exists(43) is False
+
+
 def test_bootstrap_resolves_configured_absolute_executable_path(tmp_path: Path) -> None:
     executable = tmp_path / "devspace.exe"
     executable.write_text("placeholder", encoding="utf-8")
@@ -447,6 +541,51 @@ def test_devspace_version_compatibility_matches_tested_releases() -> None:
     assert DevSpaceVersionCompatibility.is_supported("unknown") is False
 
 
+def test_doctor_allows_managed_devspace_version_probe_to_start_slowly(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def runner(
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, "1.0.8\n", "")
+
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    managed = tmp_path / "devspace"
+    entrypoint = managed / "dist" / "cli.js"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("placeholder", encoding="utf-8")
+    node = tmp_path / "node.exe"
+    node.write_text("placeholder", encoding="utf-8")
+    config_store = ConfigStore(paths=paths)
+    config = AppConfig.safe_defaults(paths)
+    config.advanced.executable_paths["node"] = str(node)
+    config_store.save(config)
+    doctor = Doctor(paths=paths, config_store=config_store, command_runner=runner)
+    monkeypatch.setattr(
+        doctor,
+        "_managed_component",
+        lambda name: managed if name == "devspace" else None,
+    )
+
+    health = doctor._workspace()
+
+    assert health.status == HealthStatus.READY
+    assert calls == [
+        (
+            [str(node), str(entrypoint), "--version"],
+            {"timeout": 15.0},
+        )
+    ]
+
+
 def test_devspace_managed_config_directory_is_used_by_repair_and_process(tmp_path: Path) -> None:
     paths = AppDataPaths.from_environment(
         environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
@@ -471,6 +610,8 @@ def test_devspace_managed_config_directory_is_used_by_repair_and_process(tmp_pat
     assert spec.cwd == bootstrap.config_directory
     assert spec.env is not None
     assert spec.env["DEVSPACE_CONFIG_DIR"] == str(bootstrap.config_directory)
+    assert spec.env["DEVSPACE_TOOL_MODE"] == "codex"
+    assert spec.env["DEVSPACE_WIDGETS"] == "changes"
     assert str(Path.home() / ".devspace") not in spec.env.values()
     assert "DEVSPACE_OAUTH_OWNER_TOKEN" not in spec.env
     auth = json.loads(bootstrap.auth_path.read_text(encoding="utf-8"))
@@ -521,6 +662,25 @@ def test_bootstrap_start_reports_supervisor_launch_failure(tmp_path: Path) -> No
 
     assert result.repairs[-1].action == "start_supervisor"
     assert result.repairs[-1].status == HealthStatus.UNAVAILABLE
+
+
+def test_supervisor_readiness_ignores_marker_from_previous_launch(tmp_path: Path) -> None:
+    log_path = tmp_path / "supervisor.log"
+    log_path.write_text(
+        "SUPERVISOR_READY status=UNAVAILABLE profile=lightweight\n",
+        encoding="utf-8",
+    )
+    previous_end = log_path.stat().st_size
+
+    assert _read_readiness_marker(log_path, start_offset=previous_end) is None
+
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write("SUPERVISOR_READY status=READY profile=lightweight\n")
+
+    assert (
+        _read_readiness_marker(log_path, start_offset=previous_end)
+        == HealthStatus.READY
+    )
 
 
 def test_bootstrap_start_uses_local_codex_protocol_bootstrap(tmp_path: Path) -> None:
@@ -827,9 +987,19 @@ def test_bootstrap_start_launches_all_healthy_components(tmp_path: Path) -> None
 
     assert [spec.name for spec in process_manager.started] == ["devspace", "supervisor"]
     devspace_spec = next(spec for spec in process_manager.started if spec.name == "devspace")
+    supervisor_spec = next(spec for spec in process_manager.started if spec.name == "supervisor")
     assert list(devspace_spec.command) == [str(devspace_executable), "serve"]
     assert devspace_spec.env is not None
     assert devspace_spec.env["DEVSPACE_CONFIG_DIR"] == str(paths.config / "devspace")
+    assert devspace_spec.env["DEVSPACE_TOOL_MODE"] == "codex"
+    assert devspace_spec.env["DEVSPACE_WIDGETS"] == "changes"
+    command = list(supervisor_spec.command)
+    devspace_url_index = command.index("--devspace-mcp-url") + 1
+    configured_devspace_port = config_store.load().config.advanced.ports["devspace"]
+    assert command[devspace_url_index] == (
+        f"http://127.0.0.1:{configured_devspace_port}/mcp"
+    )
+    assert supervisor_spec.startup_timeout >= 60
     assert any(item.action == "start_process:devspace" for item in result.repairs)
     assert any(item.action == "agent_session:local_codex_bridge" for item in result.repairs)
     assert not any(spec.name == "local_codex_bridge" for spec in process_manager.started)
@@ -963,6 +1133,45 @@ def test_repair_persists_distinct_supervisor_and_workspace_ports(tmp_path: Path)
     ports = ConfigStore(paths=paths).load().config.advanced.ports
 
     assert ports["supervisor"] != ports["devspace"]
+
+
+def test_repair_preserves_ports_for_verified_running_processes(tmp_path: Path) -> None:
+    from codex_supervisor_bridge.bootstrap.repair import RepairService
+
+    class RunningProcessManager:
+        def statuses(self) -> list[ProcessState]:
+            return [
+                ProcessState("devspace", "RUNNING", pid=41),
+                ProcessState("supervisor", "RUNNING", pid=42),
+            ]
+
+    class RejectingPortAllocator:
+        def reserve(self, preferred: int | None, *, excluded: set[int]) -> object:
+            del preferred, excluded
+            raise AssertionError("running managed ports must not be reserved again")
+
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    config_store = ConfigStore(paths=paths)
+    config = AppConfig.safe_defaults(paths)
+    config.advanced.ports = {"devspace": 39100, "supervisor": 39101}
+    config_store.save(config)
+
+    RepairService(
+        paths=paths,
+        config_store=config_store,
+        doctor=FakeDoctor(),
+        process_manager=RunningProcessManager(),
+        port_allocator=RejectingPortAllocator(),
+        secret_store=MemorySecretStore(),
+    ).repair(project_directory=tmp_path)
+
+    assert ConfigStore(paths=paths).load().config.advanced.ports == {
+        "devspace": 39100,
+        "supervisor": 39101,
+    }
 
 
 def test_repair_recovers_stale_process_and_keeps_unknown_for_user(tmp_path: Path) -> None:
@@ -1342,7 +1551,12 @@ def test_devspace_local_oauth_uses_mcp_provider_and_owner_form() -> None:
 
             async def post(self, url: str, *, data: dict[str, str], follow_redirects: bool = False) -> FakeResponse:
                 del url, follow_redirects
-                assert data == {"owner_token": "owner-secret-not-logged"}
+                assert data == {
+                    "client_id": "fake-client",
+                    "scope": "devspace",
+                    "state": "state-1",
+                    "owner_token": "owner-secret-not-logged",
+                }
                 return FakeResponse(
                     302,
                     {"location": "http://127.0.0.1/codex-supervisor-callback?code=one-time-code&state=state-1"},
@@ -1364,7 +1578,10 @@ def test_devspace_local_oauth_uses_mcp_provider_and_owner_form() -> None:
         driver = DevSpaceLocalOAuthDriver(http_client_factory=factory)
         approval = await driver.submit_owner_approval(
             client=FakeClient(),
-            authorization_url="http://127.0.0.1:39101/authorize?state=state-1",
+            authorization_url=(
+                "http://127.0.0.1:39101/authorize"
+                "?client_id=fake-client&scope=devspace&state=state-1"
+            ),
             owner_token="owner-secret-not-logged",
         )
         assert approval.code == "one-time-code"
@@ -1460,9 +1677,8 @@ class _FakeDevSpaceOAuthHandler(BaseHTTPRequestHandler):
             if form.get("owner_token", [""])[0] != "owner-secret-not-logged":
                 self.send_error(403)
                 return
-            query = parse_qs(urlparse(self.path).query)
-            state = query.get("state", [""])[0]
-            redirect_uri = query.get(
+            state = form.get("state", [""])[0]
+            redirect_uri = form.get(
                 "redirect_uri",
                 ["http://127.0.0.1/codex-supervisor-callback"],
             )[0]

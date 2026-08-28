@@ -418,19 +418,21 @@ def _auth_mode(
     requires_openai: bool | None,
     base_url: str | None,
 ) -> CodexAuthMode:
-    if requires_openai is True:
-        return CodexAuthMode.CHATGPT_ACCOUNT
     if env_key:
         if provider_type == "openai" or env_key.upper() == "OPENAI_API_KEY":
             return CodexAuthMode.OPENAI_API_KEY
         return CodexAuthMode.PROVIDER_ENV_KEY
-    if _is_local_url(base_url):
-        return CodexAuthMode.LOCAL_NO_AUTH
     lowered = f"{provider_type or ''}".lower()
     if any(marker in lowered for marker in ("aws", "azure", "bedrock", "vertex")):
         return CodexAuthMode.AWS_OR_CLOUD_PROVIDER
+    if _is_local_url(base_url) and requires_openai is not True:
+        return CodexAuthMode.LOCAL_NO_AUTH
     if provider_type and provider_type != "openai":
         return CodexAuthMode.CUSTOM_PROVIDER
+    if requires_openai is True:
+        return CodexAuthMode.CHATGPT_ACCOUNT
+    if _is_local_url(base_url):
+        return CodexAuthMode.LOCAL_NO_AUTH
     return CodexAuthMode.UNKNOWN
 
 

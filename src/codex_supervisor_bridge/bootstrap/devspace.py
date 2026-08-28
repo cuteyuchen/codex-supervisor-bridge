@@ -180,7 +180,12 @@ class DevSpaceBootstrap:
             name="devspace",
             command=command,
             cwd=self.config_directory,
-            env={**os.environ, "DEVSPACE_CONFIG_DIR": str(self.config_directory)},
+            env={
+                **os.environ,
+                "DEVSPACE_CONFIG_DIR": str(self.config_directory),
+                "DEVSPACE_TOOL_MODE": "codex",
+                "DEVSPACE_WIDGETS": "changes",
+            },
             startup_timeout=startup_timeout,
             shutdown_timeout=shutdown_timeout,
         )

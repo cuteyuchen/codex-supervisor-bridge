@@ -59,12 +59,23 @@ class RepairService:
             config.basic.project_directory = project_directory.expanduser().resolve()
         if config.advanced.sqlite_path is None:
             config.advanced.sqlite_path = self.paths.database
+        processes = self.process_manager.statuses()
+        process_by_name = {process.name: process for process in processes}
         selected_ports: set[int] = set()
         for name, action, message in (
             ("devspace", "allocate_devspace_port", "Local workspace port selected."),
             ("supervisor", "allocate_local_port", "Local connection port selected."),
         ):
             preferred = config.advanced.ports.get(name)
+            running = process_by_name.get(name)
+            if (
+                running is not None
+                and running.status == "RUNNING"
+                and preferred is not None
+                and preferred not in selected_ports
+            ):
+                selected_ports.add(preferred)
+                continue
             try:
                 lease = self.port_allocator.reserve(preferred, excluded=selected_ports)
             except OSError:
@@ -102,7 +113,7 @@ class RepairService:
             devspace.prepare_auth(self.secret_store)
             actions.append(RepairAction(action="generate_workspace_config", status=HealthStatus.READY, message="Local workspace settings are ready."))
 
-        for process in self.process_manager.statuses():
+        for process in processes:
             if process.status in {"STALE", "CRASHED"}:
                 repaired = self.process_manager.repair_stale(process.name)
                 actions.append(RepairAction(action=f"repair_process:{process.name}", status=HealthStatus.READY, message="Stopped process state was recovered.", advanced=repaired.as_dict()))

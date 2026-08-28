@@ -18,6 +18,8 @@ from .paths import AppDataPaths
 from .process import ManagedProcessSpec, ProcessManager
 from .repair import RepairService
 
+SUPERVISOR_STARTUP_TIMEOUT_FLOOR_SECONDS = 60.0
+
 
 class BootstrapService:
     def __init__(
@@ -175,8 +177,11 @@ class BootstrapService:
                     )
                 )
         port = config.advanced.ports.get("supervisor")
-        if port is None:
+        devspace_port = config.advanced.ports.get("devspace")
+        if port is None or devspace_port is None:
             return result
+        supervisor_log = self.paths.logs / "supervisor.log"
+        readiness_offset = _file_size(supervisor_log)
         spec = ManagedProcessSpec(
             name="supervisor",
             command=[
@@ -189,12 +194,19 @@ class BootstrapService:
                 "127.0.0.1",
                 "--port",
                 str(port),
+                "--devspace-mcp-url",
+                f"http://127.0.0.1:{devspace_port}/mcp",
             ],
-            startup_timeout=config.advanced.startup_timeout_seconds,
-            shutdown_timeout=config.advanced.shutdown_timeout_seconds,
-            readiness_probe=lambda: _readiness_marker_present(
-                self.paths.logs / "supervisor.log"
+            startup_timeout=max(
+                config.advanced.startup_timeout_seconds,
+                SUPERVISOR_STARTUP_TIMEOUT_FLOOR_SECONDS,
             ),
+            shutdown_timeout=config.advanced.shutdown_timeout_seconds,
+            readiness_probe=lambda: _read_readiness_marker(
+                supervisor_log,
+                start_offset=readiness_offset,
+            )
+            is not None,
         )
         try:
             state = self.process_manager.start(spec)
@@ -367,11 +379,17 @@ def _find_executable(value: str) -> str | None:
     return value if Path(value).is_file() else shutil.which(value)
 
 
-def _read_readiness_marker(log_path: Path | None) -> HealthStatus | None:
+def _read_readiness_marker(
+    log_path: Path | None,
+    *,
+    start_offset: int = 0,
+) -> HealthStatus | None:
     if log_path is None or not log_path.exists():
         return None
     try:
-        text = log_path.read_text(encoding="utf-8", errors="replace")
+        with log_path.open("rb") as handle:
+            handle.seek(start_offset)
+            text = handle.read().decode("utf-8", errors="replace")
     except OSError:
         return None
     for line in reversed(text.splitlines()):
@@ -389,3 +407,10 @@ def _read_readiness_marker(log_path: Path | None) -> HealthStatus | None:
 
 def _readiness_marker_present(log_path: Path | None) -> bool:
     return _read_readiness_marker(log_path) is not None
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0

@@ -336,6 +336,26 @@ def test_upstream_release_contract_fixture_remains_current() -> None:
     ]
 
 
+def test_local_codex_bridge_upstream_release_contract_fixture_remains_current() -> None:
+    fixture_path = (
+        Path(__file__).parent
+        / "fixtures"
+        / "local-codex-bridge"
+        / "upstream-v2.1.3.json"
+    )
+    contract = json.loads(fixture_path.read_text(encoding="utf-8"))
+    bootstrap = LocalCodexBridgeBootstrap(
+        LocalCodexBridgeBootstrapConfig(launch_command=["node", "bridge.js"])
+    )
+
+    assert contract["repository"] == "zoeynine/Local-Codex-Bridge"
+    assert contract["version"] == "2.1.3"
+    assert contract["node_requirement"] == ">=24"
+    assert contract["entrypoint"] == "dist/src/index.js"
+    assert contract["npm_start_is_development_only"] is True
+    assert sorted(contract["required_tools"]) == bootstrap.config.required_tools
+
+
 def test_devspace_version_compatibility_matches_tested_releases() -> None:
     assert DevSpaceVersionCompatibility.parse_version("devspace 1.0.8") == (1, 0, 8)
     assert DevSpaceVersionCompatibility.is_supported("1.0.5") is True

@@ -1,0 +1,14 @@
+{
+  "repository": "zoeynine/Local-Codex-Bridge",
+  "version": "2.1.3",
+  "node_requirement": ">=24",
+  "entrypoint": "dist/src/index.js",
+  "npm_start_is_development_only": true,
+  "required_tools": [
+    "codex_turn",
+    "codex_observe",
+    "codex_steer",
+    "codex_respond",
+    "codex_interrupt"
+  ]
+}

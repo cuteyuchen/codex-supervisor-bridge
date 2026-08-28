@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from mcp import Client
 
-from codex_supervisor_bridge.mcp.server import create_mcp_server
+from codex_supervisor_bridge.backends.models import BackendHealth, BackendHealthStatus
+from codex_supervisor_bridge.mcp.server import _emit_readiness_marker, create_mcp_server
 from codex_supervisor_bridge.memory.service import MemoryService
 
 
@@ -26,6 +28,47 @@ def structured(result: Any) -> dict[str, Any]:
     value = result.structured_content
     assert isinstance(value, dict)
     return value
+
+
+def test_readiness_marker_fails_soft_when_probe_raises(capsys: Any) -> None:
+    class FailingSession:
+        async def probe_health(self) -> Any:
+            raise RuntimeError("probe exploded")
+
+    composition = SimpleNamespace(
+        profile="lightweight",
+        workspace_backend="devspace",
+        agent_backend="local_codex_bridge",
+        session_manager=FailingSession(),
+    )
+
+    _emit_readiness_marker(composition)
+
+    marker = capsys.readouterr().err
+    assert "SUPERVISOR_READY status=UNAVAILABLE" in marker
+
+
+def test_readiness_marker_reports_ready(capsys: Any) -> None:
+    class ReadySession:
+        async def probe_health(self) -> BackendHealth:
+            return BackendHealth(
+                capability="local_codex_bridge",
+                status=BackendHealthStatus.READY,
+                user_message="Codex is ready.",
+                repairable=False,
+            )
+
+    composition = SimpleNamespace(
+        profile="lightweight",
+        workspace_backend="devspace",
+        agent_backend="local_codex_bridge",
+        session_manager=ReadySession(),
+    )
+
+    _emit_readiness_marker(composition)
+
+    marker = capsys.readouterr().err
+    assert "SUPERVISOR_READY status=READY" in marker
 
 
 def test_create_read_and_resume_task_through_mcp(tmp_path: Path) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import ipaddress
 import json
 import sys
@@ -10,6 +11,7 @@ from mcp.server import MCPServer
 
 from codex_supervisor_bridge import __version__
 from codex_supervisor_bridge.bootstrap import BootstrapService, CommandPolicy, DevelopmentStyle
+from codex_supervisor_bridge.bootstrap.configuration import ConfigStore
 from codex_supervisor_bridge.bootstrap.devspace_auth import DevSpaceLocalOAuthDriver
 from codex_supervisor_bridge.bootstrap.paths import AppDataPaths
 from codex_supervisor_bridge.bootstrap.secrets import MemorySecretStore, WindowsDpapiSecretStore
@@ -21,8 +23,17 @@ from codex_supervisor_bridge.integrations.devspace_client import DevSpaceWorkspa
 from codex_supervisor_bridge.integrations.kandev_client import KandevAdapter
 from codex_supervisor_bridge.integrations.kandev_coordinator import KandevCoordinator
 from codex_supervisor_bridge.memory.service import MemoryService
+from codex_supervisor_bridge.supervisor.agent_facade import (
+    CodexCoordinatorFacade,
+    CodexSemanticFacade,
+)
 from codex_supervisor_bridge.supervisor.checkpoints import CheckpointService
 from codex_supervisor_bridge.supervisor.direct_workspace import DirectWorkspaceCoordinator
+from codex_supervisor_bridge.supervisor.runtime import (
+    RuntimeComposition,
+    lcb_environment,
+    lcb_launch_from_config,
+)
 
 from .checkpoint_tools import register_checkpoint_tools
 from .codex_tools import register_codex_tools
@@ -30,6 +41,8 @@ from .direct_workspace_tools import register_direct_workspace_tools
 from .execution_tools import register_execution_tools
 from .kandev_tools import register_kandev_tools
 from .tools import register_memory_tools
+
+READINESS_PROBE_TIMEOUT_SECONDS = 15.0
 
 SERVER_INSTRUCTIONS = """
 You are connected to Codex Supervisor Bridge, the durable task memory and
@@ -101,6 +114,8 @@ def create_mcp_server(
     *,
     kandev: KandevCoordinator | None = None,
     codex: CodexCoordinator | None = None,
+    agent_facade: CodexSemanticFacade | None = None,
+    checkpoints: CheckpointService | None = None,
     direct_workspace: DirectWorkspaceCoordinator | None = None,
 ) -> MCPServer:
     server = MCPServer(
@@ -120,8 +135,15 @@ def create_mcp_server(
     register_direct_workspace_tools(server, direct_workspace)
     if kandev is not None:
         register_kandev_tools(server, kandev)
-    if codex is not None:
-        register_codex_tools(server, codex)
+    if agent_facade is not None:
+        register_codex_tools(server, agent_facade)
+        checkpoint_backend = getattr(agent_facade, "checkpoint_backend", None)
+        if checkpoints is None and checkpoint_backend is not None:
+            checkpoints = CheckpointService(service, agent_backend=checkpoint_backend)
+        if checkpoints is not None:
+            register_checkpoint_tools(server, service, checkpoints)
+    elif codex is not None:
+        register_codex_tools(server, CodexCoordinatorFacade(codex))
         register_checkpoint_tools(
             server,
             service,
@@ -302,19 +324,42 @@ def main(argv: list[str] | None = None) -> None:
         service,
         authenticated_devspace_factory,
     )
-    codex = CodexCoordinator(
-        service,
-        lambda: CodexControlAdapter.stdio(
-            args.codex_control_command,
-            env={"CODEX_MCP_EXECUTION_MODE": "client"},
-        ),
-    )
+    config = ConfigStore(paths=app_paths).load().config
+    launch_command: list[str] | None = None
+    repository = config.advanced.local_codex_repository
+    if repository is not None:
+        try:
+            launch_command = lcb_launch_from_config(
+                repository,
+                node_executable=config.advanced.executable_paths.get("node", "node"),
+            )
+        except FileNotFoundError:
+            launch_command = None
+    if launch_command:
+        composition = RuntimeComposition.profile_b(
+            service,
+            launch_command=launch_command,
+            env=lcb_environment(),
+            workspace_factory=authenticated_devspace_factory,
+        )
+    else:
+        composition = RuntimeComposition.profile_a(
+            service,
+            adapter_factory=lambda: CodexControlAdapter.stdio(
+                args.codex_control_command,
+                env={"CODEX_MCP_EXECUTION_MODE": "client"},
+            ),
+            workspace_factory=authenticated_devspace_factory,
+        )
+    facade = composition.agent_facade(service)
     server = create_mcp_server(
         service,
         kandev=kandev,
-        codex=codex,
+        agent_facade=facade,
+        checkpoints=composition.checkpoint_service,
         direct_workspace=direct_workspace,
     )
+    _emit_readiness_marker(composition)
     try:
         if args.transport == "stdio":
             server.run(transport="stdio")
@@ -329,6 +374,33 @@ def main(argv: list[str] | None = None) -> None:
             )
     finally:
         service.close()
+
+
+def _emit_readiness_marker(composition: RuntimeComposition) -> None:
+    """Print one bounded readiness line for the bootstrap start gate."""
+
+    async def probe() -> str:
+        if composition.session_manager is not None:
+            try:
+                health = await composition.session_manager.probe_health()
+            except Exception:
+                return "UNAVAILABLE"
+            return health.status.value
+        return "UNAVAILABLE"
+
+    try:
+        status = asyncio.run(
+            asyncio.wait_for(probe(), timeout=READINESS_PROBE_TIMEOUT_SECONDS)
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        status = "UNAVAILABLE"
+    print(
+        f"SUPERVISOR_READY status={status} profile={composition.profile} "
+        f"workspace_backend={composition.workspace_backend} "
+        f"agent_backend={composition.agent_backend}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _is_loopback_host(host: str) -> bool:

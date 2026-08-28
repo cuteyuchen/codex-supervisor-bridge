@@ -27,7 +27,7 @@ from codex_supervisor_bridge.memory.execution import (
     get_execution_state,
     handoff_writer,
 )
-from codex_supervisor_bridge.memory.models import ActiveWriter, EventType
+from codex_supervisor_bridge.memory.models import ActiveWriter, EventType, TaskPhase
 from codex_supervisor_bridge.memory.service import MemoryService
 from codex_supervisor_bridge.memory.workspace import bind_workspace
 from codex_supervisor_bridge.supervisor.agent_execution import (
@@ -47,6 +47,7 @@ class RaceAgent:
         block_steer: bool = False,
         block_respond: bool = False,
         block_interrupt: bool = False,
+        interrupt_raises: bool = False,
         observe_new_unknown: bool = False,
         steer_status: str = "running",
         respond_status: str = "running",
@@ -56,6 +57,7 @@ class RaceAgent:
         self.block_steer = block_steer
         self.block_respond = block_respond
         self.block_interrupt = block_interrupt
+        self.interrupt_raises = interrupt_raises
         self.observe_new_unknown = observe_new_unknown
         self.steer_status = steer_status
         self.respond_status = respond_status
@@ -133,6 +135,8 @@ class RaceAgent:
         self.interrupt_started.set()
         if self.block_interrupt:
             await self.release_interrupt.wait()
+        if self.interrupt_raises:
+            raise RuntimeError("turn is already terminal")
         return AgentSnapshot(status=self.interrupt_status, **self._identity(handle))
 
     async def list_pending_interactions(self, handle: PlanHandle) -> list[PendingInteraction]:
@@ -302,6 +306,115 @@ def test_command_approval_answer_race_compensates_after_writer_handback() -> Non
         memory.close()
 
 
+def test_plan_command_approval_allows_chatgpt_writer_without_write_lease() -> None:
+    memory = MemoryService()
+    interaction = PendingInteraction(
+        interaction_id="plan-command",
+        kind="command_approval",
+        summary="Inspect the workspace?",
+    )
+    agent = RaceAgent(pending=[interaction])
+    try:
+        task = memory.create_task("PLAN-APPROVAL", "Plan", repository="C:/repo")
+        bind_workspace(
+            memory.store,
+            task.task_id,
+            task.revision,
+            backend_name="devspace",
+            workspace_id="ws-plan",
+            repository="C:/repo",
+            root="C:/repo",
+            workspace_mode="checkout",
+        )
+        task = memory.get_task(task.task_id)
+        acquired = acquire_writer(
+            memory.store,
+            task.task_id,
+            task.revision,
+            ActiveWriter.CHATGPT,
+        )
+        task, _ = bind_codex_runtime(
+            memory.store,
+            task.task_id,
+            acquired.task.revision,
+            event_type=EventType.CODEX_STARTED,
+            thread_id="thread-plan",
+            turn_id="turn-plan",
+            remote_status="inProgress",
+            task_phase=TaskPhase.PLANNING,
+        )
+        facade = _facade(memory, agent)
+
+        answered = asyncio.run(
+            facade.answer_interaction(
+                task.task_id,
+                task.revision,
+                interaction.interaction_id,
+                decision="accept",
+            )
+        )
+
+        assert answered["snapshot"]["status"] == "running"
+        assert agent.calls == ["respond"]
+        assert get_execution_state(memory.store, task.task_id).active_writer == ActiveWriter.CHATGPT
+    finally:
+        memory.close()
+
+
+def test_execution_command_approval_still_requires_codex_writer() -> None:
+    memory = MemoryService()
+    interaction = PendingInteraction(
+        interaction_id="execution-command",
+        kind="command_approval",
+        summary="Run a workspace command?",
+    )
+    agent = RaceAgent(pending=[interaction])
+    try:
+        task = memory.create_task("EXEC-APPROVAL", "Execute", repository="C:/repo")
+        bind_workspace(
+            memory.store,
+            task.task_id,
+            task.revision,
+            backend_name="devspace",
+            workspace_id="ws-exec",
+            repository="C:/repo",
+            root="C:/repo",
+            workspace_mode="checkout",
+        )
+        task = memory.get_task(task.task_id)
+        acquired = acquire_writer(
+            memory.store,
+            task.task_id,
+            task.revision,
+            ActiveWriter.CHATGPT,
+        )
+        task, _ = bind_codex_runtime(
+            memory.store,
+            task.task_id,
+            acquired.task.revision,
+            event_type=EventType.CODEX_STARTED,
+            thread_id="thread-exec",
+            turn_id="turn-exec",
+            remote_status="inProgress",
+            task_phase=TaskPhase.IMPLEMENTING,
+        )
+        facade = _facade(memory, agent)
+
+        with pytest.raises(AgentPlanGateError, match="active CODEX writer lease"):
+            asyncio.run(
+                facade.answer_interaction(
+                    task.task_id,
+                    task.revision,
+                    interaction.interaction_id,
+                    decision="accept",
+                )
+            )
+
+        assert agent.calls == []
+    finally:
+        memory.close()
+
+
 def test_user_input_answer_is_revision_fenced_but_not_writer_bound() -> None:
     memory = MemoryService()
     interaction = PendingInteraction(
@@ -463,6 +576,75 @@ def test_stale_interrupt_does_not_overwrite_new_runtime() -> None:
         asyncio.run(scenario())
         safety = get_agent_safety(memory.store, "INTERRUPT-RACE")
         assert safety is not None and safety.state == AgentSafetyState.NONE
+    finally:
+        memory.close()
+
+
+def test_interrupt_error_accepts_confirmed_terminal_plan_snapshot() -> None:
+    memory = MemoryService()
+    agent = RaceAgent(interrupt_raises=True, steer_status="completed")
+    try:
+        task = memory.create_task("PLAN-ALREADY-TERMINAL", "Plan", repository="C:/repo")
+        bind_workspace(
+            memory.store,
+            task.task_id,
+            task.revision,
+            backend_name="devspace",
+            workspace_id="ws-plan-terminal",
+            repository="C:/repo",
+            root="C:/repo",
+            workspace_mode="checkout",
+        )
+        task = memory.get_task(task.task_id)
+        acquired = acquire_writer(
+            memory.store,
+            task.task_id,
+            task.revision,
+            ActiveWriter.CHATGPT,
+        )
+        task, _ = bind_codex_runtime(
+            memory.store,
+            task.task_id,
+            acquired.task.revision,
+            event_type=EventType.CODEX_STARTED,
+            thread_id="thread-plan-terminal",
+            turn_id="turn-plan-terminal",
+            remote_status="planning",
+            task_phase=TaskPhase.PLANNING,
+        )
+        facade = _facade(memory, agent)
+
+        result = asyncio.run(
+            facade.interrupt(
+                task.task_id,
+                task.revision,
+                reason="Replan after terminal result.",
+            )
+        )
+
+        assert result["snapshot"]["status"] == "completed"
+        assert agent.calls == ["interrupt"]
+        current = memory.get_task(task.task_id)
+        assert current.phase == TaskPhase.PAUSED
+        runtime = get_codex_runtime(memory.store, task.task_id)
+        assert runtime is not None and runtime.remote_status == "completed"
+        execution = get_execution_state(memory.store, task.task_id)
+        assert execution.active_writer == ActiveWriter.CHATGPT
+    finally:
+        memory.close()
+
+
+def test_status_does_not_poll_terminal_not_reconstructable_runtime() -> None:
+    memory = MemoryService()
+    agent = RaceAgent(steer_status="not_reconstructable")
+    try:
+        _set_up_codex_writer(memory, "STATUS-NOT-RECONSTRUCTABLE")
+        facade = _facade(memory, agent)
+
+        result = asyncio.run(facade.status("STATUS-NOT-RECONSTRUCTABLE"))
+
+        assert result["snapshot"]["status"] == "not_reconstructable"
+        assert result["pollRecommended"] is False
     finally:
         memory.close()
 

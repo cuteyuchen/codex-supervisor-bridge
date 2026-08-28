@@ -18,7 +18,7 @@ from codex_supervisor_bridge.memory.models import ActiveWriter
 
 def fake_bridge() -> tuple[MCPServer, dict[str, Any]]:
     server = MCPServer("fake-local-codex-bridge")
-    state: dict[str, Any] = {"calls": []}
+    state: dict[str, Any] = {"calls": [], "observe_payload": None}
 
     @server.tool()
     def codex_turn(
@@ -44,6 +44,8 @@ def fake_bridge() -> tuple[MCPServer, dict[str, Any]]:
         wait_ms: int | None = None,
     ) -> dict[str, Any]:
         state["calls"].append(("observe", thread_id, cursor, limit, wait_ms))
+        if state["observe_payload"] is not None:
+            return state["observe_payload"]
         return {
             "runtime_status": "inProgress",
             "thread_id": thread_id,
@@ -110,6 +112,7 @@ def test_local_codex_bridge_normalizes_live_control_surface() -> None:
         )
         assert handle.thread_id == "thread-1"
         assert handle.turn_id == "turn-1"
+        assert handle.status == "planning"
 
         snapshot = await backend.observe(handle, cursor=3, wait_ms=50)
         assert snapshot.status == "inProgress"
@@ -134,6 +137,48 @@ def test_local_codex_bridge_normalizes_live_control_surface() -> None:
     asyncio.run(scenario())
     assert any(call[0] == "steer" and call[2] == "turn-1" for call in state["calls"])
     assert any(call[0] == "respond" and call[1] == 17 for call in state["calls"])
+
+
+def test_completed_plan_uses_terminal_final_result_without_reclassifying_execution() -> None:
+    upstream, state = fake_bridge()
+    backend = LocalCodexBridgeAgentBackend(upstream)
+    state["observe_payload"] = {
+        "runtime_status": "completed",
+        "thread_id": "thread-1",
+        "turn_id": "turn-1",
+        "terminal": {
+            "status": "completed",
+            "final_result": "1. Add the smoke marker.\n2. Verify the diff.",
+        },
+    }
+
+    async def scenario() -> None:
+        plan_handle = await backend.start_plan(
+            task_id="TASK-AGENT",
+            context_pack="Goal: test",
+            workspace=WorkspaceState(workspace_id="ws", repository="repo", root="C:/repo"),
+        )
+        assert plan_handle.status == "planning"
+
+        plan_snapshot = await backend.observe(plan_handle)
+        assert plan_snapshot.status == "completed"
+        assert plan_snapshot.plan is not None
+        assert plan_snapshot.plan.content == "1. Add the smoke marker.\n2. Verify the diff."
+
+        execution_handle = await backend.start_execution(
+            task_id="TASK-AGENT",
+            context_pack="Goal: test",
+            approved_plan=plan_snapshot.plan.content,
+            workspace=WorkspaceState(workspace_id="ws", repository="repo", root="C:/repo"),
+            lease=lease(),
+        )
+        assert execution_handle.status == "inProgress"
+
+        execution_snapshot = await backend.observe(execution_handle)
+        assert execution_snapshot.status == "completed"
+        assert execution_snapshot.plan is None
+
+    asyncio.run(scenario())
 
 
 def test_unknown_outcome_handle_is_explicit_and_not_failed() -> None:

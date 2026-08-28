@@ -19,6 +19,7 @@ from codex_supervisor_bridge.memory.agent_safety import (
     AgentSafetyState,
     get_agent_safety,
     record_agent_compensation_required,
+    record_agent_compensation_succeeded,
 )
 from codex_supervisor_bridge.memory.backend_binding import (
     TaskBackendBinding,
@@ -27,13 +28,15 @@ from codex_supervisor_bridge.memory.backend_binding import (
 )
 from codex_supervisor_bridge.memory.codex_runtime import (
     CodexRuntimeState,
+    bind_codex_runtime,
     get_codex_runtime,
     is_active_runtime,
     is_execution_runtime,
+    is_plan_runtime,
 )
 from codex_supervisor_bridge.memory.errors import ConflictError
 from codex_supervisor_bridge.memory.execution import get_execution_state
-from codex_supervisor_bridge.memory.models import ActiveWriter
+from codex_supervisor_bridge.memory.models import ActiveWriter, EventType, TaskPhase
 from codex_supervisor_bridge.memory.service import MemoryService
 
 
@@ -270,12 +273,39 @@ class AgentSessionManager:
                 )
                 continue
             try:
+                task = self.memory.get_task(task_id)
                 runtime = get_codex_runtime(self.memory.store, task_id)
                 execution = get_execution_state(self.memory.store, task_id)
                 safety = get_agent_safety(self.memory.store, task_id)
             except ConflictError:
                 continue
-            if safety is not None and safety.state != AgentSafetyState.NONE.value:
+            plan_runtime = runtime is not None and (
+                task.phase == TaskPhase.PLANNING
+                or is_plan_runtime(runtime.remote_status)
+            )
+            recoverable_plan_latch = (
+                plan_runtime
+                and safety is not None
+                and safety.state == AgentSafetyState.RECONCILIATION_REQUIRED.value
+                and safety.operation == "runtime_recovery"
+                and safety.details.get("recovery_reason")
+                == "workspace-write runtime requires an active CODEX writer lease"
+                and runtime is not None
+                and all(
+                    getattr(safety, field) == getattr(runtime, field)
+                    for field in (
+                        "workflow_id",
+                        "operation_id",
+                        "thread_id",
+                        "turn_id",
+                    )
+                )
+            )
+            if (
+                safety is not None
+                and safety.state != AgentSafetyState.NONE.value
+                and not recoverable_plan_latch
+            ):
                 outcomes.append(
                     SessionRecoveryOutcome(
                         task_id=task_id,
@@ -290,7 +320,8 @@ class AgentSessionManager:
             if not is_active_runtime(runtime.remote_status if runtime else None):
                 continue
             if (
-                is_execution_runtime(runtime.remote_status)
+                not plan_runtime
+                and is_execution_runtime(runtime.remote_status)
                 and not (
                     execution.active_writer == ActiveWriter.CODEX
                     and execution.writer_epoch >= 1
@@ -342,6 +373,51 @@ class AgentSessionManager:
                 )
                 continue
             status = (snapshot.status or "").strip().lower()
+            if plan_runtime and status == "not_reconstructable":
+                current = self.memory.get_task(task_id)
+                _, stopped_runtime = bind_codex_runtime(
+                    self.memory.store,
+                    task_id,
+                    current.revision,
+                    event_type=EventType.CODEX_INTERRUPTED,
+                    workflow_id=runtime.workflow_id,
+                    operation_id=runtime.operation_id,
+                    thread_id=runtime.thread_id,
+                    turn_id=runtime.turn_id,
+                    remote_status="not_reconstructable",
+                    task_phase=TaskPhase.PAUSED,
+                    current_state=(
+                        "Read-only Codex plan could not be resumed after restart; "
+                        "start a new plan."
+                    ),
+                    event_payload={"restart_recovery": "plan_not_reconstructable"},
+                )
+                if recoverable_plan_latch:
+                    record_agent_compensation_succeeded(
+                        self.memory.store,
+                        task_id,
+                        operation="runtime_recovery",
+                        summary=(
+                            "The stale read-only planning runtime was confirmed absent; "
+                            "the recovery latch was cleared safely."
+                        ),
+                        details={"recovery_result": "plan_not_reconstructable"},
+                        workflow_id=stopped_runtime.workflow_id,
+                        operation_id=stopped_runtime.operation_id,
+                        thread_id=stopped_runtime.thread_id,
+                        turn_id=stopped_runtime.turn_id,
+                    )
+                outcomes.append(
+                    SessionRecoveryOutcome(
+                        task_id=task_id,
+                        status="PLAN_RESTART_REQUIRED",
+                        detail=(
+                            "the previous read-only plan runtime is no longer active; "
+                            "a new plan may be started safely"
+                        ),
+                    )
+                )
+                continue
             if snapshot.reconciliation_required or status in {
                 "unknown",
                 "reconciliation_required",
@@ -360,6 +436,21 @@ class AgentSessionManager:
                     )
                 )
                 continue
+            if recoverable_plan_latch:
+                record_agent_compensation_succeeded(
+                    self.memory.store,
+                    task_id,
+                    operation="runtime_recovery",
+                    summary=(
+                        "The read-only planning runtime was confirmed after restart; "
+                        "the recovery latch was cleared safely."
+                    ),
+                    details={"recovery_result": "plan_resumed"},
+                    workflow_id=runtime.workflow_id,
+                    operation_id=runtime.operation_id,
+                    thread_id=runtime.thread_id,
+                    turn_id=runtime.turn_id,
+                )
             outcomes.append(
                 SessionRecoveryOutcome(
                     task_id=task_id,

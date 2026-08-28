@@ -172,17 +172,34 @@ def _plan_result(value: Any) -> PlanResult | None:
     )
 
 
-def _plan_from_source(source: dict[str, Any]) -> PlanResult | None:
+def _plan_from_source(
+    source: dict[str, Any],
+    *,
+    allow_final_result: bool = False,
+) -> PlanResult | None:
     plan = _plan_result(_value(source, "plan", "plan_result", "latest_plan", "latestPlan"))
     if plan is not None:
         return plan
     content = _string(source, "plan_content", "planContent")
+    if content:
+        return PlanResult(
+            content=content,
+            status=_string(source, "plan_status", "planStatus") or "ready",
+            plan_hash=_string(source, "plan_hash", "planHash"),
+        )
+    if not allow_final_result:
+        return None
+    terminal = source.get("terminal") if isinstance(source.get("terminal"), dict) else {}
+    content = _string(terminal, "final_result", "finalResult") or _string(
+        source,
+        "final_result",
+        "finalResult",
+    )
     if not content:
         return None
     return PlanResult(
         content=content,
-        status=_string(source, "plan_status", "planStatus") or "ready",
-        plan_hash=_string(source, "plan_hash", "planHash"),
+        status=_string(terminal, "status") or "ready",
     )
 
 
@@ -194,6 +211,7 @@ def snapshot_from_payload(
     thread_id: str | None = None,
     turn_id: str | None = None,
     default_status: str = "unknown",
+    final_result_is_plan: bool = False,
 ) -> AgentSnapshot:
     nested_payload = payload.get("remote") if isinstance(payload.get("remote"), dict) else None
     source = {**nested_payload, **payload} if nested_payload else payload
@@ -229,7 +247,7 @@ def snapshot_from_payload(
         thread_id=thread_id,
         turn_id=turn_id,
     )
-    plan = _plan_from_source(source)
+    plan = _plan_from_source(source, allow_final_result=final_result_is_plan)
     if pending:
         blockers.append(f"{len(pending)} pending Codex interaction(s)")
     if isinstance(events, list):
@@ -261,12 +279,17 @@ def snapshot_from_payload(
     )
 
 
-def _handle(payload: dict[str, Any], *, default_status: str) -> PlanHandle:
+def _handle(
+    payload: dict[str, Any],
+    *,
+    default_status: str,
+    final_result_is_plan: bool = False,
+) -> PlanHandle:
     workflow = payload.get("workflow") if isinstance(payload.get("workflow"), dict) else {}
     operation = payload.get("operation") if isinstance(payload.get("operation"), dict) else {}
     turn = payload.get("turn") if isinstance(payload.get("turn"), dict) else {}
     source = {**workflow, **operation, **turn, **payload}
-    plan = _plan_from_source(source)
+    plan = _plan_from_source(source, allow_final_result=final_result_is_plan)
     return PlanHandle(
         operation_id=_string(source, "operation_id", "operationId", "executionOperationId"),
         workflow_id=_string(source, "workflow_id", "workflowId"),
@@ -414,7 +437,12 @@ class LocalCodexBridgeAgentBackend:
         if workspace.root:
             args["cwd"] = workspace.root
         try:
-            return _handle(await self._call("codex_turn", args), default_status="planning")
+            handle = _handle(
+                await self._call("codex_turn", args),
+                default_status="planning",
+                final_result_is_plan=True,
+            )
+            return handle.model_copy(update={"status": "planning"})
         except LocalCodexBridgeUnknownOutcomeError:
             return _unknown_handle("codex_turn")
 
@@ -474,6 +502,7 @@ class LocalCodexBridgeAgentBackend:
             thread_id=handle.thread_id,
             turn_id=handle.turn_id,
             default_status=handle.status,
+            final_result_is_plan=handle.status.strip().lower() == "planning",
         )
 
     async def steer(

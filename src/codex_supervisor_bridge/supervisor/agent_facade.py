@@ -68,6 +68,7 @@ _COMPLETE_STATUSES = {
     "success",
     "failed",
     "error",
+    "not_reconstructable",
 }
 
 _MUTATION_INTERACTION_KINDS = {
@@ -640,7 +641,17 @@ class AgentSupervisorFacade:
             raise AgentPlanGateError("Task has no Codex runtime to interrupt")
         agent = await self._agent()
         baseline_handle = self._runtime_handle(baseline_runtime)
-        snapshot = await agent.interrupt(baseline_handle)
+        try:
+            snapshot = await agent.interrupt(baseline_handle)
+        except Exception as interrupt_error:
+            try:
+                observed = await agent.observe(baseline_handle)
+            except Exception:
+                raise interrupt_error
+            observed_status = (observed.status or "").strip().lower()
+            if observed.reconciliation_required or observed_status not in _COMPLETE_STATUSES:
+                raise interrupt_error
+            snapshot = observed
         interrupt_status = (snapshot.status or "").strip().lower()
         if snapshot.reconciliation_required or interrupt_status in {
             "unknown",
@@ -875,7 +886,11 @@ class AgentSupervisorFacade:
 
         kind = (interaction.kind or interaction.type or "").strip().lower()
         lease: WriterLeaseToken | None = None
-        if kind in _MUTATION_INTERACTION_KINDS:
+        read_only_plan_command = (
+            kind == "command_approval"
+            and baseline_task.phase == TaskPhase.PLANNING
+        )
+        if kind in _MUTATION_INTERACTION_KINDS and not read_only_plan_command:
             execution = get_execution_state(self.memory.store, task_id)
             if execution.active_writer != ActiveWriter.CODEX:
                 raise AgentPlanGateError(
@@ -888,6 +903,8 @@ class AgentSupervisorFacade:
                 writer_epoch=execution.writer_epoch,
                 task_revision=expected_revision,
             )
+        elif read_only_plan_command:
+            lease = None
         elif kind == "user_input":
             lease = None
         elif kind == "provider_request":

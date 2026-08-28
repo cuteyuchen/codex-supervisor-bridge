@@ -289,6 +289,11 @@ def test_builtin_registry_uses_pinned_versions_and_no_floating_latest() -> None:
     assert lcb.commit_sha == "4ffed814f615316ade8967189a2e1772488d33c2"
     assert "4ffed814f615316ade8967189a2e1772488d33c2" in lcb.source
     assert lcb.checksum_sha256 is None
+    assert lcb.install_commands == [
+        ["npm", "ci"],
+        ["npm", "run", "typecheck"],
+        ["npm", "run", "build"],
+    ]
     assert "immutable GitHub commit archive" in registry.verification_strategy(
         "local-codex-bridge"
     )

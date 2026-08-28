@@ -5,6 +5,7 @@ import os
 import ssl
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Callable
@@ -14,12 +15,33 @@ class DownloadError(RuntimeError):
     """A bounded HTTPS download failed after retries."""
 
 
+class NoDowngradeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject any redirect that downgrades HTTPS to a non-HTTPS scheme."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: object,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        target = urllib.parse.urljoin(req.full_url, newurl)
+        if urllib.parse.urlsplit(target).scheme.lower() != "https":
+            raise DownloadError(
+                f"redirect downgrade blocked; {target!r} is not HTTPS"
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class HttpsDownloader:
     """Streaming HTTPS downloader with bounded time/size and retry semantics.
 
     The downloader never accepts plain HTTP, always verifies TLS by default,
-    streams to a temporary file, computes SHA256 while streaming, removes the
-    partial file on failure, and never emits credentials.
+    rejects HTTPS -> HTTP redirect downgrades at every hop, streams to a
+    temporary file, computes SHA256 while streaming, removes the partial file
+    on failure, and never emits credentials.
     """
 
     def __init__(
@@ -36,8 +58,15 @@ class HttpsDownloader:
         self.max_bytes = max_bytes
         self.retries = max(1, retries)
         self.chunk_size = max(1024, chunk_size)
-        self._urlopen = urlopen or urllib.request.urlopen
         self._ssl_context = ssl_context or ssl.create_default_context()
+        if urlopen is None:
+            opener = urllib.request.build_opener(
+                NoDowngradeRedirectHandler(),
+                urllib.request.HTTPSHandler(context=self._ssl_context),
+            )
+            self._urlopen = _opener_urlopen(opener)
+        else:
+            self._urlopen = urlopen
 
     def download(self, url: str, target: Path) -> Path:
         """Download ``url`` into ``target`` atomically and return its path."""
@@ -93,3 +122,15 @@ class HttpsDownloader:
         )
         os.close(fd)
         return Path(path)
+
+
+def _opener_urlopen(opener: urllib.request.OpenerDirector):
+    def open_url(
+        request: urllib.request.Request,
+        timeout: object = None,
+        context: object = None,
+    ) -> object:
+        del context
+        return opener.open(request, timeout=timeout)
+
+    return open_url

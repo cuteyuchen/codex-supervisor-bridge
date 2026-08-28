@@ -3,8 +3,12 @@ from __future__ import annotations
 import hashlib
 import io
 import tarfile
+import urllib.parse
+import urllib.request
 import zipfile
+from email.message import Message
 from pathlib import Path
+from urllib.response import addinfourl
 
 import pytest
 
@@ -13,7 +17,11 @@ from codex_supervisor_bridge.bootstrap.archive import (
     extract_tar_safe,
     extract_zip_safe,
 )
-from codex_supervisor_bridge.bootstrap.download import DownloadError, HttpsDownloader
+from codex_supervisor_bridge.bootstrap.download import (
+    DownloadError,
+    HttpsDownloader,
+    NoDowngradeRedirectHandler,
+)
 
 
 def _zip_with_member(tmp_path: Path, name: str, payload: bytes) -> Path:
@@ -129,3 +137,97 @@ def test_https_downloader_cleans_partial_and_bounded_retries(tmp_path: Path) -> 
         downloader.download("https://example.invalid/artifact.zip", target)
     assert calls == 2
     assert list(tmp_path.iterdir()) == []
+
+
+def _redirect_opener(location: str) -> urllib.request.OpenerDirector:
+    class _RedirectHTTPSHandler(urllib.request.BaseHandler):
+        def https_open(self, request: urllib.request.Request) -> addinfourl:
+            headers = Message()
+            headers["Location"] = location
+            response = addinfourl(
+                io.BytesIO(b""),
+                headers,
+                url=request.full_url,
+                code=301,
+            )
+            response.msg = "Moved Permanently"
+            return response
+
+    opener = urllib.request.OpenerDirector()
+    opener.add_handler(urllib.request.ProxyHandler({}))
+    opener.add_handler(NoDowngradeRedirectHandler())
+    opener.add_handler(_RedirectHTTPSHandler())
+    opener.add_handler(urllib.request.HTTPErrorProcessor())
+    opener.add_handler(urllib.request.UnknownHandler())
+    return opener
+
+
+def _opener_urlopen(opener: urllib.request.OpenerDirector):
+    def open_url(
+        request: urllib.request.Request,
+        timeout: object = None,
+        context: object = None,
+    ) -> object:
+        del timeout, context
+        return opener.open(request)
+
+    return open_url
+
+
+def test_https_downloader_rejects_redirect_downgrade_to_http(
+    tmp_path: Path,
+) -> None:
+    opener = _redirect_opener("http://example.invalid/artifact.zip")
+    downloader = HttpsDownloader(
+        urlopen=_opener_urlopen(opener),
+        retries=1,
+    )
+    target = tmp_path / "artifact.zip"
+
+    with pytest.raises(DownloadError, match="downgrade"):
+        downloader.download("https://trusted.invalid/artifact.zip", target)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_https_downloader_allows_https_redirect_chain(tmp_path: Path) -> None:
+    payload = b"redirected-artifact"
+
+    class _RouteHTTPSHandler(urllib.request.BaseHandler):
+        def https_open(self, request: urllib.request.Request) -> addinfourl:
+            path = urllib.parse.urlsplit(request.full_url).path
+            if path == "/artifact.zip":
+                headers = Message()
+                headers["Location"] = "https://trusted.invalid/final.zip"
+                response = addinfourl(
+                    io.BytesIO(b""),
+                    headers,
+                    url=request.full_url,
+                    code=301,
+                )
+                response.msg = "Moved Permanently"
+                return response
+            if path == "/final.zip":
+                response = addinfourl(
+                    io.BytesIO(payload),
+                    {},
+                    url=request.full_url,
+                    code=200,
+                )
+                response.msg = "OK"
+                return response
+            raise AssertionError(f"unexpected https request: {request.full_url}")
+
+    opener = urllib.request.OpenerDirector()
+    opener.add_handler(urllib.request.ProxyHandler({}))
+    opener.add_handler(NoDowngradeRedirectHandler())
+    opener.add_handler(_RouteHTTPSHandler())
+    opener.add_handler(urllib.request.HTTPErrorProcessor())
+    opener.add_handler(urllib.request.UnknownHandler())
+    downloader = HttpsDownloader(
+        urlopen=_opener_urlopen(opener),
+        retries=1,
+    )
+    target = tmp_path / "artifact.zip"
+
+    result = downloader.download("https://trusted.invalid/artifact.zip", target)
+    assert result.read_bytes() == payload

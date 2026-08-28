@@ -49,6 +49,7 @@ BUILTIN_MANIFESTS: dict[str, ComponentManifest] = {
         entrypoint="dist/src/index.js",
         install_commands=[
             ["npm", "ci"],
+            ["npm", "run", "typecheck"],
             ["npm", "run", "build"],
         ],
         requires_node=True,

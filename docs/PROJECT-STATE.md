@@ -576,6 +576,38 @@ create the Supervisor-only HTTPS tunnel, attach ChatGPT Web Remote MCP to the
 Supervisor endpoint, and run the same Profile A/B scenario against real
 worktrees. P6.6 is not marked complete until those gates pass.
 
+### 2026-08-28 runtime affinity / redirect safety round
+
+This round closes the remaining pre-real-Gate semantic gaps:
+
+- runtime affinity is explicitly different from writer ownership: a task must
+  keep its backend binding at startup when it has an active writer, an active
+  Codex runtime (`planning` / `executing` / `running` / `inprogress` /
+  `in_progress` / `started`) even with no writer, an unresolved agent safety
+  latch, a PREPARED direct mutation, or a RUNNING direct command;
+- `list_runtime_affinity_bindings` replaces the writer-only startup query, and
+  `mcp/server.py` fails closed on multiple distinct runtime-affinity bindings
+  even when one task is a read-only planning runtime and another is executing;
+- `AgentSessionManager` recovers every runtime-affinity task: a read-only
+  `planning` runtime is resumed with `active_writer = NONE` or `CHATGPT`
+  without taking the workspace writer, while `executing` / `running` /
+  `inprogress` / `in_progress` / `started` runtimes still require a current
+  CODEX writer lease with `writer_epoch >= 1`, otherwise
+  `RECONCILIATION_REQUIRED` is latched before READY;
+- unresolved compensation/reconciliation safety latches block automatic
+  recovery instead of being silently retried, and any UNKNOWN plan-mode resume
+  latches `RECONCILIATION_REQUIRED` before `PROFILE_READY`;
+- `HttpsDownloader` now rejects every HTTPS -> HTTP (or non-HTTPS) redirect hop
+  through a `NoDowngradeRedirectHandler`; final and intermediate downgrades
+  fail closed with `DownloadError`, and HTTPS -> HTTPS redirects remain allowed;
+- the built-in Local-Codex-Bridge manifest now runs the explicit production
+  install gate `npm ci` -> `npm run typecheck` -> `npm run build` with the
+  managed Node/npm absolute paths; protocol health remains the post-install
+  runtime verification;
+- new plan-mode restart, execution writer-fence, conflicting affinity, and
+  redirect-downgrade tests are part of the PR #9 suite.
+- the code-level suite is 243 tests locally on Python 3.12/3.13.
+
 ### Revised next phases
 
 #### P6.5 — Execution Modes + Backend Abstraction (code complete; PR #8)

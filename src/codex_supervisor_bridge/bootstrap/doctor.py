@@ -467,15 +467,17 @@ class Doctor:
             finder=self._find,
             runner=lambda command, **kwargs: self._run(command),
         )
+        config_path = config.advanced.backend_detail.get("codex_config_path")
         readiness = detector.probe(
             executable=configured or "codex",
             workspace=workspace,
+            config_path=config_path or None,
         )
         advanced = readiness.model_dump(mode="json")
         return ComponentHealth(
             capability="Codex",
             status=readiness.status,
-            repairable=readiness.status != HealthStatus.READY,
+            repairable=readiness.repairable,
             user_message=readiness.user_message,
             recommended_action="repair_codex" if readiness.status != HealthStatus.READY else None,
             advanced=advanced,
@@ -575,7 +577,11 @@ class Doctor:
                 capability=label,
                 status=HealthStatus.UNAVAILABLE,
                 repairable=True,
-                user_message=f"{label} needs installation or repair." if not auth_hint else "Codex needs installation or sign-in.",
+                user_message=(
+                    f"{label} needs installation or repair."
+                    if not auth_hint
+                    else "Codex 需要安装或完成一次凭据设置。"
+                ),
                 recommended_action="repair_codex" if auth_hint else "repair_environment",
                 advanced={"executable": command, "technical_detail": "executable not found"},
             )
@@ -585,7 +591,11 @@ class Doctor:
                 capability=label,
                 status=HealthStatus.DEGRADED,
                 repairable=True,
-                user_message=f"{label} needs repair." if not auth_hint else "Codex needs sign-in or runtime repair.",
+                user_message=(
+                    f"{label} needs repair."
+                    if not auth_hint
+                    else "Codex 当前配置无法使用。"
+                ),
                 recommended_action="repair_codex" if auth_hint else "repair_environment",
                 advanced={"executable": executable, "technical_detail": "version command failed"},
             )

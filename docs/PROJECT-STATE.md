@@ -544,7 +544,7 @@ Windows Gate:
   re-run; normal UX still shows only `prepare_local_environment`;
 - `RuntimeResolver` now includes the `codex` capability as a separate
   readiness input, so a healthy LCB/DevSpace pair cannot report PROFILE_READY
-  when the Codex CLI is missing or unauthenticated;
+  when the Codex CLI cannot successfully execute a bounded runtime probe;
 - `mcp/server.py` reads persisted active `task_backend_binding` rows at
   startup: one active binding is enforced (no fallback to a healthier
   profile), and multiple active tasks bound to different profiles fail closed
@@ -571,10 +571,11 @@ Windows Gate:
   Python 3.12/3.13.
 
 The real Windows Gate remains: install/launch DevSpace and Local-Codex-Bridge
-on a user machine, complete one DevSpace authorization, log in to Codex,
-create the Supervisor-only HTTPS tunnel, attach ChatGPT Web Remote MCP to the
-Supervisor endpoint, and run the same Profile A/B scenario against real
-worktrees. P6.6 is not marked complete until those gates pass.
+on a user machine, complete one DevSpace authorization, prove the user's
+existing Codex configuration with a read-only runtime smoke, create the
+Supervisor-only HTTPS tunnel, attach ChatGPT Web Remote MCP to the Supervisor
+endpoint, and run the same Profile A/B scenario against real worktrees. P6.6
+is not marked complete until those gates pass.
 
 ### 2026-08-28 runtime affinity / redirect safety round
 
@@ -607,6 +608,53 @@ This round closes the remaining pre-real-Gate semantic gaps:
 - new plan-mode restart, execution writer-fence, conflicting affinity, and
   redirect-downgrade tests are part of the PR #9 suite.
 - the code-level suite is 243 tests locally on Python 3.12/3.13.
+
+### 2026-08-28 provider-neutral Codex authentication / readiness round
+
+This round freezes the product semantics for Codex readiness:
+
+- `Codex READY` means the user's currently configured Codex provider can
+  successfully execute a bounded read-only runtime probe. It does **not** mean
+  ChatGPT account login, an OpenAI API key, or any specific provider name;
+- `CodexAuthMode` is provider-neutral and supports `CHATGPT_ACCOUNT`,
+  `OPENAI_API_KEY`, `PROVIDER_ENV_KEY`, `CUSTOM_PROVIDER`, `LOCAL_NO_AUTH`,
+  `AWS_OR_CLOUD_PROVIDER`, and `UNKNOWN` for advanced diagnostics only;
+- `CodexConfigInspector` reads `$CODEX_HOME/config.toml` (default
+  `~/.codex/config.toml`) read-only with a size limit and fail-closed parse
+  handling. It never opens `auth.json`, never modifies config, and never
+  resolves an `env_key` to its value;
+- a third-party provider configured with `model_provider`, `base_url`, and
+  `env_key` is supported without Bridge taking ownership of the key. The
+  inspector records only the variable name and whether it exists;
+- `CodexReadinessDetector` is layered: executable -> version -> config
+  inspection -> bounded runtime smoke. Final READY requires
+  `codex exec ... --sandbox read-only --json --ephemeral
+  --output-last-message <tmp> --cd <workspace>` to return
+  `CODEX_RUNTIME_READY`;
+- smoke failures are classified without dumping provider responses:
+  missing CLI (`UNAVAILABLE`), invalid config (`DEGRADED`), missing env
+  reference (`DEGRADED` + user action), provider 401/403 (`DEGRADED` + user
+  action), network timeout (`DEGRADED`), model unavailable (`DEGRADED` + user
+  action), and unexpected output (`DEGRADED`);
+- normal UX shows only `Codex: READY` / `Codex 当前配置无法使用。` /
+  `Codex 当前凭据不可用。`; provider names, env variable names, and masked
+  base URLs appear only in advanced diagnostics, and credential values never
+  appear anywhere;
+- `lcb_environment()` inherits the user environment so LCB -> Codex sees the
+  provider credentials the user already has, but the values are never
+  serialized into diagnostics, Context Packs, logs, or MCP responses;
+- `ProfileReadiness` combines workspace, agent, and `codex` readiness, so an
+  LCB protocol that is healthy cannot make `PROFILE_READY` true when the
+  Codex runtime probe is not ready;
+- the Windows real-machine flow no longer defaults to `codex login`. It
+  inspects the existing Codex config, detects the current provider, runs the
+  runtime smoke, and only asks for credential setup when the smoke explicitly
+  proves the current credential is unusable;
+- the new provider-neutral readiness tests cover ChatGPT account, OpenAI API
+  key, third-party `env_key`, local no-auth, missing env reference, provider
+  401, timeout, model unavailable, invalid config, secret redaction, no
+  forced login/logout, and ProfileReadiness combining the real Codex runtime
+  result. The code-level suite is 252 tests locally on Python 3.12/3.13.
 
 ### Revised next phases
 
@@ -653,8 +701,8 @@ recovery fails closed into reconciliation. The production safety/lifecycle
 convergence round (capability-driven RuntimeResolver, pre-READY recovery,
 combined readiness, guarded steer/respond/interrupt, migration gate, and
 managed component registry) is also in PR #9 and green on Linux/Windows CI.
-The next step is the real Windows Gate (install/launch/OAuth/Codex
-login/tunnel/ChatGPT Remote MCP attachment).
+The next step is the real Windows Gate (install/launch/DevSpace OAuth/Codex
+runtime smoke/tunnel/ChatGPT Remote MCP attachment).
 
 #### P7 — Backend-neutral Review / QA / PR / CI loop
 

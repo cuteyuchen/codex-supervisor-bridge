@@ -7,7 +7,16 @@ from .auth import (
     AuthorizationStatus,
     FirstAuthorizationFlow,
 )
-from .codex_runtime import CodexReadiness, CodexReadinessDetector
+from .codex_runtime import (
+    CodexAuthMode,
+    CodexConfigInspection,
+    CodexConfigInspector,
+    CodexReadiness,
+    CodexReadinessDetector,
+    CodexRuntimeProbeResult,
+    CodexRuntimeSmokeProbe,
+    codex_environment_references,
+)
 from .command_auth import (
     CommandAuthorization,
     CommandAuthorizationPolicy,
@@ -99,6 +108,11 @@ __all__ = [
     "ConfigStore",
     "CodexReadiness",
     "CodexReadinessDetector",
+    "CodexAuthMode",
+    "CodexConfigInspection",
+    "CodexConfigInspector",
+    "CodexRuntimeProbeResult",
+    "CodexRuntimeSmokeProbe",
     "DevelopmentStyle",
     "DownloadError",
     "Doctor",
@@ -143,6 +157,7 @@ __all__ = [
     "WindowsDpapiSecretStore",
     "UnsafeArchiveError",
     "authorize_command",
+    "codex_environment_references",
     "extract_tar_safe",
     "extract_zip_safe",
     "FirstAuthorizationFlow",

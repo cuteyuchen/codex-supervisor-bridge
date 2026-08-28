@@ -1539,7 +1539,7 @@ def test_devspace_local_oauth_real_loopback_protocol() -> None:
     assert "fake-refresh-token" not in redacted
 
 
-def test_codex_readiness_requires_more_than_an_executable() -> None:
+def test_codex_readiness_requires_real_runtime_probe() -> None:
     def runner(command: list[str], **kwargs: object) -> object:
         del kwargs
         return subprocess.CompletedProcess(command, 0, "codex 1.2.3\n", "")
@@ -1547,8 +1547,10 @@ def test_codex_readiness_requires_more_than_an_executable() -> None:
     detector = CodexReadinessDetector(finder=lambda name: "C:/tools/codex.exe", runner=runner)
     readiness = detector.probe()
     assert readiness.process_launchable is True
-    assert readiness.authentication_ready is None
+    assert readiness.runtime_ready is False
     assert readiness.status == HealthStatus.DEGRADED
+    assert readiness.runtime_probe is not None
+    assert readiness.runtime_probe.category == "UNEXPECTED_RUNTIME_RESULT"
 
 
 def test_command_session_latches_unknown_interrupt_for_reconciliation() -> None:
@@ -1868,6 +1870,16 @@ def test_codex_readiness_full_probe_matrix(tmp_path: Path) -> None:
     def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         del kwargs
         calls.append(command)
+        if "--version" in command:
+            return completed(command, stdout="codex 1.2.3\n")
+        try:
+            index = command.index("--output-last-message")
+            Path(command[index + 1]).write_text(
+                "CODEX_RUNTIME_READY",
+                encoding="utf-8",
+            )
+        except (ValueError, OSError):
+            pass
         return completed(command)
 
     missing = CodexReadinessDetector(finder=lambda name: None, runner=runner).probe()
@@ -1882,7 +1894,7 @@ def test_codex_readiness_full_probe_matrix(tmp_path: Path) -> None:
     ).probe()
     assert version_failed.status == HealthStatus.DEGRADED
     assert version_failed.process_launchable is False
-    assert version_failed.user_message == "Codex needs sign-in or runtime repair."
+    assert version_failed.user_message == "Codex 当前配置无法使用。"
 
     def raising_runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         del command, kwargs
@@ -1894,13 +1906,13 @@ def test_codex_readiness_full_probe_matrix(tmp_path: Path) -> None:
     ).probe()
     assert launch_failed.status == HealthStatus.DEGRADED
     assert launch_failed.process_launchable is False
-    assert "cannot launch" in (launch_failed.technical_detail or "")
+    assert launch_failed.technical_detail == "version command failed"
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / ".git").mkdir()
 
-    not_logged_in = CodexReadinessDetector(
+    runtime_missing = CodexReadinessDetector(
         finder=lambda name: "C:/tools/codex.exe",
         runner=lambda command, **kwargs: completed(
             command,
@@ -1908,25 +1920,25 @@ def test_codex_readiness_full_probe_matrix(tmp_path: Path) -> None:
             stderr="not logged in\n",
         ),
     ).probe(workspace=workspace)
-    assert not_logged_in.status == HealthStatus.DEGRADED
-    assert not_logged_in.authentication_ready is False
-    assert not_logged_in.workspace_ready is True
+    assert runtime_missing.status == HealthStatus.DEGRADED
+    assert runtime_missing.runtime_ready is False
+    assert runtime_missing.workspace_ready is True
 
     no_git = CodexReadinessDetector(
         finder=lambda name: "C:/tools/codex.exe",
-        runner=lambda command, **kwargs: completed(command, stdout="codex 1.2.3\n"),
+        runner=runner,
     ).probe(workspace=tmp_path / "not-a-git-project")
     assert no_git.status == HealthStatus.DEGRADED
     assert no_git.workspace_ready is False
-    assert no_git.user_message == "Codex is ready, but the selected project is unavailable."
+    assert no_git.user_message == "Codex 当前配置可以正常使用，但所选项目不可用。"
 
     ready = CodexReadinessDetector(
         finder=lambda name: "C:/tools/codex.exe",
-        runner=lambda command, **kwargs: completed(command, stdout="codex 1.2.3\nlogged in\n"),
+        runner=runner,
     ).probe(workspace=workspace)
     assert ready.status == HealthStatus.READY
     assert ready.process_launchable is True
-    assert ready.authentication_ready is True
+    assert ready.runtime_ready is True
     assert ready.workspace_ready is True
     assert ready.version == "codex 1.2.3"
     assert ready.executable == "C:/tools/codex.exe"
@@ -1935,7 +1947,7 @@ def test_codex_readiness_full_probe_matrix(tmp_path: Path) -> None:
     explicit.write_text("placeholder", encoding="utf-8")
     explicit_probe = CodexReadinessDetector(
         finder=lambda name: None,
-        runner=lambda command, **kwargs: completed(command, stdout="codex 9.9.9\nready\n"),
+        runner=runner,
     ).probe(executable=str(explicit), workspace=workspace)
     assert explicit_probe.status == HealthStatus.READY
     assert explicit_probe.executable == str(explicit)

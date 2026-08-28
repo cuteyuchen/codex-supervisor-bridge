@@ -274,5 +274,12 @@ def lcb_launch_from_config(
 
 
 def lcb_environment() -> dict[str, str]:
-    """Base environment for the LCB stdio process without leaking secrets."""
+    """Inherit the user environment for the LCB -> Codex stdio process.
+
+    Provider credentials that already work for the user's Codex CLI are passed
+    through to the child process exactly as the user has them configured.
+    Values are never serialized into diagnostics, Context Packs, logs, or MCP
+    responses.
+    """
+
     return dict(os.environ)

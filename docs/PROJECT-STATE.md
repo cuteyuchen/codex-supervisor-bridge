@@ -441,6 +441,67 @@ The first implementation slice is intentionally backend-neutral and layered:
   installer atomic promote/rollback, production-composition E2E, and the
   fail-soft readiness marker.
 
+### 2026-08-28 production safety / lifecycle convergence
+
+The pre-real-Gate production wiring round is complete on the P6.6 branch:
+
+- `RuntimeResolver` performs capability-driven production profile selection.
+  An unbound task prefers Profile B when both workspace and agent are fully
+  READY, falls back to Profile A only when Profile B is not ready, and never
+  silently switches an already-bound task: `binding_forced=True`,
+  `fallback_allowed=False`, and a temporary capability drop reports
+  DEGRADED/UNAVAILABLE instead of switching backends;
+- Profile A is now semantically consistent: `RuntimeComposition.profile_a`
+  builds a `KandevWorkspaceBackend` workspace factory (not DevSpace), and
+  `KandevWorkspaceBackend` selects a matching Kandev workspace and fails
+  closed for direct read/patch/command operations that Kandev does not expose;
+  Profile B keeps the authenticated DevSpace workspace factory;
+- `RuntimeComposition.start()` starts the persistent `AgentSessionManager` and
+  runs persisted-runtime recovery **before** readiness, and
+  `RuntimeComposition.shutdown()` shuts the session down (safe to call more
+  than once); `mcp/server.py` composes start -> recovery -> combined readiness
+  marker -> MCP server -> shutdown;
+- combined readiness (`ProfileReadiness`) now requires workspace probe plus
+  agent/session health plus zero startup reconciliation blockers. Supervisor
+  process startup is not reported as PROFILE_READY when DevSpace, LCB, or
+  Codex readiness is missing; it reports DEGRADED/UNAVAILABLE instead;
+- the semantic facade routes every agent call through `AgentSessionManager`
+  when one is composed, so the first MCP call can be `get_codex_control_health`
+  without a prior `start_codex_plan`;
+- restart recovery happens before READY: a persisted CODEX writer with an
+  active runtime identity is resumed through the new long-lived session.
+  Confirmed resume is allowed; UNKNOWN, failed, or incomplete identity latches
+  `RECONCILIATION_REQUIRED`, and the startup E2E proves handoff/mutation is
+  blocked by that latch;
+- `soft_steer` and `answer_interaction` now use the shared guarded remote
+  mutation path: baseline revision/intent/plan/writer/epoch/runtime identity,
+  post-call stale validation, and durable compensation interrupt before any
+  stale result can bind. `answer_interaction` is writer-fenced by interaction
+  kind: command/file/permissions approvals require the current CODEX lease,
+  `user_input` is revision/runtime fenced only, `provider_request` is denied
+  by default, and unknown kinds are denied;
+- stale interrupt results cannot overwrite a newer runtime identity. The old
+  runtime interruption is recorded as compensation evidence; if the current
+  runtime cannot be confirmed the facade latches reconciliation and fails
+  closed;
+- backend migration is gated: an explicit migration requires no CODEX active
+  writer, no unresolved safety latch, no pending direct mutation, no active
+  Codex runtime, and a saved workspace snapshot; negative tests cover every
+  blocker;
+- `ManagedComponentRegistry` pins immutable manifests: Node.js 24.20.0 with an
+  official SHA256, DevSpace 1.0.8 with a published SHA256, and
+  Local-Codex-Bridge v2.1.3 with the verification strategy recorded because
+  upstream publishes no official SHA256. The installer now accepts argv-only
+  install commands, rejects non-built-in manifests when a trusted registry is
+  configured, rejects path traversal, and RepairService exposes
+  `prepare_local_environment` install plans in advanced diagnostics only;
+- the current code-level suite is 211 tests locally on Python 3.12/3.13,
+  including the production startup E2E (healthy Profile B, Profile A fallback,
+  bound-task no-fallback, pre-READY reconciliation, first health call, clean
+  shutdown, no orphan session), guarded steer/respond/interrupt race tests,
+  backend migration negative tests, RuntimeResolver selection tests,
+  Kandev workspace semantics, and managed component registry tests.
+
 The current code-level work does not claim real Windows OAuth, ChatGPT Web
 Remote MCP attachment, tunnel-provider login, or authenticated Codex runtime
 proof. Those remain opt-in/manual gates after the fake and protocol coverage is
@@ -488,8 +549,12 @@ Profile B runs through `AgentExecutionCoordinator` + `LocalCodexBridgeAgentBacke
 via a persistent `AgentSessionManager`, Profile A remains the
 `ControlPlaneAgentBackend` compatibility path, the Codex semantic MCP facade is
 provider-neutral, task backend binding is durable (schema v8), and restart
-recovery fails closed into reconciliation. The next step is the real Windows
-Gate (install/launch/OAuth/Codex login/tunnel/ChatGPT Remote MCP attachment).
+recovery fails closed into reconciliation. The production safety/lifecycle
+convergence round (capability-driven RuntimeResolver, pre-READY recovery,
+combined readiness, guarded steer/respond/interrupt, migration gate, and
+managed component registry) is also in PR #9 and green on Linux/Windows CI.
+The next step is the real Windows Gate (install/launch/OAuth/Codex
+login/tunnel/ChatGPT Remote MCP attachment).
 
 #### P7 — Backend-neutral Review / QA / PR / CI loop
 

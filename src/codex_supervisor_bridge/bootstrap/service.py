@@ -17,7 +17,13 @@ from .local_codex import LocalCodexBridgeBootstrap
 from .models import BootstrapStatus, DoctorStatus, HealthStatus, RepairAction
 from .paths import AppDataPaths
 from .process import ManagedProcessSpec, ProcessManager
+from .remote import (
+    OpenAISecureMcpTunnelConfig,
+    OpenAISecureMcpTunnelController,
+    RemoteAccessMode,
+)
 from .repair import RepairService
+from .secrets import MemorySecretStore, SecretStore, WindowsDpapiSecretStore
 
 SUPERVISOR_STARTUP_TIMEOUT_FLOOR_SECONDS = 60.0
 
@@ -99,6 +105,34 @@ class BootstrapService:
             config.advanced.executable_paths["node"] = node_executable
         self.config_store.save(config)
         return self.status(project_directory=project_directory or config.basic.project_directory)
+
+    def configure_remote_access(
+        self,
+        *,
+        tunnel_id: str,
+        runtime_key: str,
+        local_mcp_url: str | None = None,
+        health_listener: str = "127.0.0.1:0",
+        runtime_secret_ref: str = "openai-tunnel-runtime",
+    ) -> BootstrapStatus:
+        """Store OpenAI tunnel metadata and the runtime key in SecretStore."""
+
+        if not runtime_key or "\n" in runtime_key or "\r" in runtime_key:
+            raise ValueError("runtime key must be provided through hidden input")
+        config = self.config_store.load().config
+        remote = OpenAISecureMcpTunnelConfig(
+            provider=RemoteAccessMode.OPENAI_SECURE_MCP_TUNNEL,
+            tunnel_id=tunnel_id,
+            runtime_secret_ref=runtime_secret_ref,
+            local_mcp_url=local_mcp_url
+            or f"http://127.0.0.1:{config.advanced.ports.get('supervisor', 8765)}/mcp",
+            health_listener=health_listener,
+            client_version="0.0.13",
+        )
+        self._default_secret_store().set(runtime_secret_ref, runtime_key)
+        config.advanced.remote_access = remote
+        self.config_store.save(config)
+        return self.status(project_directory=config.basic.project_directory)
 
     def repair_and_status(self, *, project_directory: Path | None = None) -> BootstrapStatus:
         before = self.doctor.run(DoctorOptions(project_directory=project_directory))
@@ -371,12 +405,58 @@ class BootstrapService:
                     advanced=component.as_dict(),
                 )
             )
+        remote = config.advanced.remote_access
+        if remote is not None and remote.provider == RemoteAccessMode.OPENAI_SECURE_MCP_TUNNEL:
+            executable = config.advanced.executable_paths.get("tunnel_client")
+            if executable is None:
+                managed = self.paths.components / "openai-tunnel-client" / "current.json"
+                try:
+                    import json
+
+                    pointer = json.loads(managed.read_text(encoding="utf-8"))
+                    executable = str(Path(pointer["path"]) / "tunnel-client.exe")
+                except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                    executable = "tunnel-client"
+            controller = OpenAISecureMcpTunnelController(
+                process_manager=self.process_manager,
+                secret_store=self._default_secret_store(),
+                executable=executable,
+                runtime_dir=self.paths.runtime,
+            )
+            supervisor_state = self.process_manager.health("supervisor")
+            remote_health = controller.start(
+                remote,
+                supervisor_ready=supervisor_state.status == "RUNNING" and readiness == HealthStatus.READY,
+            )
+            result.repairs.append(
+                RepairAction(
+                    action="start_remote_access",
+                    status=(
+                        HealthStatus.READY
+                        if remote_health.ready and remote_health.healthy
+                        else HealthStatus.DEGRADED
+                    ),
+                    message=(
+                        "ChatGPT connection is ready."
+                        if remote_health.ready and remote_health.healthy
+                        else "ChatGPT connection is not ready."
+                    ),
+                    requires_user_action=remote_health.state
+                    in {"TUNNEL_NOT_CONFIGURED", "TUNNEL_RUNTIME_KEY_MISSING"},
+                    advanced=remote_health.model_dump(mode="json"),
+                )
+            )
         final = self.status(project_directory=project_directory)
         if readiness is not None and readiness != HealthStatus.READY:
             final.status = readiness
             final.summary = _summary(readiness)
         final.repairs = [*result.repairs]
         return final
+
+    def _default_secret_store(self) -> SecretStore:
+        if sys.platform == "win32":
+            return WindowsDpapiSecretStore(self.paths.config / "secrets")
+        return MemorySecretStore()
 
 
 def _summary(status: HealthStatus) -> str:

@@ -744,6 +744,60 @@ destructive root cleanup was used.
 The Windows local AppData Gate is **PASSED**. The next phase is the separately
 scoped Supervisor HTTPS / ChatGPT Web Remote MCP Gate; P7 remains unopened.
 
+### 2026-08-29 Secure MCP Tunnel local integration
+
+P6.6 now freezes the remote transport as the OpenAI-hosted Secure MCP Tunnel
+architecture. The intended path is:
+
+```text
+ChatGPT Web Custom MCP App
+  -> OpenAI Secure MCP Tunnel endpoint
+  -> outbound HTTPS tunnel-client
+  -> http://127.0.0.1:<supervisor-port>/mcp
+  -> Supervisor Bridge -> DevSpace / Local-Codex-Bridge -> Codex
+```
+
+DevSpace, Local-Codex-Bridge, and Supervisor remain loopback-only. The Bridge
+does not open a public listener, configure Cloudflare/ngrok, or expose raw
+shell/filesystem access. The old generic HTTPS abstraction remains available
+as a vendor-neutral fallback, while the Windows default is
+`OPENAI_SECURE_MCP_TUNNEL`.
+
+The official `openai/tunnel-client` v0.0.13 Windows amd64 release is now a
+trusted managed component. The registry pins the GitHub release URL, artifact
+SHA256, and official `SHA256SUMS.txt` sidecar; installation uses the existing
+safe archive extractor, atomic promotion/rollback, and binary `--version`
+verification. Windows arm64 selection is represented by the same pinned
+manifest with its official arm64 checksum.
+
+Remote settings persist only provider-neutral metadata (`tunnel_id`, loopback
+MCP URL, loopback health listener, client version, and
+`runtime_secret_ref`). The runtime API key is stored only in the Windows DPAPI
+SecretStore and is injected into the managed child through an environment
+variable reference. It is never written to settings, argv, process metadata,
+logs, diagnostics, Context Pack, MCP responses, or project documentation.
+
+`codex-supervisor remote configure --tunnel-id <id>` performs hidden terminal
+input and stores the runtime key locally. It does not create a tunnel and does
+not accept an admin key. Doctor/Status report process, `/healthz`, `/readyz`,
+local MCP target, client version, and key presence without exposing the key.
+Remote access is READY only when the managed process is running and both
+health endpoints are ready; this capability is kept separate from Codex
+inference readiness.
+
+The historical Supervisor PID `28268` was inspected with executable,
+command-line, creation time, parent PID, and listener evidence. It is a live
+`cmd.exe /d /s /c claude-code-mcp` PID reuse, not a Bridge process. The Bridge
+runtime record was cleared through ProcessManager's identity check without
+terminating the unrelated process. New managed records persist executable,
+start time, command fingerprint, and managed instance identity; mismatches
+are classified as `PID_REUSED`/`STALE_IDENTITY` and fail closed.
+
+The local Secure MCP Tunnel integration is code-complete and the managed
+binary is installed. OpenAI Platform tunnel/runtime-key creation and ChatGPT
+Workspace Developer Mode / Custom MCP App actions remain explicit human gates;
+P6.6 remains ACTIVE until the remote Profile B live scenario completes.
+
 ### Revised next phases
 
 #### P6.5 — Execution Modes + Backend Abstraction (code complete; PR #8)

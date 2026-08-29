@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -32,6 +33,7 @@ class ProcessState:
     restart_count: int = 0
     technical_detail: str | None = None
     process_identity: dict[str, Any] | None = None
+    identity_status: str | None = None
     _process: Any = field(default=None, repr=False, compare=False)
 
     def as_dict(self) -> dict[str, Any]:
@@ -44,6 +46,7 @@ class ProcessState:
             "restart_count": self.restart_count,
             "technical_detail": self.technical_detail,
             "process_identity": self.process_identity,
+            "identity_status": self.identity_status,
         }
 
 
@@ -84,6 +87,8 @@ class ProcessManager:
                     technical_detail="restart limit reached",
                 )
             )
+        if current.status == "UNKNOWN" and current.identity_status == "PID_REUSED":
+            current = self.repair_stale(spec.name)
         if current.status == "UNKNOWN":
             return self._record(
                 ProcessState(
@@ -143,7 +148,11 @@ class ProcessManager:
             pid=int(process.pid),
             log_path=log_path,
             restart_count=restart_count,
-            process_identity=_process_identity(int(process.pid)),
+            process_identity=_augment_process_identity(
+                _process_identity(int(process.pid)),
+                spec.command,
+                spec.name,
+            ),
             _process=process,
         )
         if process.poll() is not None:
@@ -201,12 +210,19 @@ class ProcessManager:
             current_identity = _process_identity(state.pid)
             if _same_process_identity(state.process_identity, current_identity):
                 state.status = "RUNNING"
+                state.identity_status = "VERIFIED"
                 state.technical_detail = "recovered persisted managed process"
             else:
                 state.status = "UNKNOWN"
+                state.identity_status = (
+                    "PID_REUSED"
+                    if state.process_identity and current_identity
+                    else "STALE_IDENTITY"
+                )
                 state.technical_detail = "persisted PID is alive without a verified managed identity"
         else:
             state.status = "STALE"
+            state.identity_status = "STALE_PID"
             state.technical_detail = "persisted PID is no longer running"
         return self._record(state)
 
@@ -225,6 +241,13 @@ class ProcessManager:
             state.status = "STOPPED"
             state.pid = None
             state.technical_detail = "stale runtime state cleared"
+            self._lock_path(name).unlink(missing_ok=True)
+            return self._record(state)
+        if state.status == "UNKNOWN" and state.identity_status == "PID_REUSED":
+            state.status = "STOPPED"
+            state.pid = None
+            state.identity_status = "CLEARED_PID_REUSE"
+            state.technical_detail = "stale PID reuse record cleared without touching the live process"
             self._lock_path(name).unlink(missing_ok=True)
             return self._record(state)
         return state
@@ -277,6 +300,11 @@ class ProcessManager:
             process_identity=(
                 item.get("process_identity")
                 if isinstance(item.get("process_identity"), dict)
+                else None
+            ),
+            identity_status=(
+                item.get("identity_status")
+                if isinstance(item.get("identity_status"), str)
                 else None
             ),
         )
@@ -435,7 +463,31 @@ def _same_process_identity(
     return (
         os.path.normcase(expected_executable) == os.path.normcase(current_executable)
         and expected_started_at == current_started_at
+        and (
+            not isinstance(expected.get("command_fingerprint"), str)
+            or not isinstance(current.get("command_fingerprint"), str)
+            or expected["command_fingerprint"] == current["command_fingerprint"]
+        )
     )
+
+
+def _augment_process_identity(
+    identity: dict[str, Any] | None,
+    command: Sequence[str],
+    managed_name: str,
+) -> dict[str, Any] | None:
+    if identity is None:
+        return None
+    return {
+        **identity,
+        "command_fingerprint": _command_fingerprint(command),
+        "managed_instance": managed_name,
+    }
+
+
+def _command_fingerprint(command: Sequence[str]) -> str:
+    payload = "\x00".join(str(item) for item in command)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _safe_name(name: str) -> str:

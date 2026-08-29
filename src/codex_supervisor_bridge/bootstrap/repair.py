@@ -14,6 +14,7 @@ from .models import DoctorStatus, HealthStatus, RepairAction
 from .paths import AppDataMigrationError, AppDataPaths, migrate_legacy_app_data
 from .ports import PortAllocator
 from .process import ProcessManager
+from .remote import RemoteAccessMode
 from .secrets import MemorySecretStore, SecretStore, WindowsDpapiSecretStore
 
 
@@ -206,6 +207,14 @@ class RepairService:
             if item is None or item.status == HealthStatus.READY:
                 continue
             actions.append(self._install_action(name, item))
+        remote = self.config_store.load().config.advanced.remote_access
+        if (
+            remote is not None
+            and remote.provider == RemoteAccessMode.OPENAI_SECURE_MCP_TUNNEL
+        ):
+            item = status.component("ChatGPT connection")
+            if item is not None and item.status != HealthStatus.READY:
+                actions.append(self._install_action("openai-tunnel-client", item))
         return actions
 
     def _install_action(
@@ -269,6 +278,10 @@ class RepairService:
                 config.advanced.local_codex_repository = self.paths.canonicalize_path(
                     installed_path
                 )
+        elif name == "openai-tunnel-client":
+            executable = installed_path / "tunnel-client.exe"
+            if executable.is_file():
+                config.advanced.executable_paths["tunnel_client"] = str(executable)
         self.config_store.save(config)
 
     def _write_mcp_config(self, config: AppConfig) -> None:

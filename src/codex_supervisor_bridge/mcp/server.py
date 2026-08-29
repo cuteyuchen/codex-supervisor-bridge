@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import ipaddress
 import json
 import sys
@@ -180,6 +181,7 @@ def build_parser(settings: Settings | None = None) -> argparse.ArgumentParser:
             "status",
             "repair",
             "reconcile-app-data",
+            "remote",
         ),
         help="Bootstrap command; omit to run the MCP server",
     )
@@ -250,6 +252,18 @@ def build_parser(settings: Settings | None = None) -> argparse.ArgumentParser:
         help="Node.js executable path for configure",
     )
     parser.add_argument(
+        "remote_action",
+        nargs="?",
+        choices=("configure",),
+        help="Remote access action (use with the remote command)",
+    )
+    parser.add_argument("--tunnel-id", default=None, help="OpenAI Secure MCP Tunnel id")
+    parser.add_argument(
+        "--runtime-secret-ref",
+        default="openai-tunnel-runtime",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--database",
         type=Path,
         default=settings.database_path,
@@ -299,6 +313,30 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command is not None:
+        if args.command == "remote":
+            if args.remote_action != "configure":
+                parser.error("remote requires the configure action")
+            if not args.tunnel_id:
+                parser.error("remote configure requires --tunnel-id")
+            try:
+                runtime_key = getpass.getpass("OpenAI tunnel runtime API key (hidden): ")
+            except (EOFError, KeyboardInterrupt):
+                print("需要在本机隐藏终端输入 runtime key；不要把 key 粘贴到聊天中。")
+                return
+            if not runtime_key:
+                parser.error("runtime key must not be empty")
+            bootstrap = BootstrapService(auto_install=True)
+            result = bootstrap.configure_remote_access(
+                tunnel_id=args.tunnel_id,
+                runtime_key=runtime_key,
+                runtime_secret_ref=args.runtime_secret_ref,
+            )
+            payload = result.advanced_view() if args.advanced else result.user_view()
+            if args.json_output:
+                print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+            else:
+                print("ChatGPT 连接：已保存本机配置，等待 tunnel 启动。")
+            return
         if args.command == "reconcile-app-data":
             if args.confirm and not args.keep:
                 parser.error("reconcile-app-data apply requires --keep canonical or --keep legacy")

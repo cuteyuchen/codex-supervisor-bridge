@@ -33,9 +33,13 @@ class ComponentManifest(BaseModel):
         pattern=r"^[0-9a-f]{40}$",
     )
     checksum_sha256: str | None = None
+    checksum_source: str | None = Field(default=None, pattern=r"^https://")
+    checksum_entry: str | None = None
     archive_kind: Literal["auto", "zip", "tgz"] = "auto"
     archive_root: str | None = None
     entrypoint: str | None = None
+    version_args: list[str] = Field(default_factory=list)
+    version_contains: str | None = None
     install_commands: list[list[str]] = Field(default_factory=list)
     requires_node: bool = False
 
@@ -248,6 +252,20 @@ class ComponentInstaller:
                 digest = hashlib.sha256(payload.read_bytes()).hexdigest()
                 if digest.lower() != manifest.checksum_sha256.lower():
                     raise RuntimeError(f"checksum mismatch for {manifest.name}")
+        if manifest.checksum_source:
+            checksum_path = staging / "SHA256SUMS.txt"
+            checksum_payload = self._downloader(manifest.checksum_source, checksum_path)
+            if isinstance(checksum_payload, bytes):
+                checksum_path.write_bytes(checksum_payload)
+            try:
+                checksum_text = checksum_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise RuntimeError("official checksum manifest could not be read") from exc
+            expected_name = manifest.checksum_entry or Path(manifest.source).name
+            expected_digest = _checksum_from_manifest(checksum_text, expected_name)
+            actual_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+            if expected_digest.lower() != actual_digest.lower():
+                raise RuntimeError(f"official checksum mismatch for {manifest.name}")
         return target
 
     def _extract(
@@ -373,6 +391,25 @@ class ComponentInstaller:
             return False
         if manifest.entrypoint and not (root / manifest.entrypoint).is_file():
             return False
+        if manifest.entrypoint and manifest.version_args:
+            executable = root / manifest.entrypoint
+            try:
+                result = subprocess.run(
+                    [str(executable), *manifest.version_args],
+                    cwd=str(root),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=15.0,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+            if result.returncode != 0:
+                return False
+            if manifest.version_contains:
+                output = f"{result.stdout}\n{result.stderr}"
+                if manifest.version_contains not in output:
+                    return False
         return True
 
     @staticmethod
@@ -420,3 +457,19 @@ class ComponentInstaller:
             raise ValueError(
                 f"component path escapes the managed components root: {resolved}"
             )
+
+
+def _checksum_from_manifest(payload: str, artifact_name: str) -> str:
+    """Read one exact artifact digest from an upstream SHA256SUMS file."""
+
+    normalized = Path(artifact_name).name
+    for line in payload.splitlines():
+        parts = line.strip().split()
+        if len(parts) < 2:
+            continue
+        digest, name = parts[0], parts[-1].lstrip("*")
+        if name == normalized and len(digest) == 64 and all(
+            char in "0123456789abcdefABCDEF" for char in digest
+        ):
+            return digest
+    raise RuntimeError(f"artifact {normalized} is missing from official checksum manifest")

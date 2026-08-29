@@ -23,7 +23,14 @@ from .models import ComponentHealth, DoctorStatus, HealthStatus
 from .paths import AppDataPaths
 from .ports import PortAllocator
 from .process import ProcessManager
-from .remote import SecureRemoteAccessConfig, SecureRemoteAccessValidator
+from .remote import (
+    OpenAISecureMcpTunnelConfig,
+    OpenAISecureMcpTunnelController,
+    RemoteAccessFailure,
+    RemoteAccessMode,
+    SecureRemoteAccessConfig,
+    SecureRemoteAccessValidator,
+)
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -298,6 +305,10 @@ class Doctor:
         )
 
     def _secure_remote(self, config: AppConfig) -> ComponentHealth:
+        if config.advanced.remote_access is not None:
+            remote = config.advanced.remote_access
+            if remote.provider == RemoteAccessMode.OPENAI_SECURE_MCP_TUNNEL:
+                return self._openai_secure_remote(remote)
         detail = config.advanced.tunnel_detail
         remote = SecureRemoteAccessConfig(
             public_url=detail.get("public_url"),
@@ -321,6 +332,98 @@ class Doctor:
             user_message="ChatGPT connection needs one-time setup.",
             recommended_action="connect_chatgpt",
             advanced={"technical_detail": errors, "bind_host": remote.bind_host},
+        )
+
+    def _openai_secure_remote(self, remote: object) -> ComponentHealth:
+        try:
+            config = OpenAISecureMcpTunnelConfig.model_validate(
+                remote.model_dump() if hasattr(remote, "model_dump") else remote
+            )
+        except Exception as exc:  # noqa: BLE001 - safe diagnostic boundary
+            return ComponentHealth(
+                capability="ChatGPT connection",
+                status=HealthStatus.DEGRADED,
+                repairable=False,
+                user_message="ChatGPT connection needs one-time setup.",
+                recommended_action="connect_chatgpt",
+                advanced={
+                    "provider": RemoteAccessMode.OPENAI_SECURE_MCP_TUNNEL.value,
+                    "state": RemoteAccessFailure.TUNNEL_NOT_CONFIGURED.value,
+                    "technical_detail": str(exc),
+                },
+            )
+        component = self._managed_component("openai-tunnel-client")
+        executable = component / "tunnel-client.exe" if component else None
+        runtime_key_present = _secret_reference_present(self.paths, config.runtime_secret_ref)
+        process = self._process_manager.health(
+            OpenAISecureMcpTunnelController.process_name
+        ) if self._process_manager else None
+        controller = OpenAISecureMcpTunnelController(
+            process_manager=self._process_manager,
+            runtime_dir=self.paths.runtime,
+            executable=executable or "tunnel-client",
+            client_version=config.client_version,
+        )
+        tunnel_health = controller.health() if process is not None else None
+        advanced = {
+            "provider": config.provider.value,
+            "tunnel_id": config.tunnel_id,
+            "client_version": config.client_version,
+            "tunnel_client_version": config.client_version,
+            "executable": str(executable) if executable else None,
+            "process_status": process.status if process else "STOPPED",
+            "process_identity": process.process_identity if process else None,
+            "health_url": tunnel_health.health_url if tunnel_health else config.health_url,
+            "health_status": tunnel_health.healthy if tunnel_health else False,
+            "ready_status": tunnel_health.ready if tunnel_health else False,
+            "local_mcp_target": config.local_mcp_url,
+            "runtime_key_present": runtime_key_present,
+        }
+        if component is None:
+            return ComponentHealth(
+                capability="ChatGPT connection",
+                status=HealthStatus.UNAVAILABLE,
+                repairable=True,
+                user_message="ChatGPT connection needs local setup.",
+                recommended_action="repair_environment",
+                advanced={
+                    **advanced,
+                    "state": RemoteAccessFailure.TUNNEL_CLIENT_MISSING.value,
+                },
+            )
+        if not runtime_key_present:
+            return ComponentHealth(
+                capability="ChatGPT connection",
+                status=HealthStatus.DEGRADED,
+                repairable=False,
+                user_message="ChatGPT connection needs one-time setup.",
+                recommended_action="connect_chatgpt",
+                advanced={
+                    **advanced,
+                    "state": RemoteAccessFailure.TUNNEL_RUNTIME_KEY_MISSING.value,
+                },
+            )
+        if tunnel_health and tunnel_health.ready and tunnel_health.healthy:
+            return ComponentHealth(
+                capability="ChatGPT connection",
+                status=HealthStatus.READY,
+                user_message="ChatGPT connection is ready.",
+                advanced={**advanced, "state": RemoteAccessFailure.READY.value},
+            )
+        return ComponentHealth(
+            capability="ChatGPT connection",
+            status=HealthStatus.DEGRADED,
+            repairable=True,
+            user_message="ChatGPT connection is not ready.",
+            recommended_action="start_remote_access",
+            advanced={
+                **advanced,
+                "state": (
+                    tunnel_health.state
+                    if tunnel_health
+                    else RemoteAccessFailure.TUNNEL_NOT_READY.value
+                ),
+            },
         )
 
     def _shell(self) -> ComponentHealth:
@@ -710,3 +813,12 @@ def _int_or_none(value: Any) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _secret_reference_present(paths: AppDataPaths, reference: str) -> bool:
+    """Check DPAPI file presence without decrypting or reading its value."""
+
+    if not reference or not re.fullmatch(r"[A-Za-z0-9_-]+", reference):
+        return False
+    path = paths.config / "secrets" / f"{reference}.dpapi"
+    return path.is_file()

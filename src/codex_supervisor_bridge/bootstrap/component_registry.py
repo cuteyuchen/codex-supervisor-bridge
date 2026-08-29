@@ -1,11 +1,35 @@
 from __future__ import annotations
 
+import platform
 from pathlib import Path
 from typing import Mapping
 
 from .installer import ComponentInstaller, ComponentManifest, InstallPlan
 
 BUILTIN_MANIFESTS: dict[str, ComponentManifest] = {
+    "openai-tunnel-client": ComponentManifest(
+        name="openai-tunnel-client",
+        display_name="OpenAI Secure MCP Tunnel",
+        version="0.0.13",
+        source=(
+            "https://github.com/openai/tunnel-client/releases/download/v0.0.13/"
+            "tunnel-client-v0.0.13-windows-amd64.zip"
+        ),
+        source_ref="v0.0.13",
+        checksum_sha256="17113162b353906bbb884c3ed7620facba5cc72b5fdc94fd54fd7208c7166edb",
+        checksum_source=(
+            "https://github.com/openai/tunnel-client/releases/download/v0.0.13/"
+            "SHA256SUMS.txt"
+        ),
+        checksum_entry="tunnel-client-v0.0.13-windows-amd64.zip",
+        archive_kind="zip",
+        archive_root=None,
+        entrypoint="tunnel-client.exe",
+        version_args=["--version"],
+        version_contains="0.0.13",
+        install_commands=[],
+        requires_node=False,
+    ),
     "nodejs": ComponentManifest(
         name="nodejs",
         display_name="Node.js",
@@ -74,13 +98,29 @@ class ManagedComponentRegistry:
         return sorted(self._manifests)
 
     def manifests(self) -> dict[str, ComponentManifest]:
-        return dict(self._manifests)
+        return {name: self.manifest(name) for name in self._manifests}
 
     def manifest(self, name: str) -> ComponentManifest:
         try:
-            return self._manifests[name]
+            manifest = self._manifests[name]
         except KeyError as exc:
             raise ValueError(f"unknown managed component: {name}") from exc
+        if name != "openai-tunnel-client" or platform.system() != "Windows":
+            return manifest
+        machine = platform.machine().lower()
+        if machine not in {"arm64", "aarch64"}:
+            return manifest
+        artifact = "tunnel-client-v0.0.13-windows-arm64.zip"
+        checksum = "ec7c33cb06fabbbc04aa4803304b647f8542922b8b1489c961b3ebfc283ddcb0"
+        return manifest.model_copy(
+            update={
+                "source": manifest.source.replace(
+                    "tunnel-client-v0.0.13-windows-amd64.zip", artifact
+                ),
+                "checksum_sha256": checksum,
+                "checksum_entry": artifact,
+            }
+        )
 
     def plan(
         self,
@@ -99,7 +139,7 @@ class ManagedComponentRegistry:
         installer = ComponentInstaller(
             components_root,
             max_retries=max_retries,
-            trusted_manifests=self._manifests,
+            trusted_manifests=self.manifests(),
         )
         return self.plan(name, installer)
 
@@ -113,9 +153,10 @@ class ManagedComponentRegistry:
                 "verification strategy"
             )
         if manifest.checksum_sha256:
+            sidecar = " and official SHA256SUMS.txt" if manifest.checksum_source else ""
             return (
                 f"pinned {manifest.version}; SHA256 verified from the official "
-                "distribution before promotion"
+                f"distribution{sidecar} before promotion"
             )
         return (
             f"pinned {manifest.version}; upstream publishes no official SHA256 "

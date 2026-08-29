@@ -10,6 +10,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .paths import AppDataPaths
+from .remote import OpenAISecureMcpTunnelConfig, RemoteAccessConfig, RemoteAccessMode
 
 CONFIG_VERSION = 1
 
@@ -48,6 +49,7 @@ class AdvancedSettings(BaseModel):
     sqlite_path: Path | None = None
     oauth_detail: dict[str, str] = Field(default_factory=dict)
     tunnel_detail: dict[str, str] = Field(default_factory=dict)
+    remote_access: RemoteAccessConfig | None = None
     heartbeat_seconds: int = Field(default=30, ge=1, le=3600)
     startup_timeout_seconds: int = Field(default=15, ge=1, le=300)
     shutdown_timeout_seconds: int = Field(default=10, ge=1, le=300)
@@ -62,6 +64,16 @@ class AdvancedSettings(BaseModel):
                 marker in item.lower() for marker in ("bearer ", "access_token=", "refresh_token=", "password=")
             ):
                 raise ValueError("credentials must be stored through SecretStore")
+        return value
+
+    @field_validator("remote_access", mode="before")
+    @classmethod
+    def parse_remote_access(cls, value: Any) -> Any:
+        if isinstance(value, dict) and value.get("provider") in {
+            RemoteAccessMode.OPENAI_SECURE_MCP_TUNNEL.value,
+            RemoteAccessMode.OPENAI_SECURE_MCP_TUNNEL,
+        } and value.get("tunnel_id") and value.get("runtime_secret_ref"):
+            return OpenAISecureMcpTunnelConfig.model_validate(value)
         return value
 
 

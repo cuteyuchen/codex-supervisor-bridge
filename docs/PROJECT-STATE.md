@@ -691,7 +691,7 @@ This round freezes the product semantics for Codex readiness:
   key, third-party `env_key`, local no-auth, missing env reference, provider
   401, timeout, model unavailable, invalid config, secret redaction, no
   forced login/logout, and ProfileReadiness combining the real Codex runtime
-  result. The code-level suite is 252 tests locally on Python 3.12/3.13.
+  result. The code-level suite is 307 tests locally on Python 3.12/3.13.
 
 ### 2026-08-29 explicit Windows AppData split-brain reconciliation
 

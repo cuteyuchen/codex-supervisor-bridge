@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 from codex_supervisor_bridge.integrations.kandev_models import KandevTaskBinding
@@ -16,6 +18,40 @@ from codex_supervisor_bridge.memory.models import (
 
 class TaskResponse(BaseModel):
     task: TaskMemory
+
+
+class TaskDiscoverySummary(BaseModel):
+    """Bounded provider-neutral task identity for discovery before task-scoped reads."""
+
+    task_id: str
+    title: str
+    repository: str | None = None
+    status: str
+    phase: str
+    revision: int = Field(ge=0)
+    intent_version: int = Field(ge=0)
+    plan_version: int = Field(ge=0)
+    current_state: str | None = None
+    updated_at: datetime
+
+    @classmethod
+    def from_task(cls, task: TaskMemory) -> "TaskDiscoverySummary":
+        return cls(
+            task_id=task.task_id,
+            title=task.title,
+            repository=task.repository,
+            status=task.status,
+            phase=task.phase.value,
+            revision=task.revision,
+            intent_version=task.intent_version,
+            plan_version=task.plan_version,
+            current_state=task.current_state,
+            updated_at=task.updated_at,
+        )
+
+
+class TaskListResponse(BaseModel):
+    tasks: list[TaskDiscoverySummary]
 
 
 class ContextPackResponse(BaseModel):

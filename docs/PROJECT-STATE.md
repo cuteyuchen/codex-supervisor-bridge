@@ -823,6 +823,15 @@ At verification time the local evidence was:
   displayed, serialized, or sent through the chat;
 - Supervisor, DevSpace, and Local-Codex-Bridge remained loopback-only.
 
+The tunnel-client log also records an `openai-mcp-discover` request followed by
+forwarded MCP commands, and the Supervisor log records the corresponding
+loopback `/mcp` requests. The canonical Profile B task memory remains durable
+through this access check: task `P66-GATE-E5062DF-A` is at revision 28 with
+`writer_epoch=3`, and its persisted event history includes plan creation and
+approval, Codex handoff, active-turn steer, checkpoint creation, interrupt, and
+handback. These are evidence of transport and memory continuity; they are not
+treated as proof that every remote acceptance step has passed.
+
 The full remote Profile B acceptance sequence is intentionally still open.
 Direct semantic write, Plan Gate approval, Codex execution, soft steer,
 interrupt, hard replan, handback, fresh-conversation Context Pack resume,

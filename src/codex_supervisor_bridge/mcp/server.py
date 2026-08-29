@@ -11,7 +11,13 @@ from mcp.server import MCPServer
 
 from codex_supervisor_bridge import __version__
 from codex_supervisor_bridge.backends.models import BackendHealth, BackendHealthStatus
-from codex_supervisor_bridge.bootstrap import BootstrapService, CommandPolicy, DevelopmentStyle
+from codex_supervisor_bridge.bootstrap import (
+    BootstrapService,
+    CommandPolicy,
+    DevelopmentStyle,
+    ReconciliationError,
+    ReconciliationService,
+)
 from codex_supervisor_bridge.bootstrap.configuration import ConfigStore
 from codex_supervisor_bridge.bootstrap.devspace_auth import DevSpaceLocalOAuthDriver
 from codex_supervisor_bridge.bootstrap.doctor import DoctorOptions
@@ -167,11 +173,40 @@ def build_parser(settings: Settings | None = None) -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("configure", "doctor", "start", "status", "repair"),
+        choices=(
+            "configure",
+            "doctor",
+            "start",
+            "status",
+            "repair",
+            "reconcile-app-data",
+        ),
         help="Bootstrap command; omit to run the MCP server",
     )
     parser.add_argument("--json", action="store_true", dest="json_output", help="Render structured output")
     parser.add_argument("--advanced", action="store_true", help="Include technical diagnostics")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Create a reconciliation plan without applying it",
+    )
+    parser.add_argument(
+        "--keep",
+        choices=("canonical", "legacy"),
+        default=None,
+        help="Explicitly select the authoritative application-data root",
+    )
+    parser.add_argument(
+        "--legacy-root",
+        type=Path,
+        default=None,
+        help="Explicit non-authoritative application-data root for reconciliation",
+    )
+    parser.add_argument(
+        "--confirm",
+        default=None,
+        help="Apply only the exact reconciliation plan identified by this plan id",
+    )
     parser.add_argument("--project", type=Path, default=None, help="Project directory for bootstrap commands")
     parser.add_argument(
         "--style",
@@ -264,6 +299,64 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command is not None:
+        if args.command == "reconcile-app-data":
+            if args.confirm and not args.keep:
+                parser.error("reconcile-app-data apply requires --keep canonical or --keep legacy")
+            if args.confirm and args.dry_run:
+                parser.error("--dry-run cannot be combined with --confirm")
+            paths = AppDataPaths.from_environment()
+            reconciler = ReconciliationService(paths=paths)
+            try:
+                if args.confirm:
+                    result = reconciler.apply(
+                        plan_id=args.confirm,
+                        selected_authority=args.keep,
+                        legacy_root=args.legacy_root,
+                    )
+                    payload = result.advanced_view() if args.advanced else result.user_view()
+                    if args.json_output:
+                        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+                    else:
+                        print(result.message)
+                        print(f"status={result.status}")
+                        if result.backup_location:
+                            print(f"backup={result.backup_location}")
+                    return
+                plan = reconciler.plan(
+                    selected_authority=args.keep or "canonical",
+                    legacy_root=args.legacy_root,
+                )
+            except ReconciliationError as exc:
+                if args.json_output:
+                    print(
+                        json.dumps(
+                            {
+                                "status": "PLAN_BLOCKED",
+                                "message": str(exc),
+                                "blocking_reasons": ["RECONCILIATION_PLAN_UNAVAILABLE"],
+                            },
+                            ensure_ascii=True,
+                            indent=2,
+                            sort_keys=True,
+                        )
+                    )
+                else:
+                    print(str(exc))
+                return
+            payload = plan.advanced_view() if args.advanced else plan.user_view()
+            if args.json_output:
+                print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+            else:
+                print(
+                    "Reconciliation plan "
+                    f"{plan.plan_id}: authority={plan.selected_authority} "
+                    f"safe_to_apply={plan.safe_to_apply}"
+                )
+                for action in plan.actions:
+                    print(f"action={action}")
+                for reason in plan.blocking_reasons:
+                    print(f"blocked={reason}")
+            return
         bootstrap = BootstrapService(auto_install=True)
         if args.command in {"doctor", "status"}:
             result = bootstrap.status(project_directory=args.project)
@@ -349,7 +442,7 @@ def main(argv: list[str] | None = None) -> None:
         composition = RuntimeComposition.profile_b(
             service,
             launch_command=launch_command,
-            env=lcb_environment(app_data_root=app_paths.root),
+            env=lcb_environment(app_data_root=app_paths.filesystem_root),
             workspace_factory=authenticated_devspace_factory,
         )
     elif selection.binding_forced and selection.profile == "lightweight":

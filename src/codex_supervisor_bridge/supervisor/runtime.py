@@ -289,6 +289,6 @@ def lcb_environment(
     if app_data_root is None:
         from codex_supervisor_bridge.bootstrap.paths import AppDataPaths
 
-        app_data_root = AppDataPaths.from_environment().root
+        app_data_root = AppDataPaths.from_environment().filesystem_root
     environment["CODEX_SUPERVISOR_DATA_DIR"] = str(Path(app_data_root))
     return environment

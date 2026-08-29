@@ -16,6 +16,7 @@ from mcp.client.auth.oauth2 import OAuthClientInformationFull, OAuthClientProvid
 from mcp.shared.auth import OAuthToken
 from pydantic import ValidationError
 
+import codex_supervisor_bridge.bootstrap.paths as paths_module
 from codex_supervisor_bridge.bootstrap import (
     AppConfig,
     AppDataMigrationError,
@@ -185,6 +186,105 @@ def test_windows_packaged_root_discovery_does_not_stop_at_first_128_packages(
     )
 
     assert target in paths.legacy_roots
+
+
+def test_packaged_inactive_alias_reuses_canonical_physical_root_with_backup_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = tmp_path / "User" / "AppData" / "Local"
+    canonical = base / "CodexSupervisorBridge"
+    inactive_alias = (
+        base
+        / "Packages"
+        / "PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0"
+        / "LocalCache"
+        / "Local"
+        / "CodexSupervisorBridge"
+    )
+    active_alias = (
+        base
+        / "Packages"
+        / "OpenAI.Codex_2p2nqsd0c76g0"
+        / "LocalCache"
+        / "Local"
+        / "CodexSupervisorBridge"
+    )
+    inactive_alias.mkdir(parents=True)
+    active_alias.mkdir(parents=True)
+    (active_alias / "config").mkdir()
+    (active_alias / "config" / "settings.json").write_text(
+        json.dumps({"config_version": 1}), encoding="utf-8"
+    )
+    backup_id = "20260829T000000000000Z-plan"
+    (active_alias / ".reconciliation-backups" / backup_id / "legacy").mkdir(
+        parents=True
+    )
+    (inactive_alias / paths_module.LEGACY_INACTIVE_MARKER).write_text(
+        json.dumps(
+            {
+                "authority": "canonical",
+                "backup_location": str(
+                    canonical / ".reconciliation-backups" / backup_id / "legacy"
+                ),
+                "canonical_root": str(canonical),
+                "reason": "explicit_split_brain_reconciliation",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def same_physical(left: Path, right: Path) -> bool:
+        pair = {_path_key_for_test(left), _path_key_for_test(right)}
+        return pair == {
+            _path_key_for_test(canonical),
+            _path_key_for_test(inactive_alias),
+        }
+
+    monkeypatch.setattr(paths_module, "_same_physical_path", same_physical)
+    physical, legacy, aliases = paths_module._converge_packaged_root(
+        canonical_root=canonical,
+        legacy_roots=(active_alias,),
+        alias_roots=(inactive_alias,),
+    )
+
+    assert physical == active_alias
+    assert inactive_alias in legacy
+    assert active_alias not in legacy
+    assert active_alias in aliases
+
+
+def test_packaged_alias_without_reconciliation_evidence_stays_legacy(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "User" / "AppData" / "Local"
+    canonical = base / "CodexSupervisorBridge"
+    inactive_alias = (
+        base / "Packages" / "Python.Package" / "LocalCache" / "Local" / "CodexSupervisorBridge"
+    )
+    active_alias = (
+        base / "Packages" / "Other.Package" / "LocalCache" / "Local" / "CodexSupervisorBridge"
+    )
+    inactive_alias.mkdir(parents=True)
+    active_alias.mkdir(parents=True)
+    (active_alias / "config").mkdir()
+    (active_alias / "config" / "settings.json").write_text(
+        json.dumps({"config_version": 1}), encoding="utf-8"
+    )
+
+    physical, legacy, aliases = paths_module._converge_packaged_root(
+        canonical_root=canonical,
+        legacy_roots=(active_alias,),
+        alias_roots=(inactive_alias,),
+    )
+
+    assert physical == canonical
+    assert legacy == (active_alias,)
+    assert aliases == (inactive_alias,)
+
+
+def _path_key_for_test(path: Path) -> str:
+    return str(path).replace("/", "\\").casefold().rstrip("\\")
 
 
 def _test_app_data_paths(

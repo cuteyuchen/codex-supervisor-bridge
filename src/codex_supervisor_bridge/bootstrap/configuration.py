@@ -127,9 +127,8 @@ class ConfigStore:
                 advanced.sqlite_path = normalized
                 changed = True
         for key, value in list(advanced.executable_paths.items()):
-            relative = self.paths.alias_relative_path(value)
-            if relative is not None:
-                normalized = self.paths.root / relative
+            normalized = self.paths.canonicalize_path(value)
+            if normalized != Path(value):
                 advanced.executable_paths[key] = str(normalized)
                 changed = True
         return changed

@@ -5,7 +5,7 @@ import os
 import platform
 import shutil
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping
@@ -126,6 +126,10 @@ class AppDataPaths:
     legacy_roots: tuple[Path, ...] = ()
     alias_roots: tuple[Path, ...] = ()
     resolution_source: str = "unknown"
+    # ``root`` is the stable canonical path. Packaged processes can require a
+    # physical package alias for file I/O because Windows redirects the
+    # canonical path into the current package's LocalCache view.
+    physical_root: Path | None = None
 
     @classmethod
     def from_environment(
@@ -144,6 +148,7 @@ class AppDataPaths:
             source = "explicit_override"
             legacy_roots: tuple[Path, ...] = ()
             alias_roots: tuple[Path, ...] = ()
+            physical_root = root
         elif system_name == "Windows":
             local_app_data, source = resolve_windows_local_app_data(
                 environ=env,
@@ -156,33 +161,50 @@ class AppDataPaths:
                 canonical_root=root,
                 environ=env,
             )
+            physical_root, legacy_roots, alias_roots = _converge_packaged_root(
+                canonical_root=root,
+                legacy_roots=legacy_roots,
+                alias_roots=alias_roots,
+            )
+            if not _same_path(physical_root, root):
+                source = f"{source}_packaged_alias"
         elif env.get("XDG_DATA_HOME", "").strip():
             root = Path(env["XDG_DATA_HOME"]) / "codex-supervisor-bridge"
             source = "xdg_data_home"
             legacy_roots = ()
             alias_roots = ()
+            physical_root = root
         else:
             root = (home or Path.home()) / ".local" / "share" / "codex-supervisor-bridge"
             source = "portable_home"
             legacy_roots = ()
             alias_roots = ()
+            physical_root = root
         return cls(
             root=root,
-            data=root / "data",
-            logs=root / "logs",
-            runtime=root / "runtime",
-            config=root / "config",
-            cache=root / "cache",
-            components=root / "components",
+            data=physical_root / "data",
+            logs=physical_root / "logs",
+            runtime=physical_root / "runtime",
+            config=physical_root / "config",
+            cache=physical_root / "cache",
+            components=physical_root / "components",
             legacy_roots=legacy_roots,
             alias_roots=alias_roots,
             resolution_source=source,
+            physical_root=physical_root,
         )
+
+    @property
+    def filesystem_root(self) -> Path:
+        """Return the root that should be used for local file I/O."""
+
+        return self.physical_root or self.root
 
     @property
     def root_report(self) -> AppDataRootReport:
         return inspect_app_data_roots(
             self.root,
+            canonical_storage_root=self.filesystem_root,
             legacy_roots=self.legacy_roots,
             alias_roots=self.alias_roots,
             resolution_source=self.resolution_source,
@@ -194,9 +216,15 @@ class AppDataPaths:
         candidate = Path(value).expanduser()
         if not candidate.is_absolute():
             return candidate
+        try:
+            relative_to_canonical = candidate.relative_to(self.root)
+        except ValueError:
+            relative_to_canonical = None
+        if relative_to_canonical is not None:
+            return self.filesystem_root / relative_to_canonical
         relative = self.alias_relative_path(candidate)
         if relative is not None:
-            return self.root / relative
+            return self.filesystem_root / relative
         return candidate
 
     def alias_relative_path(self, value: str | Path) -> Path | None:
@@ -228,7 +256,7 @@ class AppDataPaths:
 
     def ensure_directories(self) -> None:
         for path in (
-            self.root,
+            self.filesystem_root,
             self.data,
             self.logs,
             self.runtime,
@@ -272,19 +300,24 @@ def resolve_windows_local_app_data(
 def inspect_app_data_roots(
     canonical_root: str | Path,
     *,
+    canonical_storage_root: str | Path | None = None,
     legacy_roots: tuple[Path, ...] = (),
     alias_roots: tuple[Path, ...] = (),
     resolution_source: str = "unknown",
 ) -> AppDataRootReport:
     canonical = Path(canonical_root)
+    storage = Path(canonical_storage_root) if canonical_storage_root is not None else canonical
     states = tuple(
         _inspect_root(root)
         for root in legacy_roots
         if not _same_path(canonical, root)
     )
+    canonical_state = _inspect_root(storage)
+    if not _same_path(canonical, storage):
+        canonical_state = replace(canonical_state, root=canonical)
     return AppDataRootReport(
         canonical_root=canonical,
-        canonical_state=_inspect_root(canonical),
+        canonical_state=canonical_state,
         legacy_roots=states,
         alias_roots=tuple(alias_roots),
         resolution_source=resolution_source,
@@ -305,7 +338,7 @@ def migrate_legacy_app_data(paths: AppDataPaths) -> AppDataRootReport:
     if _legacy_runtime_is_live(legacy.root):
         raise AppDataMigrationError("legacy runtime contains live process state")
 
-    backup = paths.root / ".migration-backups" / (
+    backup = paths.filesystem_root / ".migration-backups" / (
         datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
     )
     backup.mkdir(parents=True, exist_ok=False)
@@ -317,7 +350,7 @@ def migrate_legacy_app_data(paths: AppDataPaths) -> AppDataRootReport:
             if not _has_content(source):
                 continue
             _copy_tree_or_file(source, backup / relative)
-            target = paths.root / relative
+            target = paths.filesystem_root / relative
             if _has_content(target):
                 raise AppDataMigrationError(
                     f"canonical state appeared during migration: {relative}"
@@ -326,13 +359,14 @@ def migrate_legacy_app_data(paths: AppDataPaths) -> AppDataRootReport:
             copied.append(target)
         migrated = inspect_app_data_roots(
             paths.root,
+            canonical_storage_root=paths.filesystem_root,
             legacy_roots=paths.legacy_roots,
             alias_roots=paths.alias_roots,
             resolution_source=paths.resolution_source,
         )
         if not migrated.canonical_state.has_persistent_state:
             raise AppDataMigrationError("canonical state validation failed after migration")
-        _validate_migrated_state(paths.root, migrated.canonical_state.persistent_categories)
+        _validate_migrated_state(paths.filesystem_root, migrated.canonical_state.persistent_categories)
         _write_legacy_inactive_marker(legacy.root, paths.root, backup)
     except Exception:
         for target in reversed(copied):
@@ -343,6 +377,7 @@ def migrate_legacy_app_data(paths: AppDataPaths) -> AppDataRootReport:
         raise
     return inspect_app_data_roots(
         paths.root,
+        canonical_storage_root=paths.filesystem_root,
         legacy_roots=paths.legacy_roots,
         alias_roots=paths.alias_roots,
         resolution_source=paths.resolution_source,
@@ -421,6 +456,99 @@ def _discover_windows_legacy_roots(
         elif _inspect_root(candidate).has_state:
             legacy.append(candidate)
     return tuple(legacy), tuple(aliases)
+
+
+def _converge_packaged_root(
+    *,
+    canonical_root: Path,
+    legacy_roots: tuple[Path, ...],
+    alias_roots: tuple[Path, ...],
+) -> tuple[Path, tuple[Path, ...], tuple[Path, ...]]:
+    """Recover the physical canonical alias after package virtualization.
+
+    A packaged Python process can see the stable canonical path as its own
+    package-local directory.  We only redirect file I/O when that view is
+    already marked inactive by an explicit canonical reconciliation, the
+    marker's backup evidence is present in exactly one other package root, and
+    no ambiguous second active root exists.  This is path-view convergence,
+    not authority selection for a live split brain.
+    """
+
+    current_aliases = [
+        alias
+        for alias in alias_roots
+        if _same_physical_path(canonical_root, alias)
+    ]
+    if len(current_aliases) != 1:
+        return canonical_root, legacy_roots, alias_roots
+    current_alias = current_aliases[0]
+    marker = _read_canonical_inactive_marker(current_alias, canonical_root)
+    if marker is None:
+        return canonical_root, legacy_roots, alias_roots
+
+    active = [
+        root
+        for root in legacy_roots
+        if not _inspect_root(root).inactive
+        and _inspect_root(root).has_persistent_state
+        and _is_packaged_bridge_root(root)
+    ]
+    if len(active) != 1 or not _backup_evidence_matches(active[0], marker):
+        return canonical_root, legacy_roots, alias_roots
+
+    selected = active[0]
+    remaining_legacy = tuple(
+        root for root in legacy_roots if not _same_path(root, selected)
+    )
+    if not any(_same_path(root, current_alias) for root in remaining_legacy):
+        remaining_legacy = (*remaining_legacy, current_alias)
+    aliases = list(alias_roots)
+    if not any(_same_path(root, selected) for root in aliases):
+        aliases.append(selected)
+    return selected, remaining_legacy, tuple(aliases)
+
+
+def _is_packaged_bridge_root(root: Path) -> bool:
+    return _is_packaged_local_app_data(str(root))
+
+
+def _read_canonical_inactive_marker(
+    root: Path,
+    canonical_root: Path,
+) -> dict[str, object] | None:
+    marker_path = root / LEGACY_INACTIVE_MARKER
+    try:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("authority") != "canonical":
+        return None
+    if payload.get("reason") != "explicit_split_brain_reconciliation":
+        return None
+    marker_canonical = payload.get("canonical_root")
+    if not isinstance(marker_canonical, str):
+        return None
+    if _path_key(Path(marker_canonical)) != _path_key(canonical_root):
+        return None
+    if not isinstance(payload.get("backup_location"), str):
+        return None
+    return payload
+
+
+def _backup_evidence_matches(
+    candidate: Path,
+    marker: Mapping[str, object],
+) -> bool:
+    backup_location = marker.get("backup_location")
+    if not isinstance(backup_location, str):
+        return False
+    backup_name = Path(backup_location).parent.name
+    if not backup_name:
+        return False
+    evidence = candidate / ".reconciliation-backups" / backup_name / "legacy"
+    return evidence.is_dir()
 
 
 def _same_path(left: Path, right: Path) -> bool:

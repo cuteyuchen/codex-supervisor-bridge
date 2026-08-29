@@ -595,17 +595,24 @@ overwrite, or delete either root. Only an unambiguous legacy-only state can use
 the backup, copy, validate, atomic-promote migration path, after which the
 legacy root is retained and marked inactive.
 
-The current machine inspection found the canonical root at
+The current machine inspection initially found the canonical root at
 `%USERPROFILE%\\AppData\\Local\\CodexSupervisorBridge`, a Codex packaged path
 that is the same physical root (alias), and a separate Python packaged root
-with its own `settings.json` and DPAPI SecretStore but no database. Because the
-separate root is persistent state, the local Gate is currently blocked on
-explicit split-brain reconciliation; no automatic data selection is allowed.
-P6.6 remains active and is not complete. After reconciliation, the next real
-Gate is only: Supervisor HTTPS -> ChatGPT Web Remote MCP -> ChatGPT/Supervisor
-Profile B end-to-end flow plus the corresponding remote Profile A/B comparison.
-The resulting local suite is 282 tests on Windows Python 3.12; Ruff, compileall,
-and `git diff --check` are green.
+with its own `settings.json` and DPAPI SecretStore but no database. The
+explicit two-phase reconciliation gate was then executed with **canonical** as
+the user-selected authority. The Python packaged root was copied to a
+timestamped backup, validated, and marked inactive; it was not deleted and no
+settings, database, or secrets were merged. The root report is now `CLEAN`,
+and the inactive root remains discoverable for diagnostics. The AppData portion
+of the Windows local Gate is therefore passed. Overall Doctor/Repair/Start/Status
+can still report `DEGRADED` when the machine contains an unrelated unknown live
+PID; that condition is kept fail-closed and was not force-killed.
+
+P6.6 remains active and is not complete. The next real Gate is only:
+Supervisor HTTPS -> ChatGPT Web Remote MCP -> ChatGPT/Supervisor Profile B
+end-to-end flow plus the corresponding remote Profile A/B comparison. The
+resulting local suite is 295 tests on Windows Python 3.12/3.13; Ruff,
+compileall, and `git diff --check` are green.
 
 ### 2026-08-28 runtime affinity / redirect safety round
 
@@ -685,6 +692,57 @@ This round freezes the product semantics for Codex readiness:
   401, timeout, model unavailable, invalid config, secret redaction, no
   forced login/logout, and ProfileReadiness combining the real Codex runtime
   result. The code-level suite is 252 tests locally on Python 3.12/3.13.
+
+### 2026-08-29 explicit Windows AppData split-brain reconciliation
+
+The final P6.6 local blocker was exercised on the real Windows machine with
+the new two-phase `codex-supervisor reconcile-app-data` command. The logical
+canonical root and its physical storage root are both
+`C:\\Users\\Windows\\AppData\\Local\\CodexSupervisorBridge`; the Codex
+packaged path is a physical alias, not a second state root. The independent
+Python 3.13 packaged root was selected explicitly as the non-authoritative
+root:
+`C:\\Users\\Windows\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\LocalCache\\Local\\CodexSupervisorBridge`.
+
+The dry-run plan selected `canonical`, bound the plan id to both root
+fingerprints, and reported:
+
+- canonical state: `database`, `settings`, `secrets`, `runtime`,
+  `components`, `logs`, `cache`;
+- legacy state: `settings`, `secrets`, `components`, `cache`;
+- persistent state: canonical `database`, `settings`, `secrets`, `runtime`,
+  legacy `settings`, `secrets`;
+- settings relation: `DIFFERENT`, using `AppConfig`/`ConfigStore` semantic
+  parsing rather than text comparison;
+- secret relation: `DIFFERENT`; canonical had 3 names, legacy had 1, with
+  one same name and two canonical-only names. Secret values were never read,
+  compared, logged, or serialized;
+- database relation: `CANONICAL_ONLY`; canonical schema 8 had one task and no
+  unresolved/prepared/running mutation, while the legacy database was absent;
+- runtime relation: `CANONICAL_ONLY`; the legacy root had no live runtime.
+
+The confirmed apply copied and validated the complete legacy root before
+writing the inactive marker. Backup evidence is at
+`C:\\Users\\Windows\\AppData\\Local\\CodexSupervisorBridge\\.reconciliation-backups\\20260829T095459795376Z-a2f605bdf329\\legacy`.
+The marker is
+`C:\\Users\\Windows\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\LocalCache\\Local\\CodexSupervisorBridge\\.codex-supervisor-legacy-inactive.json`.
+The original root remains discoverable and untouched; a second reconciliation
+is idempotent and reports `ALREADY_RECONCILED`. The post-apply root report is
+`CLEAN`, and both ordinary PowerShell and the packaged Python 3.12/3.13
+startup paths resolve `AppDataPaths.root` to the canonical root without
+reactivating the inactive Python root.
+
+The local Profile B regression (read -> plan -> approve -> handoff -> execute
+-> checkpoint -> handback -> restart -> resume/status) completed against the
+same canonical database, settings, SecretStore, backend binding, and writer
+epoch. Codex readiness reached `SUCCESS`/`READY` during the real smoke; a later
+third-party provider timeout and an unrelated unknown `cmd /c claude-code-mcp`
+PID are recorded as external runtime availability, so overall diagnostics may
+be `DEGRADED` while Application data remains `READY`. No `taskkill` or
+destructive root cleanup was used.
+
+The Windows local AppData Gate is **PASSED**. The next phase is the separately
+scoped Supervisor HTTPS / ChatGPT Web Remote MCP Gate; P7 remains unopened.
 
 ### Revised next phases
 

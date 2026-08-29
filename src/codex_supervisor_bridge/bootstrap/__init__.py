@@ -81,6 +81,12 @@ from .paths import (
 )
 from .ports import PortAllocator, PortLease
 from .process import ManagedProcessSpec, ProcessManager, ProcessState
+from .reconciliation import (
+    ReconciliationError,
+    ReconciliationPlan,
+    ReconciliationResult,
+    ReconciliationService,
+)
 from .recovery import RecoveryDecision, RecoveryStatus, RuntimeRecovery
 from .remote import (
     SecureRemoteAccess,
@@ -156,6 +162,10 @@ __all__ = [
     "RecoveryDecision",
     "RecoveryStatus",
     "RuntimeRecovery",
+    "ReconciliationError",
+    "ReconciliationPlan",
+    "ReconciliationResult",
+    "ReconciliationService",
     "SecretStore",
     "SecureRemoteAccess",
     "SecureRemoteAccessConfig",

@@ -107,6 +107,38 @@ class BootstrapService:
         after.repairs = repairs
         return after
 
+    def reconcile_app_data_plan(
+        self,
+        *,
+        selected_authority: str = "canonical",
+        legacy_root: Path | None = None,
+    ):
+        """Create an explicit two-phase AppData reconciliation plan."""
+
+        from .reconciliation import ReconciliationService
+
+        return ReconciliationService(paths=self.paths).plan(
+            selected_authority=selected_authority,
+            legacy_root=legacy_root,
+        )
+
+    def reconcile_app_data_apply(
+        self,
+        *,
+        plan_id: str,
+        selected_authority: str | None = None,
+        legacy_root: Path | None = None,
+    ):
+        """Apply a previously confirmed AppData reconciliation plan."""
+
+        from .reconciliation import ReconciliationService
+
+        return ReconciliationService(paths=self.paths).apply(
+            plan_id=plan_id,
+            selected_authority=selected_authority,
+            legacy_root=legacy_root,
+        )
+
     def start(self, *, project_directory: Path | None = None) -> BootstrapStatus:
         result = self.repair_and_status(project_directory=project_directory)
         config = self.config_store.load().config
@@ -216,7 +248,7 @@ class BootstrapService:
             shutdown_timeout=config.advanced.shutdown_timeout_seconds,
             env={
                 **os.environ,
-                "CODEX_SUPERVISOR_DATA_DIR": str(self.paths.root),
+                "CODEX_SUPERVISOR_DATA_DIR": str(self.paths.filesystem_root),
             },
             readiness_probe=lambda: _read_readiness_marker(
                 supervisor_log,

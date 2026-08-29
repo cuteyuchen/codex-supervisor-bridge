@@ -798,6 +798,44 @@ binary is installed. OpenAI Platform tunnel/runtime-key creation and ChatGPT
 Workspace Developer Mode / Custom MCP App actions remain explicit human gates;
 P6.6 remains ACTIVE until the remote Profile B live scenario completes.
 
+### 2026-08-29 first live ChatGPT Secure MCP Tunnel verification
+
+The first live remote access check has now completed on the Windows machine.
+From a new ChatGPT conversation (`Codex插件控制测试`), the Custom MCP App was
+able to reach the local Codex runtime through the configured OpenAI Secure MCP
+Tunnel. This confirms the intended transport path is live:
+
+```text
+ChatGPT Web -> Custom MCP App -> OpenAI Secure MCP Tunnel
+  -> tunnel-client 0.0.13 -> http://127.0.0.1:8767/mcp
+  -> Supervisor Bridge -> Local-Codex-Bridge -> Codex
+```
+
+At verification time the local evidence was:
+
+- tunnel id: `tunnel_6a92f2b222788191b5619aebcce4cd5f`;
+- tunnel-client process identity: managed `0.0.13` child, PID `30572`;
+- local Supervisor MCP: `http://127.0.0.1:8767/mcp`;
+- loopback health listener: `http://127.0.0.1:52411`;
+- `/healthz`: HTTP 200;
+- `/readyz`: HTTP 200;
+- runtime key: present in Windows DPAPI SecretStore only; no value was
+  displayed, serialized, or sent through the chat;
+- Supervisor, DevSpace, and Local-Codex-Bridge remained loopback-only.
+
+The full remote Profile B acceptance sequence is intentionally still open.
+Direct semantic write, Plan Gate approval, Codex execution, soft steer,
+interrupt, hard replan, handback, fresh-conversation Context Pack resume,
+tunnel-only restart, Supervisor restart, and network-recovery evidence have not
+yet been recorded as a complete end-to-end set. Therefore P6.6 remains ACTIVE
+and PR #9 remains Draft; do not enter P7 or merge the PR based on this first
+access check alone.
+
+The local verification rerun on 2026-08-29 passed the complete test suite,
+Ruff, `python -m compileall src`, and `git diff --check`. Pytest emitted only
+Windows ACL warnings while writing `.pytest_cache` and its temporary cleanup
+directory; no test failed.
+
 ### Revised next phases
 
 #### P6.5 — Execution Modes + Backend Abstraction (code complete; PR #8)

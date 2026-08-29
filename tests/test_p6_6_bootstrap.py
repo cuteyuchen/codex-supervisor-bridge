@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -17,6 +18,7 @@ from pydantic import ValidationError
 
 from codex_supervisor_bridge.bootstrap import (
     AppConfig,
+    AppDataMigrationError,
     AppDataPaths,
     AuthorizationStatus,
     CodexReadinessDetector,
@@ -39,6 +41,7 @@ from codex_supervisor_bridge.bootstrap import (
     HealthStatus,
     LocalCodexBridgeBootstrap,
     LocalCodexBridgeBootstrapConfig,
+    ManagedComponentRegistry,
     ManagedProcessSpec,
     MemorySecretStore,
     PortAllocator,
@@ -46,13 +49,16 @@ from codex_supervisor_bridge.bootstrap import (
     ProcessState,
     ProfileABHarness,
     ProfileScenarioRunner,
+    RepairService,
     ScenarioObservation,
     SecretTokenStorage,
     SecureRemoteAccessConfig,
     SecureRemoteAccessController,
     SecureRemoteAccessValidator,
     authorize_command,
+    migrate_legacy_app_data,
     redact_oauth_payload,
+    resolve_windows_local_app_data,
 )
 from codex_supervisor_bridge.bootstrap.service import (
     _find_executable,
@@ -93,6 +99,422 @@ def test_windows_paths_follow_local_app_data(tmp_path: Path) -> None:
     assert str(paths.root).replace("/", "\\").endswith(r"AppData\Local\CodexSupervisorBridge")
     assert paths.database == paths.data / "supervisor.db"
     assert paths.settings == paths.config / "settings.json"
+
+
+def test_windows_packaged_local_app_data_converges_on_user_profile_root(
+    tmp_path: Path,
+) -> None:
+    profile = tmp_path / "User With Space"
+    normal_local = profile / "AppData" / "Local"
+    packaged_local = normal_local / "Packages" / "Some.Package" / "LocalCache" / "Local"
+    normal = AppDataPaths.from_environment(
+        environ={
+            "LOCALAPPDATA": str(normal_local),
+            "USERPROFILE": str(profile),
+        },
+        system="Windows",
+        known_folder_resolver=lambda: None,
+    )
+    packaged = AppDataPaths.from_environment(
+        environ={
+            "LOCALAPPDATA": str(packaged_local),
+            "USERPROFILE": str(profile),
+        },
+        system="Windows",
+        known_folder_resolver=lambda: None,
+    )
+
+    assert normal.root == packaged.root == normal_local / "CodexSupervisorBridge"
+    assert normal.resolution_source == packaged.resolution_source == "userprofile_fallback"
+    assert resolve_windows_local_app_data(
+        environ={"LOCALAPPDATA": str(normal_local)},
+        known_folder_resolver=lambda: None,
+    )[1] == "localappdata_fallback"
+
+
+def test_windows_explicit_data_root_override_wins_over_packaged_environment(
+    tmp_path: Path,
+) -> None:
+    override = tmp_path / "Bridge Data With Space"
+    packaged_local = (
+        tmp_path
+        / "User"
+        / "AppData"
+        / "Local"
+        / "Packages"
+        / "Some.Package"
+        / "LocalCache"
+        / "Local"
+    )
+    paths = AppDataPaths.from_environment(
+        environ={
+            "CODEX_SUPERVISOR_DATA_DIR": str(override),
+            "LOCALAPPDATA": str(packaged_local),
+            "USERPROFILE": str(tmp_path / "User"),
+        },
+        system="Windows",
+        known_folder_resolver=lambda: tmp_path / "ignored-known-folder",
+    )
+
+    assert paths.root == override
+    assert paths.resolution_source == "explicit_override"
+    assert paths.legacy_roots == ()
+    assert paths.alias_roots == ()
+
+
+def test_windows_packaged_root_discovery_does_not_stop_at_first_128_packages(
+    tmp_path: Path,
+) -> None:
+    profile = tmp_path / "User"
+    packages = profile / "AppData" / "Local" / "Packages"
+    for index in range(130):
+        (packages / f"Package{index:03d}" / "LocalCache" / "Local").mkdir(parents=True)
+    target = packages / "Target.Package" / "LocalCache" / "Local" / "CodexSupervisorBridge"
+    (target / "components" / "local-codex-bridge").mkdir(parents=True)
+    (target / "components" / "local-codex-bridge" / "marker.txt").write_text(
+        "component", encoding="utf-8"
+    )
+
+    paths = AppDataPaths.from_environment(
+        environ={
+            "LOCALAPPDATA": str(profile / "AppData" / "Local"),
+            "USERPROFILE": str(profile),
+        },
+        system="Windows",
+        known_folder_resolver=lambda: None,
+    )
+
+    assert target in paths.legacy_roots
+
+
+def _test_app_data_paths(
+    root: Path,
+    *legacy_roots: Path,
+    alias_roots: tuple[Path, ...] = (),
+) -> AppDataPaths:
+    return AppDataPaths(
+        root=root,
+        data=root / "data",
+        logs=root / "logs",
+        runtime=root / "runtime",
+        config=root / "config",
+        cache=root / "cache",
+        components=root / "components",
+        legacy_roots=tuple(legacy_roots),
+        alias_roots=alias_roots,
+        resolution_source="test",
+    )
+
+
+def test_only_legacy_persistent_state_migrates_with_backup_and_inactive_marker(
+    tmp_path: Path,
+) -> None:
+    canonical = tmp_path / "Canonical Bridge Data"
+    legacy = tmp_path / "Legacy Bridge Data"
+    paths = _test_app_data_paths(canonical, legacy)
+    (legacy / "data").mkdir(parents=True)
+    with sqlite3.connect(legacy / "data" / "supervisor.db") as connection:
+        connection.execute("CREATE TABLE marker (value TEXT)")
+        connection.commit()
+    (legacy / "config").mkdir(parents=True)
+    (legacy / "config" / "settings.json").write_text(
+        json.dumps({"config_version": 1}), encoding="utf-8"
+    )
+    (legacy / "config" / "secrets").mkdir()
+    (legacy / "config" / "secrets" / "opaque.dpapi").write_bytes(b"opaque-test-data")
+    (legacy / "runtime").mkdir()
+    (legacy / "runtime" / "processes.json").write_text(
+        json.dumps({"bridge": {"status": "STOPPED", "pid": None}}),
+        encoding="utf-8",
+    )
+
+    assert paths.root_report.status == "MIGRATION_AVAILABLE"
+    migrated = migrate_legacy_app_data(paths)
+
+    assert migrated.status == "CLEAN"
+    assert migrated.canonical_state.persistent_categories == (
+        "database",
+        "settings",
+        "secrets",
+        "runtime",
+    )
+    assert migrated.legacy_roots[0].inactive is True
+    assert (legacy / ".codex-supervisor-legacy-inactive.json").is_file()
+    assert (canonical / "data" / "supervisor.db").is_file()
+    assert (canonical / "config" / "settings.json").is_file()
+    assert (canonical / "config" / "secrets" / "opaque.dpapi").is_file()
+    backups = list((canonical / ".migration-backups").iterdir())
+    assert len(backups) == 1
+    assert (backups[0] / "data" / "supervisor.db").is_file()
+
+
+def test_legacy_migration_replaces_only_empty_canonical_state_directories(
+    tmp_path: Path,
+) -> None:
+    canonical = tmp_path / "canonical"
+    legacy = tmp_path / "legacy"
+    paths = _test_app_data_paths(canonical, legacy)
+    (canonical / "config" / "secrets").mkdir(parents=True)
+    (canonical / "runtime").mkdir(parents=True)
+    (legacy / "config" / "secrets").mkdir(parents=True)
+    (legacy / "config" / "secrets" / "opaque.dpapi").write_bytes(b"opaque")
+    (legacy / "runtime").mkdir(parents=True)
+    (legacy / "runtime" / "processes.json").write_text("{}", encoding="utf-8")
+
+    migrated = migrate_legacy_app_data(paths)
+
+    assert migrated.status == "CLEAN"
+    assert (canonical / "config" / "secrets" / "opaque.dpapi").is_file()
+    assert (canonical / "runtime" / "processes.json").is_file()
+
+
+def test_canonical_and_legacy_persistent_state_fail_closed_without_overwrite(
+    tmp_path: Path,
+) -> None:
+    canonical = tmp_path / "canonical"
+    legacy = tmp_path / "legacy"
+    paths = _test_app_data_paths(canonical, legacy)
+    (canonical / "config").mkdir(parents=True)
+    (canonical / "config" / "settings.json").write_text(
+        json.dumps({"config_version": 1, "side": "canonical"}), encoding="utf-8"
+    )
+    (legacy / "config").mkdir(parents=True)
+    (legacy / "config" / "settings.json").write_text(
+        json.dumps({"config_version": 1, "side": "legacy"}), encoding="utf-8"
+    )
+
+    assert paths.root_report.status == "SPLIT_BRAIN_DETECTED"
+    with pytest.raises(AppDataMigrationError, match="SPLIT_BRAIN_DETECTED"):
+        migrate_legacy_app_data(paths)
+
+    actions = RepairService(paths=paths).repair(
+        DoctorStatus(status=HealthStatus.UNAVAILABLE)
+    )
+    assert actions[0].action == "reconcile_app_data"
+    assert actions[0].status == HealthStatus.UNAVAILABLE
+    assert actions[0].requires_user_action is True
+    assert json.loads((canonical / "config" / "settings.json").read_text(encoding="utf-8"))["side"] == "canonical"
+
+
+def test_split_brain_does_not_persist_config_normalization(
+    tmp_path: Path,
+) -> None:
+    canonical = tmp_path / "canonical"
+    alias = tmp_path / "alias"
+    legacy = tmp_path / "legacy"
+    paths = _test_app_data_paths(canonical, legacy, alias_roots=(alias,))
+    (canonical / "config").mkdir(parents=True)
+    raw = {
+        "config_version": 1,
+        "advanced": {
+            "local_codex_repository": str(alias / "components" / "local-codex-bridge"),
+        },
+    }
+    (canonical / "config" / "settings.json").write_text(
+        json.dumps(raw), encoding="utf-8"
+    )
+    (legacy / "config").mkdir(parents=True)
+    (legacy / "config" / "settings.json").write_text(
+        json.dumps({"config_version": 1}), encoding="utf-8"
+    )
+    before = (canonical / "config" / "settings.json").read_bytes()
+
+    loaded = ConfigStore(paths=paths).load()
+
+    assert loaded.config.advanced.local_codex_repository == (
+        canonical / "components" / "local-codex-bridge"
+    )
+    assert (canonical / "config" / "settings.json").read_bytes() == before
+
+
+def test_legacy_components_only_are_preserved_while_canonical_install_is_planned(
+    tmp_path: Path,
+) -> None:
+    canonical = tmp_path / "canonical"
+    legacy = tmp_path / "legacy"
+    paths = _test_app_data_paths(canonical, legacy)
+    (legacy / "components" / "local-codex-bridge").mkdir(parents=True)
+    (legacy / "components" / "local-codex-bridge" / "marker.txt").write_text(
+        "legacy", encoding="utf-8"
+    )
+
+    class MissingComponentsDoctor:
+        def run(self, options: object | None = None) -> DoctorStatus:
+            del options
+            return DoctorStatus(
+                status=HealthStatus.UNAVAILABLE,
+                components=[
+                    ComponentHealth(
+                        capability="Node.js",
+                        status=HealthStatus.UNAVAILABLE,
+                        user_message="Local runtime needs an update.",
+                        repairable=True,
+                    ),
+                    ComponentHealth(
+                        capability="Local workspace",
+                        status=HealthStatus.UNAVAILABLE,
+                        user_message="Local workspace is not installed.",
+                        repairable=True,
+                    ),
+                    ComponentHealth(
+                        capability="Codex control",
+                        status=HealthStatus.UNAVAILABLE,
+                        user_message="Codex control is not installed.",
+                        repairable=True,
+                    ),
+                ],
+            )
+
+    registry = ManagedComponentRegistry()
+    actions = RepairService(
+        paths=paths,
+        doctor=MissingComponentsDoctor(),  # type: ignore[arg-type]
+        registry=registry,
+        secret_store=MemorySecretStore(),
+    ).repair(project_directory=tmp_path)
+
+    assert paths.components.is_dir()
+    reconcile = next(action for action in actions if action.action == "reconcile_app_data")
+    assert reconcile.status == HealthStatus.READY
+    install_actions = [
+        action for action in actions if action.action.startswith("install_component:")
+    ]
+    assert {action.action for action in install_actions} == {
+        "install_component:nodejs",
+        "install_component:devspace",
+        "install_component:local-codex-bridge",
+    }
+    assert all(
+        paths.components in Path(action.advanced["install_plan"]["target_dir"]).parents
+        for action in install_actions
+    )
+    assert (legacy / "components" / "local-codex-bridge" / "marker.txt").read_text(encoding="utf-8") == "legacy"
+
+
+def test_child_processes_keep_canonical_root_with_spaces(tmp_path: Path) -> None:
+    from codex_supervisor_bridge.supervisor.runtime import lcb_environment
+
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "Bridge Data With Space")},
+        system="Windows",
+    )
+    devspace = DevSpaceBootstrap.from_app_data(paths, port=39101)
+    lcb = LocalCodexBridgeBootstrap(
+        LocalCodexBridgeBootstrapConfig(launch_command=["node", "bridge.js"])
+    )
+
+    assert devspace.process_spec().env["CODEX_SUPERVISOR_DATA_DIR"] == str(paths.root)
+    assert lcb.process_spec(data_root=paths.root).env["CODEX_SUPERVISOR_DATA_DIR"] == str(paths.root)
+    assert lcb_environment(app_data_root=paths.root)["CODEX_SUPERVISOR_DATA_DIR"] == str(paths.root)
+
+
+def test_packaged_alias_paths_are_normalized_back_to_canonical_root(
+    tmp_path: Path,
+) -> None:
+    canonical = tmp_path / "Canonical Bridge Data"
+    alias = tmp_path / "Packages" / "Some.Package" / "LocalCache" / "Local" / "CodexSupervisorBridge"
+    paths = _test_app_data_paths(canonical, alias_roots=(alias,))
+    config_store = ConfigStore(paths=paths)
+    config = AppConfig.safe_defaults(paths)
+    config.advanced.local_codex_repository = alias / "components" / "local-codex-bridge" / "2.1.3"
+    config.advanced.sqlite_path = alias / "data" / "supervisor.db"
+    config.advanced.executable_paths["node"] = str(alias / "components" / "nodejs" / "node.exe")
+    config_store.save(config)
+
+    loaded = config_store.load()
+
+    assert loaded.migrated is True
+    assert loaded.config.advanced.local_codex_repository == (
+        canonical / "components" / "local-codex-bridge" / "2.1.3"
+    )
+    assert loaded.config.advanced.sqlite_path == canonical / "data" / "supervisor.db"
+    assert loaded.config.advanced.executable_paths["node"] == str(
+        canonical / "components" / "nodejs" / "node.exe"
+    )
+
+
+def test_doctor_reports_canonical_lcb_entrypoint_after_alias_normalization(
+    tmp_path: Path,
+) -> None:
+    canonical = tmp_path / "Canonical Bridge Data"
+    alias = tmp_path / "Packages" / "Some.Package" / "LocalCache" / "Local" / "CodexSupervisorBridge"
+    paths = _test_app_data_paths(canonical, alias_roots=(alias,))
+    repository = canonical / "components" / "local-codex-bridge" / "2.1.3"
+    (repository / "dist" / "src").mkdir(parents=True)
+    (repository / "dist" / "src" / "index.js").write_text("placeholder", encoding="utf-8")
+    node = tmp_path / "node.exe"
+    node.write_text("placeholder", encoding="utf-8")
+    config = AppConfig.safe_defaults(paths)
+    config.advanced.local_codex_repository = alias / "components" / "local-codex-bridge" / "2.1.3"
+    config.advanced.executable_paths["node"] = str(node)
+    doctor = Doctor(
+        paths=paths,
+        config_store=ConfigStore(paths=paths),
+        executable_finder=lambda name: str(node) if name == "node" else None,
+        command_runner=lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, "v24.20.0\n", ""
+        ),
+    )
+
+    health = doctor._codex_control(config)
+
+    assert health.status == HealthStatus.READY
+    assert health.advanced["repository"] == str(repository)
+    assert health.advanced["entrypoint"] == str(repository / "dist" / "src" / "index.js")
+
+
+def test_normalized_windows_root_reopens_same_task_runtime_state(tmp_path: Path) -> None:
+    profile = tmp_path / "User With Space"
+    normal_local = profile / "AppData" / "Local"
+    packaged_local = normal_local / "Packages" / "Some.Package" / "LocalCache" / "Local"
+    normal = AppDataPaths.from_environment(
+        environ={"LOCALAPPDATA": str(normal_local), "USERPROFILE": str(profile)},
+        system="Windows",
+        known_folder_resolver=lambda: None,
+    )
+    packaged = AppDataPaths.from_environment(
+        environ={"LOCALAPPDATA": str(packaged_local), "USERPROFILE": str(profile)},
+        system="Windows",
+        known_folder_resolver=lambda: None,
+    )
+    from codex_supervisor_bridge.memory.backend_binding import (
+        bind_task_backend,
+        get_task_backend_binding,
+    )
+    from codex_supervisor_bridge.memory.execution import acquire_writer, get_execution_state
+    from codex_supervisor_bridge.memory.service import MemoryService
+
+    assert normal.database == packaged.database
+    first = MemoryService(normal.database)
+    task = first.store.create_task("NORMALIZED-ROOT", "resume", repository="C:/repo")
+    acquired = acquire_writer(
+        first.store,
+        task.task_id,
+        task.revision,
+        ActiveWriter.CODEX,
+        explicit_user_authorization=True,
+    )
+    bound, binding = bind_task_backend(
+        first.store,
+        task.task_id,
+        acquired.task.revision,
+        workspace_backend="devspace",
+        agent_backend="local_codex_bridge",
+        profile="lightweight",
+    )
+    first.close()
+
+    reopened = MemoryService(packaged.database)
+    try:
+        resumed = reopened.get_task(task.task_id)
+        execution = get_execution_state(reopened.store, task.task_id)
+        recovered_binding = get_task_backend_binding(reopened.store, task.task_id)
+        assert resumed.revision == bound.revision
+        assert execution.active_writer == ActiveWriter.CODEX
+        assert execution.writer_epoch == acquired.execution.writer_epoch
+        assert recovered_binding == binding
+    finally:
+        reopened.close()
 
 
 def test_config_migrates_old_shape_and_invalid_config_degrades(tmp_path: Path) -> None:

@@ -109,6 +109,59 @@ def test_config_inspector_reports_provider_env_key_without_value(tmp_path: Path)
     assert SENTINEL not in rendered
 
 
+def test_config_inspector_checks_env_key_membership_without_reading_value(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.toml"
+    write_custom_config(config)
+
+    class NoValueReadEnvironment(dict[str, str]):
+        def __contains__(self, key: object) -> bool:
+            if key == "THIRD_PARTY_API_KEY":
+                return True
+            return super().__contains__(key)
+
+        def get(self, key: str, default: str | None = None) -> str | None:
+            if key == "THIRD_PARTY_API_KEY":
+                raise AssertionError("provider credential value must not be read")
+            return super().get(key, default)
+
+        def __getitem__(self, key: str) -> str:
+            if key == "THIRD_PARTY_API_KEY":
+                raise AssertionError("provider credential value must not be read")
+            return super().__getitem__(key)
+
+    inspection = CodexConfigInspector(
+        config_path=config,
+        environ=NoValueReadEnvironment(),
+    ).inspect()
+
+    assert inspection.credential_reference == "THIRD_PARTY_API_KEY"
+    assert inspection.credential_present is True
+
+
+def test_config_inspector_drops_url_userinfo_path_query_and_fragment(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.toml"
+    write_custom_config(
+        config,
+        base_url="https://user:password@example.com:8443/v1?token=hidden#fragment",
+    )
+
+    inspection = CodexConfigInspector(
+        config_path=config,
+        environ={"THIRD_PARTY_API_KEY": "present"},
+    ).inspect()
+
+    assert inspection.base_url_masked == "https://example.com:8443"
+    rendered = json.dumps(inspection.model_dump(mode="json"), ensure_ascii=True)
+    assert "user" not in rendered
+    assert "password" not in rendered
+    assert "hidden" not in rendered
+    assert "fragment" not in rendered
+
+
 def test_config_inspector_distinguishes_auth_mode_categories(tmp_path: Path) -> None:
     chatgpt = tmp_path / "chatgpt.toml"
     chatgpt.write_text(

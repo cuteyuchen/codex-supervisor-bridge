@@ -70,7 +70,15 @@ from .models import (
     HealthStatus,
     RepairAction,
 )
-from .paths import AppDataPaths
+from .paths import (
+    AppDataMigrationError,
+    AppDataPaths,
+    AppDataRootReport,
+    AppDataRootState,
+    inspect_app_data_roots,
+    migrate_legacy_app_data,
+    resolve_windows_local_app_data,
+)
 from .ports import PortAllocator, PortLease
 from .process import ManagedProcessSpec, ProcessManager, ProcessState
 from .recovery import RecoveryDecision, RecoveryStatus, RuntimeRecovery
@@ -87,6 +95,9 @@ from .service import BootstrapService
 __all__ = [
     "AppConfig",
     "AppDataPaths",
+    "AppDataMigrationError",
+    "AppDataRootReport",
+    "AppDataRootState",
     "AuthorizationChallenge",
     "AuthorizationResult",
     "AuthorizationStatus",
@@ -158,6 +169,9 @@ __all__ = [
     "UnsafeArchiveError",
     "authorize_command",
     "codex_environment_references",
+    "inspect_app_data_roots",
+    "migrate_legacy_app_data",
+    "resolve_windows_local_app_data",
     "extract_tar_safe",
     "extract_zip_safe",
     "FirstAuthorizationFlow",

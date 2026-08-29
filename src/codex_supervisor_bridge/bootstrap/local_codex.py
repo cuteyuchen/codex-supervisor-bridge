@@ -55,7 +55,7 @@ class LocalCodexBridgeBootstrap:
         *,
         node_executable: str = "node",
     ) -> list[str]:
-        entrypoint = Path(repository_path).expanduser().resolve() / "dist" / "src" / "index.js"
+        entrypoint = Path(repository_path).expanduser().absolute() / "dist" / "src" / "index.js"
         if not entrypoint.is_file():
             raise FileNotFoundError("Local-Codex-Bridge build output is missing")
         return [node_executable, str(entrypoint)]
@@ -65,12 +65,16 @@ class LocalCodexBridgeBootstrap:
         *,
         startup_timeout: float = 15.0,
         shutdown_timeout: float = 10.0,
+        data_root: str | Path | None = None,
     ) -> ManagedProcessSpec:
+        environment = dict(os.environ)
+        if data_root is not None:
+            environment["CODEX_SUPERVISOR_DATA_DIR"] = str(Path(data_root))
         return ManagedProcessSpec(
             name="local_codex_bridge",
             command=self.config.launch_command,
             cwd=self.config.working_directory,
-            env=dict(os.environ),
+            env=environment,
             startup_timeout=startup_timeout,
             shutdown_timeout=shutdown_timeout,
         )

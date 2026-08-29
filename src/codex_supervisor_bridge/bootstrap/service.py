@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import shutil
@@ -52,9 +53,14 @@ class BootstrapService:
         doctor = self.doctor.run(DoctorOptions(project_directory=project_directory))
         config = self.config_store.load().config
         project = project_directory or config.basic.project_directory
+        status = (
+            HealthStatus.UNAVAILABLE
+            if self.paths.root_report.split_brain
+            else doctor.status
+        )
         return BootstrapStatus(
-            status=doctor.status,
-            summary=_summary(doctor.status),
+            status=status,
+            summary=_summary(status),
             project_directory=str(project) if project else None,
             selected_profile=_profile(config, doctor),
             doctor=doctor,
@@ -86,7 +92,9 @@ class BootstrapService:
         if automatic_pull_request is not None:
             config.basic.automatic_pull_request = automatic_pull_request
         if local_codex_repository is not None:
-            config.advanced.local_codex_repository = local_codex_repository.expanduser().resolve()
+            config.advanced.local_codex_repository = self.paths.canonicalize_path(
+                local_codex_repository
+            )
         if node_executable is not None:
             config.advanced.executable_paths["node"] = node_executable
         self.config_store.save(config)
@@ -102,6 +110,10 @@ class BootstrapService:
     def start(self, *, project_directory: Path | None = None) -> BootstrapStatus:
         result = self.repair_and_status(project_directory=project_directory)
         config = self.config_store.load().config
+        if self.paths.root_report.split_brain:
+            result.status = HealthStatus.UNAVAILABLE
+            result.summary = _summary(HealthStatus.UNAVAILABLE)
+            return result
         if result.status == HealthStatus.UNAVAILABLE:
             return result
         devspace_executable = config.advanced.executable_paths.get("devspace", "devspace")
@@ -202,6 +214,10 @@ class BootstrapService:
                 SUPERVISOR_STARTUP_TIMEOUT_FLOOR_SECONDS,
             ),
             shutdown_timeout=config.advanced.shutdown_timeout_seconds,
+            env={
+                **os.environ,
+                "CODEX_SUPERVISOR_DATA_DIR": str(self.paths.root),
+            },
             readiness_probe=lambda: _read_readiness_marker(
                 supervisor_log,
                 start_offset=readiness_offset,

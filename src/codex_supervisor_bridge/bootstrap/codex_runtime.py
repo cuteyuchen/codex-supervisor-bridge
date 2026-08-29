@@ -104,7 +104,7 @@ class CodexConfigInspector:
             if config_path is not None
             else default_codex_config_path(environ)
         )
-        self.environ = dict(environ) if environ is not None else os.environ
+        self.environ: Mapping[str, str] = environ if environ is not None else os.environ
 
     def inspect(self) -> CodexConfigInspection:
         if not self.config_path.is_file():
@@ -145,7 +145,7 @@ class CodexConfigInspector:
         base_url = _string_or_none(provider_config.get("base_url"))
         requires_openai = provider_config.get("requires_openai_auth")
         requires_openai = requires_openai if isinstance(requires_openai, bool) else None
-        credential_present = bool(self.environ.get(env_key)) if env_key else None
+        credential_present = env_key in self.environ if env_key else None
         auth_mode = _auth_mode(
             provider_type=provider_type,
             env_key=env_key,
@@ -268,7 +268,7 @@ class CodexReadinessDetector:
     ) -> None:
         self.finder = finder
         self.runner = runner or subprocess.run
-        self.environ = dict(environ) if environ is not None else os.environ
+        self.environ: Mapping[str, str] = environ if environ is not None else os.environ
         self.inspector = inspector or CodexConfigInspector(environ=self.environ)
         self.smoke_probe = smoke_probe or CodexRuntimeSmokeProbe(runner=self.runner)
 
@@ -394,7 +394,7 @@ class CodexReadinessDetector:
 def default_codex_config_path(
     environ: Mapping[str, str] | None = None,
 ) -> Path:
-    environment = dict(environ) if environ is not None else os.environ
+    environment = environ if environ is not None else os.environ
     home = environment.get("CODEX_HOME")
     if home:
         return Path(home).expanduser() / "config.toml"
@@ -463,8 +463,17 @@ def _mask_base_url(value: str | None) -> str | None:
         return None
     try:
         parsed = urlparse(value)
-        if parsed.scheme and parsed.netloc:
-            return f"{parsed.scheme}://{parsed.netloc}"
+        if not parsed.scheme or not parsed.hostname:
+            return None
+        host = parsed.hostname
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        suffix = f":{port}" if port is not None else ""
+        return f"{parsed.scheme.lower()}://{host}{suffix}"
     except ValueError:
         return None
     return None

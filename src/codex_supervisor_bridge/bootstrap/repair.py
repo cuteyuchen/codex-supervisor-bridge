@@ -11,7 +11,7 @@ from .devspace import DevSpaceBootstrap
 from .doctor import Doctor, DoctorOptions
 from .installer import ComponentInstaller
 from .models import DoctorStatus, HealthStatus, RepairAction
-from .paths import AppDataPaths
+from .paths import AppDataMigrationError, AppDataPaths, migrate_legacy_app_data
 from .ports import PortAllocator
 from .process import ProcessManager
 from .secrets import MemorySecretStore, SecretStore, WindowsDpapiSecretStore
@@ -49,6 +49,55 @@ class RepairService:
     def repair(self, status: DoctorStatus | None = None, *, project_directory: Path | None = None) -> list[RepairAction]:
         status = status or self.doctor.run()
         actions: list[RepairAction] = []
+        root_report = self.paths.root_report
+        if root_report.split_brain:
+            return [
+                RepairAction(
+                    action="reconcile_app_data",
+                    status=HealthStatus.UNAVAILABLE,
+                    message="检测到两个本地状态，需要安全整理。",
+                    requires_user_action=True,
+                    advanced=root_report.as_dict(),
+                )
+            ]
+        if root_report.migration_available:
+            try:
+                migrated = migrate_legacy_app_data(self.paths)
+            except AppDataMigrationError as exc:
+                return [
+                    RepairAction(
+                        action="reconcile_app_data",
+                        status=HealthStatus.DEGRADED,
+                        message="检测到旧的本地数据位置，需要安全整理。",
+                        requires_user_action=True,
+                        advanced={
+                            "app_data_roots": root_report.as_dict(),
+                            "technical_detail": str(exc),
+                        },
+                    )
+                ]
+            actions.append(
+                RepairAction(
+                    action="reconcile_app_data",
+                    status=HealthStatus.READY,
+                    message="旧的本地数据已安全迁移到统一位置。",
+                    requires_user_action=False,
+                    advanced={"app_data_roots": migrated.as_dict()},
+                )
+            )
+            status = self.doctor.run(
+                DoctorOptions(project_directory=project_directory)
+            )
+        elif root_report.active_legacy_roots:
+            actions.append(
+                RepairAction(
+                    action="reconcile_app_data",
+                    status=HealthStatus.READY,
+                    message="旧的本地组件将保留，统一位置会安全准备所需组件。",
+                    requires_user_action=False,
+                    advanced={"app_data_roots": root_report.as_dict()},
+                )
+            )
         if not self.paths.data.exists() or not self.paths.logs.exists() or not self.paths.runtime.exists() or not self.paths.config.exists() or not self.paths.cache.exists():
             self.paths.ensure_directories()
             actions.append(RepairAction(action="repair_data_directory", status=HealthStatus.READY, message="Application data is ready."))
@@ -217,7 +266,9 @@ class RepairService:
         elif name == "local-codex-bridge":
             entrypoint = installed_path / "dist" / "src" / "index.js"
             if entrypoint.is_file():
-                config.advanced.local_codex_repository = installed_path
+                config.advanced.local_codex_repository = self.paths.canonicalize_path(
+                    installed_path
+                )
         self.config_store.save(config)
 
     def _write_mcp_config(self, config: AppConfig) -> None:

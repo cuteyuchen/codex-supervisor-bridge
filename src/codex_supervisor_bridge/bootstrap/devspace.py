@@ -182,6 +182,7 @@ class DevSpaceBootstrap:
             cwd=self.config_directory,
             env={
                 **os.environ,
+                "CODEX_SUPERVISOR_DATA_DIR": str(self.paths.root),
                 "DEVSPACE_CONFIG_DIR": str(self.config_directory),
                 "DEVSPACE_TOOL_MODE": "codex",
                 "DEVSPACE_WIDGETS": "changes",

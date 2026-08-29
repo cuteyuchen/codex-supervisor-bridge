@@ -101,15 +101,38 @@ class ConfigStore:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
             migrated, changed = self._migrate(raw)
             config = AppConfig.model_validate(migrated)
+            normalized = self._normalize_app_data_paths(config)
+            changed = changed or normalized
         except (OSError, json.JSONDecodeError, ValidationError, TypeError, ValueError):
             return ConfigLoadResult(
                 config=AppConfig.safe_defaults(self.paths),
                 status="DEGRADED",
                 error="Configuration is invalid; safe defaults are active.",
             )
-        if changed:
+        if changed and not self.paths.root_report.split_brain:
             self.save(config)
         return ConfigLoadResult(config=config, migrated=changed)
+
+    def _normalize_app_data_paths(self, config: AppConfig) -> bool:
+        changed = False
+        advanced = config.advanced
+        if advanced.local_codex_repository is not None:
+            normalized = self.paths.canonicalize_path(advanced.local_codex_repository)
+            if normalized != advanced.local_codex_repository:
+                advanced.local_codex_repository = normalized
+                changed = True
+        if advanced.sqlite_path is not None:
+            normalized = self.paths.canonicalize_path(advanced.sqlite_path)
+            if normalized != advanced.sqlite_path:
+                advanced.sqlite_path = normalized
+                changed = True
+        for key, value in list(advanced.executable_paths.items()):
+            relative = self.paths.alias_relative_path(value)
+            if relative is not None:
+                normalized = self.paths.root / relative
+                advanced.executable_paths[key] = str(normalized)
+                changed = True
+        return changed
 
     def save(self, config: AppConfig) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

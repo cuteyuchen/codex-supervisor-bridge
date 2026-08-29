@@ -161,21 +161,50 @@ class Doctor:
     def _data_directory(self) -> ComponentHealth:
         paths = (self.paths.data, self.paths.logs, self.paths.runtime, self.paths.config, self.paths.cache)
         missing = [str(path) for path in paths if not path.exists()]
-        if not missing:
+        root_report = self.paths.root_report
+        if root_report.split_brain:
+            status = HealthStatus.UNAVAILABLE
+            message = "检测到两个本地状态，需要安全整理。"
+            repairable = False
+            recommended_action = "reconcile_app_data"
+        elif root_report.migration_available:
+            status = HealthStatus.DEGRADED
+            message = "检测到旧的本地数据位置，正在安全整理。"
+            repairable = True
+            recommended_action = "reconcile_app_data"
+        elif root_report.active_legacy_roots:
+            status = HealthStatus.DEGRADED
+            message = "检测到旧的本地数据位置，正在安全整理。"
+            repairable = True
+            recommended_action = "reconcile_app_data"
+        elif not missing:
             status = HealthStatus.READY
             message = "Application data is ready."
             repairable = False
+            recommended_action = None
         else:
             status = HealthStatus.DEGRADED
             message = "Application data will be prepared automatically."
             repairable = True
+            recommended_action = "repair_data_directory"
+        advanced = {
+            "paths": {
+                "data": str(self.paths.data),
+                "logs": str(self.paths.logs),
+                "runtime": str(self.paths.runtime),
+                "config": str(self.paths.config),
+                "cache": str(self.paths.cache),
+                "missing": missing,
+            },
+            "app_data_roots": root_report.as_dict(),
+        }
         return ComponentHealth(
             capability="Application data",
             status=status,
             repairable=repairable,
             user_message=message,
-            recommended_action="repair_data_directory" if repairable else None,
-            advanced={"paths": {"data": str(self.paths.data), "logs": str(self.paths.logs), "runtime": str(self.paths.runtime), "config": str(self.paths.config), "cache": str(self.paths.cache), "missing": missing}},
+            recommended_action=recommended_action,
+            advanced=advanced,
         )
 
     def _project(self, project: Path | None) -> ComponentHealth:
@@ -392,7 +421,7 @@ class Doctor:
                     "local-codex-bridge --version",
                 )
 
-        resolved = repository.expanduser().resolve()
+        resolved = self.paths.canonicalize_path(repository)
         entrypoint = resolved / "dist" / "src" / "index.js"
         node_value = config.advanced.executable_paths.get("node", "node")
         node = self._resolve_executable(node_value) or self._resolve_executable("node")
@@ -553,7 +582,7 @@ class Doctor:
         pointer = self.paths.components / name / "current.json"
         try:
             payload = json.loads(pointer.read_text(encoding="utf-8"))
-            path = Path(str(payload["path"]))
+            path = self.paths.canonicalize_path(str(payload["path"]))
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
             return None
         if not path.is_dir():

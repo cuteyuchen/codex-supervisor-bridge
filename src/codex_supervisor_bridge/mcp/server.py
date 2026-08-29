@@ -349,7 +349,7 @@ def main(argv: list[str] | None = None) -> None:
         composition = RuntimeComposition.profile_b(
             service,
             launch_command=launch_command,
-            env=lcb_environment(),
+            env=lcb_environment(app_data_root=app_paths.root),
             workspace_factory=authenticated_devspace_factory,
         )
     elif selection.binding_forced and selection.profile == "lightweight":

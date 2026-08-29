@@ -4,7 +4,7 @@
 >
 > This document records the current product intent and the architecture decisions that supersede earlier fixed-backend assumptions. It is deliberately more durable than a browser conversation.
 
-Last updated: 2026-08-28
+Last updated: 2026-08-29
 
 ## Product goal
 
@@ -570,12 +570,42 @@ Windows Gate:
   are part of the PR #9 suite. The code-level suite is 234 tests locally on
   Python 3.12/3.13.
 
-The real Windows Gate remains: install/launch DevSpace and Local-Codex-Bridge
-on a user machine, complete one DevSpace authorization, prove the user's
-existing Codex configuration with a read-only runtime smoke, create the
-Supervisor-only HTTPS tunnel, attach ChatGPT Web Remote MCP to the Supervisor
-endpoint, and run the same Profile A/B scenario against real worktrees. P6.6
-is not marked complete until those gates pass.
+The Windows local-machine Gate has now been executed in the real development
+environment. It passed Bridge editable install, managed Node.js 24.20.0,
+managed DevSpace 1.0.8, managed Local-Codex-Bridge 2.1.3, DevSpace OAuth with
+Windows DPAPI, the configured third-party Codex provider, a real read-only
+Codex runtime smoke (`SUCCESS` / `READY` at least once), Supervisor startup,
+persistent Local-Codex-Bridge session reuse, the Profile B local workflow,
+direct-to-Codex handoff, plan approval, execution, active-turn steer,
+checkpoint, interrupt, handback, and restart/resume. A later intermittent
+`PROVIDER_TIMEOUT` from the third-party provider is recorded as external
+runtime/service availability, not as a Bridge login failure; the readiness
+probe must remain `DEGRADED` when that smoke times out.
+
+That real run exposed one final Windows path-consistency issue. Ordinary
+PowerShell and a packaged Codex child can report different `LOCALAPPDATA`
+values. `bootstrap.paths` now resolves the canonical root through the Windows
+Known Folder API, falls back to `USERPROFILE\\AppData\\Local`, recognizes generic
+`AppData\\Local\\Packages\\<package>\\LocalCache\\Local` virtualization, and
+passes the canonical root explicitly to Bridge-owned children. Physical aliases
+are reported as aliases rather than split brain. An independent root containing
+persistent `settings`/SecretStore state is classified as
+`SPLIT_BRAIN_DETECTED`; Doctor/Repair/Start/Status fail closed and never merge,
+overwrite, or delete either root. Only an unambiguous legacy-only state can use
+the backup, copy, validate, atomic-promote migration path, after which the
+legacy root is retained and marked inactive.
+
+The current machine inspection found the canonical root at
+`%USERPROFILE%\\AppData\\Local\\CodexSupervisorBridge`, a Codex packaged path
+that is the same physical root (alias), and a separate Python packaged root
+with its own `settings.json` and DPAPI SecretStore but no database. Because the
+separate root is persistent state, the local Gate is currently blocked on
+explicit split-brain reconciliation; no automatic data selection is allowed.
+P6.6 remains active and is not complete. After reconciliation, the next real
+Gate is only: Supervisor HTTPS -> ChatGPT Web Remote MCP -> ChatGPT/Supervisor
+Profile B end-to-end flow plus the corresponding remote Profile A/B comparison.
+The resulting local suite is 282 tests on Windows Python 3.12; Ruff, compileall,
+and `git diff --check` are green.
 
 ### 2026-08-28 runtime affinity / redirect safety round
 
@@ -701,8 +731,9 @@ recovery fails closed into reconciliation. The production safety/lifecycle
 convergence round (capability-driven RuntimeResolver, pre-READY recovery,
 combined readiness, guarded steer/respond/interrupt, migration gate, and
 managed component registry) is also in PR #9 and green on Linux/Windows CI.
-The next step is the real Windows Gate (install/launch/DevSpace OAuth/Codex
-runtime smoke/tunnel/ChatGPT Remote MCP attachment).
+The Windows local install/runtime portion has passed; the next step is the
+Supervisor HTTPS -> ChatGPT Web Remote MCP attachment and the complete remote
+Profile A/B scenario. Do not enter P7 until that Gate is explicitly accepted.
 
 #### P7 — Backend-neutral Review / QA / PR / CI loop
 

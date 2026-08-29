@@ -273,7 +273,10 @@ def lcb_launch_from_config(
     )
 
 
-def lcb_environment() -> dict[str, str]:
+def lcb_environment(
+    *,
+    app_data_root: str | Path | None = None,
+) -> dict[str, str]:
     """Inherit the user environment for the LCB -> Codex stdio process.
 
     Provider credentials that already work for the user's Codex CLI are passed
@@ -282,4 +285,10 @@ def lcb_environment() -> dict[str, str]:
     responses.
     """
 
-    return dict(os.environ)
+    environment = dict(os.environ)
+    if app_data_root is None:
+        from codex_supervisor_bridge.bootstrap.paths import AppDataPaths
+
+        app_data_root = AppDataPaths.from_environment().root
+    environment["CODEX_SUPERVISOR_DATA_DIR"] = str(Path(app_data_root))
+    return environment

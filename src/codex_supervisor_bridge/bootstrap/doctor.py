@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import platform
 import re
 import shutil
@@ -12,6 +13,11 @@ from typing import Any, Callable
 
 from codex_supervisor_bridge import __version__
 
+from .codex_isolation import (
+    CodexRuntimeMetadata,
+    ProcessInspector,
+    runtime_process_chain_failure,
+)
 from .codex_runtime import CodexReadinessDetector
 from .configuration import AppConfig, ConfigStore
 from .devspace import (
@@ -59,6 +65,7 @@ class Doctor:
         bind_checker: Callable[[str], bool] | None = None,
         port_allocator: PortAllocator | None = None,
         process_manager: ProcessManager | None = None,
+        codex_process_inspector: ProcessInspector | None = None,
     ) -> None:
         self.paths = paths or AppDataPaths.from_environment()
         self.config_store = config_store or ConfigStore(paths=self.paths)
@@ -67,6 +74,7 @@ class Doctor:
         self._can_bind = bind_checker or self._check_bind
         self._ports = port_allocator or PortAllocator()
         self._process_manager = process_manager
+        self._codex_process_inspector = codex_process_inspector or ProcessInspector()
 
     def run(self, options: DoctorOptions | None = None) -> DoctorStatus:
         options = options or DoctorOptions()
@@ -93,6 +101,7 @@ class Doctor:
                 [
                     self._workspace(),
                     self._codex_control(config),
+                    self._codex_runtime_isolation(),
                     self._executable("Fallback workspace", "kandev", "kandev --version"),
                     self._executable("Fallback control", "codex-control-plane-mcp", "codex-control-plane-mcp --version"),
                 ]
@@ -594,7 +603,72 @@ class Doctor:
                 "entrypoint": str(entrypoint),
                 "launch_command": [node, str(entrypoint)],
                 "node_version": node_version,
+                "supports_isolated_runtime": True,
+                "runtime_transport": "private_stdio",
+                "desktop_attach_fallback": False,
             },
+        )
+
+    def _codex_runtime_isolation(self) -> ComponentHealth:
+        runtime_root = self.paths.runtime / "codex"
+        metadata_paths = sorted(
+            runtime_root.glob("*/runtime.json") if runtime_root.is_dir() else (),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        metadata: CodexRuntimeMetadata | None = None
+        if metadata_paths:
+            try:
+                metadata = CodexRuntimeMetadata.model_validate(
+                    json.loads(metadata_paths[0].read_text(encoding="utf-8"))
+                )
+            except (OSError, ValueError, TypeError):
+                metadata = None
+        if metadata is None:
+            return ComponentHealth(
+                capability="Codex runtime isolation",
+                status=HealthStatus.DEGRADED,
+                repairable=True,
+                user_message="Codex needs runtime verification.",
+                recommended_action="recover_codex_runtime",
+                advanced={
+                    "ownership": "UNKNOWN",
+                    "runtime_instance": None,
+                    "runtime_epoch": 0,
+                    "desktop_runtime_detected": False,
+                    "isolation_verified": False,
+                    "technical_detail": "no verified Supervisor Codex runtime metadata",
+                },
+            )
+        advanced = metadata.advanced_status()
+        metadata_path = metadata_paths[0]
+        runtime_directory = Path(metadata.runtime_directory)
+        if (
+            runtime_directory != metadata_path.parent
+            or runtime_directory.parent != runtime_root
+        ):
+            live_failure = "runtime metadata is outside the canonical runtime namespace"
+        else:
+            live_failure = runtime_process_chain_failure(
+                metadata,
+                self._codex_process_inspector.snapshot(),
+            )
+        advanced["live_identity_verified"] = live_failure is None
+        if live_failure is not None:
+            advanced["technical_detail"] = live_failure
+        ready = (
+            metadata.status == "READY"
+            and metadata.ownership.value == "SUPERVISOR_MANAGED"
+            and metadata.isolation_verified
+            and live_failure is None
+        )
+        return ComponentHealth(
+            capability="Codex runtime isolation",
+            status=HealthStatus.READY if ready else HealthStatus.DEGRADED,
+            repairable=not ready,
+            user_message="Codex is connected." if ready else "Codex needs runtime recovery.",
+            recommended_action=None if ready else "recover_codex_runtime",
+            advanced=advanced,
         )
 
     def _codex(self, config: AppConfig, *, workspace: Path | None) -> ComponentHealth:

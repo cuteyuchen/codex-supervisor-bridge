@@ -12,6 +12,10 @@ from codex_supervisor_bridge.integrations.kandev_errors import KandevError
 from codex_supervisor_bridge.integrations.local_codex_bridge_errors import (
     LocalCodexBridgeError,
 )
+from codex_supervisor_bridge.memory.codex_runtime import (
+    CodexRuntimeAffinityError,
+    CodexRuntimeCircuitOpenError,
+)
 from codex_supervisor_bridge.memory.errors import MemoryErrorBase
 from codex_supervisor_bridge.supervisor.agent_execution import (
     AgentCompensationRequiredError,
@@ -53,6 +57,10 @@ def _integration_message(exc: Exception) -> str:
         return "Codex runtime requires reconciliation before continuing."
     if isinstance(exc, AgentPlanGateError):
         return str(exc)
+    if isinstance(exc, CodexRuntimeAffinityError):
+        return "Codex runtime requires reconciliation before continuing."
+    if isinstance(exc, CodexRuntimeCircuitOpenError):
+        return "CODEX_RUNTIME_CIRCUIT_OPEN: explicit runtime recovery is required."
     return str(exc)
 
 
@@ -92,6 +100,8 @@ def expose_integration_errors(
             DevSpaceError,
             LocalCodexBridgeError,
             AgentPlanGateError,
+            CodexRuntimeAffinityError,
+            CodexRuntimeCircuitOpenError,
         ) as exc:
             raise ToolError(_integration_message(exc)) from exc
 

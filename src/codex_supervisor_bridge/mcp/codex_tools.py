@@ -30,6 +30,13 @@ INTERRUPT = ToolAnnotations(
     open_world_hint=False,
 )
 
+RECOVERY = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=True,
+    idempotent_hint=False,
+    open_world_hint=False,
+)
+
 
 def register_codex_tools(server: MCPServer, facade: CodexSemanticFacade) -> None:
     """Register the provider-neutral semantic Codex control surface.
@@ -158,6 +165,16 @@ def register_codex_tools(server: MCPServer, facade: CodexSemanticFacade) -> None
             expected_revision,
             reason=reason,
         )
+
+    @server.tool(annotations=RECOVERY)
+    @expose_integration_errors
+    async def recover_codex_runtime(task_id: str) -> dict[str, Any]:
+        """Explicitly replace only the verified Supervisor-owned Codex runtime.
+
+        This is not a turn interrupt. It advances the runtime epoch, invalidates
+        old thread/turn affinity, and never attaches to Codex Desktop.
+        """
+        return await facade.recover_runtime(task_id)
 
     @server.tool(annotations=READ_ONLY)
     @expose_integration_errors

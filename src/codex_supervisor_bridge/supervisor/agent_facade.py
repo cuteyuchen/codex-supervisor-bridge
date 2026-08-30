@@ -45,6 +45,7 @@ SEMANTIC_TOOLS = [
     "execute_codex_approved_plan",
     "soft_steer_codex",
     "interrupt_codex",
+    "recover_codex_runtime",
     "list_codex_pending_interactions",
     "answer_codex_pending_interaction",
 ]
@@ -83,7 +84,14 @@ def _runtime_identity(runtime: CodexRuntimeState | None) -> tuple[str | None, ..
         return None
     return tuple(
         getattr(runtime, field, None)
-        for field in ("workflow_id", "operation_id", "thread_id", "turn_id")
+        for field in (
+            "runtime_instance_id",
+            "runtime_epoch",
+            "workflow_id",
+            "operation_id",
+            "thread_id",
+            "turn_id",
+        )
     )
 
 
@@ -141,6 +149,8 @@ class CodexSemanticFacade(Protocol):
     ) -> dict[str, Any]: ...
 
     async def pending_interactions(self, task_id: str) -> dict[str, Any]: ...
+
+    async def recover_runtime(self, task_id: str) -> dict[str, Any]: ...
 
     async def answer_interaction(
         self,
@@ -373,16 +383,27 @@ class AgentSupervisorFacade:
     @staticmethod
     def _runtime_handle(runtime: CodexRuntimeState) -> PlanHandle:
         return PlanHandle(
+            task_id=runtime.task_id,
             operation_id=runtime.operation_id,
             workflow_id=runtime.workflow_id,
             thread_id=runtime.thread_id,
             turn_id=runtime.turn_id,
+            runtime_instance_id=runtime.runtime_instance_id,
+            runtime_epoch=runtime.runtime_epoch,
+            runtime_ownership=runtime.runtime_ownership,
+            isolation_verified=runtime.isolation_verified,
             status=runtime.remote_status or "unknown",
         )
 
     async def health(self) -> dict[str, Any]:
         agent = await self._agent()
         health = await agent.health()
+        runtime_status = (
+            self.session_manager.runtime_manager.public_status()
+            if self.session_manager is not None
+            and self.session_manager.runtime_manager is not None
+            else None
+        )
         return {
             "ok": health.status.value == "READY",
             "status": health.status.value,
@@ -392,6 +413,20 @@ class AgentSupervisorFacade:
             "workspace_backend": self.workspace_backend,
             "agent_backend": self.agent_backend,
             "session": self.session_manager.status() if self.session_manager else None,
+            "codex_runtime": runtime_status,
+        }
+
+    async def recover_runtime(self, task_id: str) -> dict[str, Any]:
+        if self.session_manager is None:
+            raise AgentPlanGateError(
+                "LCB_RUNTIME_ISOLATION_UNSUPPORTED: active backend has no runtime manager"
+            )
+        runtime = await self.session_manager.recover_runtime(task_id)
+        return {
+            "task": self.memory.get_task(task_id).model_dump(mode="json"),
+            "runtime": runtime.model_dump(mode="json"),
+            "profile": self.profile,
+            "status": "SUPERVISOR_CODEX_RUNTIME_READY",
         }
 
     async def runtime_capabilities(self) -> dict[str, Any]:
@@ -404,6 +439,15 @@ class AgentSupervisorFacade:
             "plan_gated_execution": True,
             "backend_binding_required": True,
             "restart_recovery": "fail_closed_reconciliation",
+            "runtime_ownership_required": self.agent_backend == "local_codex_bridge",
+            "desktop_attach_fallback": False,
+            "interrupt_scope": "turn_protocol_only",
+            "runtime": (
+                self.session_manager.runtime_manager.public_status()
+                if self.session_manager is not None
+                and self.session_manager.runtime_manager is not None
+                else None
+            ),
         }
 
     async def preflight(
@@ -426,8 +470,24 @@ class AgentSupervisorFacade:
                 "agent_ready": bool(health["ok"]),
                 "workspace_path_available": bool(project),
                 "plan_gate_enforced": True,
+                "runtime_ownership_verified": bool(
+                    health.get("codex_runtime")
+                    and health["codex_runtime"].get("ownership") == "SUPERVISOR_MANAGED"
+                    and health["codex_runtime"].get("isolation_verified")
+                )
+                if self.agent_backend == "local_codex_bridge"
+                else True,
             },
-            "ready": bool(health["ok"]) and bool(project),
+            "ready": bool(health["ok"])
+            and bool(project)
+            and (
+                self.agent_backend != "local_codex_bridge"
+                or bool(
+                    health.get("codex_runtime")
+                    and health["codex_runtime"].get("ownership") == "SUPERVISOR_MANAGED"
+                    and health["codex_runtime"].get("isolation_verified")
+                )
+            ),
         }
 
     async def start_plan(
@@ -465,9 +525,11 @@ class AgentSupervisorFacade:
             return {"task": task.model_dump(mode="json"), "runtime": None, "snapshot": None, "pollRecommended": False}
         agent = await self._agent()
         snapshot = await agent.observe(self._runtime_handle(runtime))
+        runtime = get_codex_runtime(self.memory.store, task_id) or runtime
         status = (snapshot.status or "").strip().lower()
         poll_recommended = (
             not snapshot.reconciliation_required
+            and not runtime.circuit_open
             and status not in _COMPLETE_STATUSES
             and status not in {"unknown", "reconciliation_required", "compensation_required"}
         )

@@ -481,6 +481,7 @@ def main(argv: list[str] | None = None) -> None:
             service,
             launch_command=launch_command,
             env=lcb_environment(app_data_root=app_paths.filesystem_root),
+            app_data_root=app_paths.filesystem_root,
             workspace_factory=authenticated_devspace_factory,
         )
     elif selection.binding_forced and selection.profile == "lightweight":
@@ -549,6 +550,7 @@ def _doctor_health(doctor: object) -> dict[str, BackendHealth]:
         "control_plane": "Fallback control",
         "github": "GitHub",
         "codex": "Codex",
+        "codex_runtime_isolation": "Codex runtime isolation",
     }
     result: dict[str, BackendHealth] = {}
     for name, label in aliases.items():
@@ -567,6 +569,13 @@ def _doctor_health(doctor: object) -> dict[str, BackendHealth]:
             user_message=item.user_message,
             repairable=item.repairable,
             technical_detail=str(item.advanced.get("technical_detail", "")),
+            capabilities={
+                "supports_isolated_runtime": bool(
+                    item.advanced.get("supports_isolated_runtime", False)
+                )
+            }
+            if name == "local_codex_bridge"
+            else {},
         )
     return result
 

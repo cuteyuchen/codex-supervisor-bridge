@@ -334,6 +334,60 @@ history and schema version 7. The P6.6 implementation branch is
 ### P6.6 — active
 
 P6.6 is the active phase: Windows Integration / Bootstrap / Real A-B Proof.
+
+#### 2026-08-30 release blocker: Codex Desktop runtime isolation
+
+P6.6 remains **ACTIVE**. PR #9 is **NOT READY TO MERGE** and must remain open
+as a Draft. Remote Profile B is **NOT production safe** until the complete
+Desktop isolation Gate passes.
+
+At least two real incidents showed Codex Desktop conversations becoming
+unavailable after Supervisor/Local-Codex-Bridge activity. The visible failure
+included `Codex app-server process is not available`; the later incident did
+not require a repeated interrupt sequence. The earlier assumption that
+`interrupt` alone caused the failure is therefore insufficient.
+
+Read-only investigation of the pinned Local-Codex-Bridge 2.1.3 source at
+commit `4ffed814f615316ade8967189a2e1772488d33c2` confirmed that LCB starts its
+own `codex app-server --listen stdio://` child and uses protocol-level
+`turn/interrupt`; it does not intentionally attach to a Codex Desktop
+app-server. The unsafe architectural gap was that the LCB child inherited the
+user's default Codex environment and state root, while Supervisor had no
+durable process ownership, runtime instance, epoch, endpoint ownership, or
+fail-closed lifecycle proof. A Supervisor/LCB failure could therefore not be
+shown to be independent from the user's daily Desktop runtime.
+
+The code-level blocker work on this branch now establishes:
+
+- `DESKTOP_EXTERNAL`, `SUPERVISOR_MANAGED`, and `UNKNOWN` process ownership;
+- PID-reuse-resistant identity using creation time, executable, command-line
+  fingerprint, parent PID, and parent process identity;
+- a canonical Supervisor runtime namespace under
+  `runtime/codex/<instance-id>` with an isolated `CODEX_HOME`, LCB checkpoint
+  directory, ownership-token hash, process-chain metadata, and private stdio
+  endpoint category;
+- a Supervisor-owned runtime proxy that verifies the
+  Supervisor -> proxy -> LCB -> Codex app-server parent/child chain before
+  Profile B can report READY;
+- runtime-instance and epoch affinity for task/thread/turn/pending interaction
+  recovery, with old affinity invalidated after runtime replacement;
+- protocol-only turn interrupt, with no process-kill fallback;
+- stalled-turn detection based on elapsed time, status transitions, pending
+  interactions, latest plan, and semantic progress rather than a fixed raw
+  event count;
+- a runtime circuit breaker that blocks repeated start/interrupt loops until
+  explicit verified recovery;
+- capability fallback to Control Plane when isolated LCB runtime support is
+  unavailable, without any fallback attach to Codex Desktop;
+- passive Desktop process metadata in advanced diagnostics only; normal
+  Context Packs omit PIDs and all credential values.
+
+This is code/fake-test evidence only. It does **not** complete the release
+blocker. No second real Codex app-server, real process termination, Desktop
+concurrency test, real turn interrupt Gate, or runtime crash Gate may run
+without the explicit human checkpoints documented for P6.6. Until those Gates
+prove bidirectional failure isolation, do not resume the full remote Profile B
+E2E sequence and do not enter P7.
 The first implementation slice is intentionally backend-neutral and layered:
 
 - persistent versioned user configuration with Basic / Advanced projections;

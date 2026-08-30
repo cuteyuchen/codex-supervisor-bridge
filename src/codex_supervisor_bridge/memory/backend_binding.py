@@ -55,6 +55,7 @@ def _runtime_affinity_conditions() -> tuple[str, tuple[str, ...]]:
     return (
         "e.active_writer <> 'NONE'"
         f" OR LOWER(r.remote_status) IN ({placeholders})"
+        " OR r.circuit_state <> 'CLOSED'"
         " OR s.state <> 'NONE'"
         " OR EXISTS ("
         "  SELECT 1 FROM direct_workspace_operations d"
@@ -241,13 +242,17 @@ def _assert_migration_safe(conn: Any, task_id: str) -> None:
         )
 
     runtime = conn.execute(
-        "SELECT remote_status FROM codex_runtime_state WHERE task_id = ?",
+        "SELECT remote_status, circuit_state FROM codex_runtime_state WHERE task_id = ?",
         (task_id,),
     ).fetchone()
     if runtime is not None:
         if is_active_runtime(runtime["remote_status"]):
             raise ConflictError(
                 "Backend migration is blocked while a Codex runtime is active"
+            )
+        if runtime["circuit_state"] != "CLOSED":
+            raise ConflictError(
+                "Backend migration is blocked while Codex runtime recovery is required"
             )
 
     workspace = conn.execute(

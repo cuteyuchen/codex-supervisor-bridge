@@ -245,6 +245,9 @@ def _health(
         capability=capability,
         status=status,
         user_message=f"{capability} is ready.",
+        capabilities={"supports_isolated_runtime": True}
+        if capability == "local_codex_bridge"
+        else {},
     )
 
 

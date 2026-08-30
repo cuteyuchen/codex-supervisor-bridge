@@ -707,6 +707,7 @@ def test_soft_steer_unknown_remote_outcome_fails_closed() -> None:
 
         asyncio.run(scenario())
         assert agent.interrupts == [PlanHandle(
+            task_id="STEER-UNKNOWN",
             operation_id="op-old",
             workflow_id="wf-old",
             thread_id="thread-old",

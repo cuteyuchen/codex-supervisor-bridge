@@ -90,7 +90,17 @@ class CapabilityResolver:
 
     def resolve(self) -> ResolvedBackends:
         workspace = self._best(("devspace", "kandev"))
-        agent = self._best(("local_codex_bridge", "control_plane"))
+        lcb = self.health.get("local_codex_bridge")
+        lcb_isolated = bool(
+            lcb
+            and lcb.status in {BackendHealthStatus.READY, BackendHealthStatus.DEGRADED}
+            and lcb.capabilities.get("supports_isolated_runtime", False)
+        )
+        agent = (
+            "local_codex_bridge"
+            if lcb_isolated
+            else self._best(("control_plane",))
+        )
         codex = self._best(("codex",))
         delivery = self._best(("github", "kandev"))
 

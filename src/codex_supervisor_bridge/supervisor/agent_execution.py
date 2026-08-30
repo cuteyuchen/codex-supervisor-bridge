@@ -61,7 +61,14 @@ def _runtime_identity(runtime: object | None) -> tuple[str | None, ...] | None:
         return None
     return tuple(
         getattr(runtime, field, None)
-        for field in ("workflow_id", "operation_id", "thread_id", "turn_id")
+        for field in (
+            "runtime_instance_id",
+            "runtime_epoch",
+            "workflow_id",
+            "operation_id",
+            "thread_id",
+            "turn_id",
+        )
     )
 
 
@@ -287,6 +294,11 @@ class AgentExecutionCoordinator:
                 operation_id=handle.operation_id,
                 thread_id=handle.thread_id,
                 turn_id=handle.turn_id,
+                runtime_instance_id=handle.runtime_instance_id,
+                runtime_epoch=handle.runtime_epoch,
+                runtime_ownership=handle.runtime_ownership,
+                isolation_verified=handle.isolation_verified,
+                interrupt_attempted=False,
                 remote_status=handle.status,
                 task_phase=TaskPhase.PLANNING,
                 current_state="Codex is preparing a read-only plan.",
@@ -373,6 +385,13 @@ class AgentExecutionCoordinator:
             raise AgentPlanGateError("The read-only plan runtime is stale")
         if runtime.thread_id and plan_handle.thread_id and runtime.thread_id != plan_handle.thread_id:
             raise AgentPlanGateError("The read-only plan runtime is stale")
+        if (
+            runtime.runtime_instance_id != plan_handle.runtime_instance_id
+            or runtime.runtime_epoch != plan_handle.runtime_epoch
+        ):
+            raise AgentPlanGateError(
+                "CODEX_RUNTIME_RECONCILIATION_REQUIRED: plan belongs to a prior runtime"
+            )
         if plan_handle.reconciliation_required or plan_handle.status.upper() == "UNKNOWN":
             raise AgentPlanGateError(
                 "Cannot execute while the read-only plan outcome requires reconciliation"
@@ -414,6 +433,11 @@ class AgentExecutionCoordinator:
                 operation_id=handle.operation_id,
                 thread_id=handle.thread_id or plan_handle.thread_id,
                 turn_id=handle.turn_id,
+                runtime_instance_id=handle.runtime_instance_id,
+                runtime_epoch=handle.runtime_epoch,
+                runtime_ownership=handle.runtime_ownership,
+                isolation_verified=handle.isolation_verified,
+                interrupt_attempted=False,
                 remote_status=handle.status,
                 task_phase=TaskPhase.IMPLEMENTING,
                 current_state="Codex is implementing the locally approved plan.",

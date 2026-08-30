@@ -7,6 +7,15 @@ from .auth import (
     AuthorizationStatus,
     FirstAuthorizationFlow,
 )
+from .codex_isolation import (
+    CodexRuntimeIsolationError,
+    CodexRuntimeMetadata,
+    LcbRuntimeIsolationUnsupportedError,
+    ProcessInspector,
+    ProcessObservation,
+    RuntimeOwnershipError,
+    SupervisorCodexRuntimeManager,
+)
 from .codex_runtime import (
     CodexAuthMode,
     CodexConfigInspection,
@@ -80,7 +89,7 @@ from .paths import (
     resolve_windows_local_app_data,
 )
 from .ports import PortAllocator, PortLease
-from .process import ManagedProcessSpec, ProcessManager, ProcessState
+from .process import CodexProcessOwnership, ManagedProcessSpec, ProcessManager, ProcessState
 from .reconciliation import (
     ReconciliationError,
     ReconciliationPlan,
@@ -138,6 +147,9 @@ __all__ = [
     "CodexConfigInspector",
     "CodexRuntimeProbeResult",
     "CodexRuntimeSmokeProbe",
+    "CodexProcessOwnership",
+    "CodexRuntimeIsolationError",
+    "CodexRuntimeMetadata",
     "DevelopmentStyle",
     "DownloadError",
     "Doctor",
@@ -159,17 +171,22 @@ __all__ = [
     "ManagedComponentRegistry",
     "LocalCodexBridgeBootstrap",
     "LocalCodexBridgeBootstrapConfig",
+    "LcbRuntimeIsolationUnsupportedError",
     "MemorySecretStore",
     "SecretTokenStorage",
     "PortAllocator",
     "PortLease",
     "ProcessManager",
+    "ProcessInspector",
+    "ProcessObservation",
     "ProcessState",
     "RepairAction",
     "RepairService",
     "RecoveryDecision",
     "RecoveryStatus",
     "RuntimeRecovery",
+    "RuntimeOwnershipError",
+    "SupervisorCodexRuntimeManager",
     "ReconciliationError",
     "ReconciliationPlan",
     "ReconciliationResult",

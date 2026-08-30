@@ -7,8 +7,17 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Sequence
+
+
+class CodexProcessOwnership(str, Enum):
+    """Fail-closed ownership classification for Codex-related processes."""
+
+    DESKTOP_EXTERNAL = "DESKTOP_EXTERNAL"
+    SUPERVISOR_MANAGED = "SUPERVISOR_MANAGED"
+    UNKNOWN = "UNKNOWN"
 
 
 @dataclass(frozen=True)
@@ -21,6 +30,9 @@ class ManagedProcessSpec:
     shutdown_timeout: float = 10.0
     max_restarts: int = 3
     readiness_probe: Callable[[], bool] | None = None
+    ownership: CodexProcessOwnership = CodexProcessOwnership.SUPERVISOR_MANAGED
+    runtime_identity: str | None = None
+    instance_id: str | None = None
 
 
 @dataclass
@@ -34,6 +46,7 @@ class ProcessState:
     technical_detail: str | None = None
     process_identity: dict[str, Any] | None = None
     identity_status: str | None = None
+    ownership: CodexProcessOwnership = CodexProcessOwnership.UNKNOWN
     _process: Any = field(default=None, repr=False, compare=False)
 
     def as_dict(self) -> dict[str, Any]:
@@ -47,6 +60,7 @@ class ProcessState:
             "technical_detail": self.technical_detail,
             "process_identity": self.process_identity,
             "identity_status": self.identity_status,
+            "ownership": self.ownership.value,
         }
 
 
@@ -105,7 +119,9 @@ class ProcessManager:
                 )
             )
         if current.status == "RUNNING":
-            self.stop(spec.name, timeout=spec.shutdown_timeout)
+            stopped = self.stop(spec.name, timeout=spec.shutdown_timeout)
+            if stopped.status != "STOPPED":
+                return stopped
         log_path = self.logs_dir / f"{_safe_name(spec.name)}.log"
         lock_path = self.runtime_dir / f"{_safe_name(spec.name)}.lock"
         try:
@@ -152,7 +168,11 @@ class ProcessManager:
                 _process_identity(int(process.pid)),
                 spec.command,
                 spec.name,
+                runtime_identity=spec.runtime_identity,
+                instance_id=spec.instance_id,
             ),
+            identity_status="VERIFIED",
+            ownership=spec.ownership,
             _process=process,
         )
         if process.poll() is not None:
@@ -168,6 +188,20 @@ class ProcessManager:
     def stop(self, name: str, *, timeout: float = 10.0) -> ProcessState:
         state = self.health(name)
         process = state._process
+        if state.status == "RUNNING" and state.ownership != CodexProcessOwnership.SUPERVISOR_MANAGED:
+            state.status = "UNKNOWN"
+            state.technical_detail = (
+                "destructive lifecycle refused because process ownership is not "
+                "SUPERVISOR_MANAGED"
+            )
+            return self._record(state)
+        if state.status == "RUNNING" and process is None:
+            state.status = "UNKNOWN"
+            state.technical_detail = (
+                "destructive lifecycle refused because the verified persisted process "
+                "has no owned process handle"
+            )
+            return self._record(state)
         if process is None or state.status != "RUNNING":
             if state.status in {"CRASHED", "STALE"}:
                 self._lock_path(name).unlink(missing_ok=True)
@@ -307,6 +341,11 @@ class ProcessManager:
                 if isinstance(item.get("identity_status"), str)
                 else None
             ),
+            ownership=(
+                CodexProcessOwnership(item["ownership"])
+                if item.get("ownership") in {member.value for member in CodexProcessOwnership}
+                else CodexProcessOwnership.UNKNOWN
+            ),
         )
         self._processes[name] = state
         return state
@@ -387,7 +426,20 @@ def _process_identity(pid: int) -> dict[str, Any] | None:
         started_at = int(fields[21])
     except (OSError, ValueError, IndexError):
         return None
-    return {"executable": executable, "started_at": started_at}
+    try:
+        parent_pid = int(fields[3])
+        command_line = (proc_root / "cmdline").read_bytes().replace(b"\x00", b"\x1f")
+    except (OSError, ValueError, IndexError):
+        parent_pid = None
+        command_line = b""
+    return {
+        "executable": executable,
+        "started_at": started_at,
+        "parent_pid": parent_pid,
+        "command_fingerprint": hashlib.sha256(command_line).hexdigest()
+        if command_line
+        else None,
+    }
 
 
 def _windows_process_identity(pid: int) -> dict[str, Any] | None:
@@ -441,9 +493,52 @@ def _windows_process_identity(pid: int) -> dict[str, Any] | None:
         ):
             return None
         started_at = (created.dwHighDateTime << 32) | created.dwLowDateTime
-        return {"executable": buffer.value, "started_at": started_at}
+        supplemental = _windows_process_supplement(pid)
+        return {
+            "executable": buffer.value,
+            "started_at": started_at,
+            "parent_pid": supplemental.get("parent_pid"),
+            "command_fingerprint": supplemental.get("command_fingerprint"),
+        }
     finally:
         kernel32.CloseHandle(handle)
+
+
+def _windows_process_supplement(pid: int) -> dict[str, Any]:
+    """Read parent/command identity without retaining or logging command text."""
+
+    script = (
+        "$p=Get-CimInstance Win32_Process -Filter \"ProcessId="
+        + str(pid)
+        + "\" -ErrorAction SilentlyContinue;"
+        "if($null -ne $p){[pscustomobject]@{ParentProcessId=$p.ParentProcessId;"
+        "CommandLine=$p.CommandLine}|ConvertTo-Json -Compress}"
+    )
+    try:
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        payload = json.loads(completed.stdout) if completed.returncode == 0 and completed.stdout else {}
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return {}
+    command_line = payload.get("CommandLine")
+    return {
+        "parent_pid": (
+            int(payload["ParentProcessId"])
+            if isinstance(payload.get("ParentProcessId"), int)
+            else None
+        ),
+        "command_fingerprint": (
+            hashlib.sha256(command_line.encode("utf-8")).hexdigest()
+            if isinstance(command_line, str) and command_line
+            else None
+        ),
+    }
 
 
 def _same_process_identity(
@@ -465,9 +560,12 @@ def _same_process_identity(
         and expected_started_at == current_started_at
         and (
             not isinstance(expected.get("command_fingerprint"), str)
-            or not isinstance(current.get("command_fingerprint"), str)
-            or expected["command_fingerprint"] == current["command_fingerprint"]
+            or (
+                isinstance(current.get("command_fingerprint"), str)
+                and expected["command_fingerprint"] == current["command_fingerprint"]
+            )
         )
+        and expected.get("parent_pid") == current.get("parent_pid")
     )
 
 
@@ -475,13 +573,21 @@ def _augment_process_identity(
     identity: dict[str, Any] | None,
     command: Sequence[str],
     managed_name: str,
+    *,
+    runtime_identity: str | None = None,
+    instance_id: str | None = None,
 ) -> dict[str, Any] | None:
     if identity is None:
         return None
+    parent_pid = identity.get("parent_pid")
+    parent_identity = _process_identity(parent_pid) if isinstance(parent_pid, int) else None
     return {
         **identity,
-        "command_fingerprint": _command_fingerprint(command),
+        "launch_command_fingerprint": _command_fingerprint(command),
         "managed_instance": managed_name,
+        "parent_process_identity": parent_identity,
+        "runtime_identity": runtime_identity,
+        "instance_id": instance_id,
     }
 
 

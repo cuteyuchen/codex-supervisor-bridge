@@ -65,6 +65,12 @@ class RuntimeResolver:
                 missing.append(name)
             else:
                 statuses.append(probe.status)
+                if (
+                    name == "local_codex_bridge"
+                    and not probe.capabilities.get("supports_isolated_runtime", False)
+                ):
+                    statuses.append(BackendHealthStatus.UNAVAILABLE)
+                    missing.append("local_codex_bridge:isolation")
         combined = max(statuses, key=lambda status: _STATUS_RANK[status])
         return combined, missing
 

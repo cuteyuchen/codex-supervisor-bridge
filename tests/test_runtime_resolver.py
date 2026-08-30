@@ -14,6 +14,9 @@ def _health(
         status=status,
         user_message=f"{capability} is ready.",
         repairable=status != BackendHealthStatus.READY,
+        capabilities={"supports_isolated_runtime": True}
+        if capability == "local_codex_bridge"
+        else {},
     )
 
 

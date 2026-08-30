@@ -16,6 +16,9 @@ def health(
         user_message=f"{capability} probe",
         repairable=repairable,
         technical_detail=f"technical:{capability}",
+        capabilities={"supports_isolated_runtime": True}
+        if capability in {"local-codex", "local_codex_bridge"}
+        else {},
     )
 
 

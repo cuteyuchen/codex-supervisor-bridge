@@ -15,6 +15,7 @@ from codex_supervisor_bridge.backends.models import (
     BackendHealthStatus,
 )
 from codex_supervisor_bridge.backends.workspace import WorkspaceBackend
+from codex_supervisor_bridge.bootstrap.codex_isolation import SupervisorCodexRuntimeManager
 from codex_supervisor_bridge.memory.service import MemoryService
 
 from .agent_execution import AgentExecutionCoordinator
@@ -36,6 +37,11 @@ class ProfileReadiness(BaseModel):
     workspace_status: str
     agent_status: str
     codex_status: str
+    codex_runtime_ownership: str = "UNKNOWN"
+    codex_runtime_instance_id: str | None = None
+    codex_runtime_epoch: int = 0
+    desktop_runtime_detected: bool = False
+    desktop_isolation_verified: bool = False
     recovery_outcomes: list[SessionRecoveryOutcome] = Field(default_factory=list)
     startup_blockers: list[str] = Field(default_factory=list)
     requires_user_action: bool = False
@@ -58,6 +64,8 @@ class RuntimeComposition:
     session_manager: AgentSessionManager | None = None
     checkpoint_service: CheckpointService | None = None
     codex_readiness: BackendHealth | None = None
+    codex_runtime_manager: SupervisorCodexRuntimeManager | None = None
+    requires_codex_isolation: bool = False
     delivery_backend: str = "github"
     started: bool = False
     recovery_outcomes: list[SessionRecoveryOutcome] = field(default_factory=list)
@@ -69,6 +77,8 @@ class RuntimeComposition:
         *,
         launch_command: list[str],
         env: dict[str, str] | None = None,
+        app_data_root: str | Path | None = None,
+        runtime_manager: SupervisorCodexRuntimeManager | None = None,
         workspace_factory: WorkspaceAdapterFactory | None = None,
         delivery_backend: str = "github",
     ) -> "RuntimeComposition":
@@ -79,11 +89,22 @@ class RuntimeComposition:
         if not launch_command or not launch_command[0].strip():
             raise ValueError("Local-Codex-Bridge launch command must not be empty")
 
+        base_environment = dict(env or lcb_environment(app_data_root=app_data_root))
+        if runtime_manager is None:
+            resolved_root = app_data_root or base_environment.get("CODEX_SUPERVISOR_DATA_DIR")
+            if resolved_root is None:
+                from codex_supervisor_bridge.bootstrap.paths import AppDataPaths
+
+                resolved_root = AppDataPaths.from_environment().filesystem_root
+            runtime_manager = SupervisorCodexRuntimeManager(resolved_root)
+
         def backend_factory() -> LocalCodexBridgeAgentBackend:
+            runtime_manager.prepare(base_environment)
+            wrapped_command = runtime_manager.wrapped_lcb_command(launch_command)
             return LocalCodexBridgeAgentBackend.stdio(
-                launch_command[0],
-                args=list(launch_command[1:]),
-                env=env,
+                wrapped_command[0],
+                args=list(wrapped_command[1:]),
+                env=runtime_manager.environment(base_environment),
             )
 
         session = AgentSessionManager(
@@ -92,6 +113,7 @@ class RuntimeComposition:
             profile="lightweight",
             workspace_backend="devspace",
             agent_backend="local_codex_bridge",
+            runtime_manager=runtime_manager,
         )
         coordinator = AgentExecutionCoordinator(memory, session)
         checkpoints = CheckpointService(memory, agent_backend=session)
@@ -104,6 +126,8 @@ class RuntimeComposition:
             agent_coordinator=coordinator,
             session_manager=session,
             checkpoint_service=checkpoints,
+            codex_runtime_manager=runtime_manager,
+            requires_codex_isolation=True,
             delivery_backend=delivery_backend,
         )
 
@@ -209,8 +233,25 @@ class RuntimeComposition:
         blockers = [
             f"{outcome.task_id}: {outcome.status} - {outcome.detail}"
             for outcome in recovery
-            if outcome.status == "RECONCILIATION_REQUIRED"
+            if outcome.status in {
+                "RECONCILIATION_REQUIRED",
+                "RUNTIME_RECOVERY_REQUIRED",
+            }
         ]
+        runtime_status = (
+            self.codex_runtime_manager.public_status()
+            if self.codex_runtime_manager is not None
+            else None
+        )
+        if self.requires_codex_isolation and (
+            runtime_status is None
+            or runtime_status["ownership"] != "SUPERVISOR_MANAGED"
+            or not runtime_status["isolation_verified"]
+        ):
+            blockers.append(
+                "UNSAFE_SHARED_CODEX_RUNTIME: Supervisor Codex runtime ownership/isolation "
+                "is not verified"
+            )
         status = self._combined_status(workspace_health.status, agent_health.status)
         status = self._combined_status(status, codex_health.status)
         if blockers:
@@ -223,6 +264,23 @@ class RuntimeComposition:
             workspace_status=workspace_health.status.value,
             agent_status=agent_health.status.value,
             codex_status=codex_health.status.value,
+            codex_runtime_ownership=(
+                str(runtime_status["ownership"]) if runtime_status else "UNKNOWN"
+            ),
+            codex_runtime_instance_id=(
+                str(runtime_status["instance_id"])
+                if runtime_status and runtime_status["instance_id"]
+                else None
+            ),
+            codex_runtime_epoch=(
+                int(runtime_status["runtime_epoch"]) if runtime_status else 0
+            ),
+            desktop_runtime_detected=bool(
+                runtime_status and runtime_status["desktop_runtime_detected"]
+            ),
+            desktop_isolation_verified=bool(
+                runtime_status and runtime_status["isolation_verified"]
+            ),
             recovery_outcomes=recovery,
             startup_blockers=blockers,
             requires_user_action=status != BackendHealthStatus.READY or bool(blockers),

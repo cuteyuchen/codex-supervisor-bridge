@@ -250,12 +250,6 @@ def snapshot_from_payload(
     plan = _plan_from_source(source, allow_final_result=final_result_is_plan)
     if pending:
         blockers.append(f"{len(pending)} pending Codex interaction(s)")
-    if isinstance(events, list):
-        for event in events[-20:]:
-            if isinstance(event, dict):
-                text = _string(event, "summary", "message", "text", "description")
-                if text and text not in in_progress and len(in_progress) < 20:
-                    in_progress.append(text[:300])
     return AgentSnapshot(
         status=status,
         reconciliation_required=reconciliation_required,

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -10,6 +12,7 @@ from uuid import UUID
 
 import pytest
 
+import codex_supervisor_bridge.bootstrap.lcb_runtime_proxy as lcb_runtime_proxy
 from codex_supervisor_bridge.backends.models import (
     AgentSnapshot,
     BackendHealth,
@@ -17,9 +20,11 @@ from codex_supervisor_bridge.backends.models import (
     PendingInteraction,
     PlanHandle,
     WorkspaceState,
+    WriterLeaseToken,
 )
 from codex_supervisor_bridge.bootstrap.codex_isolation import (
     CodexRuntimeMetadata,
+    LcbRuntimeIsolationUnsupportedError,
     ProcessObservation,
     RuntimeOwnershipError,
     SupervisorCodexRuntimeManager,
@@ -41,9 +46,12 @@ from codex_supervisor_bridge.memory.codex_runtime import (
     open_runtime_circuit,
     record_runtime_observation,
 )
-from codex_supervisor_bridge.memory.models import EventType, TaskPhase
+from codex_supervisor_bridge.memory.models import ActiveWriter, EventType, TaskPhase
 from codex_supervisor_bridge.memory.service import MemoryService
-from codex_supervisor_bridge.supervisor.agent_session import AgentSessionManager
+from codex_supervisor_bridge.supervisor.agent_session import (
+    AgentSessionManager,
+    AgentSessionUnavailableError,
+)
 from codex_supervisor_bridge.supervisor.runtime_resolver import RuntimeResolver
 
 
@@ -162,6 +170,14 @@ class _FakeRuntimeManager:
 
     def mark_degraded(self, code: str, detail: str) -> CodexRuntimeMetadata:
         self.degraded.append(f"{code}:{detail}")
+        self.metadata = self.metadata.model_copy(
+            update={
+                "status": "DEGRADED",
+                "isolation_verified": False,
+                "failure_code": code,
+                "technical_detail": detail,
+            }
+        )
         return self.metadata
 
     def assert_destructive_lifecycle_allowed(self) -> None:
@@ -189,8 +205,10 @@ class _FakeRuntimeManager:
 class _FakeBackend:
     def __init__(self) -> None:
         self.start_calls = 0
+        self.execution_calls = 0
         self.interrupt_calls = 0
         self.respond_calls = 0
+        self.resume_calls = 0
 
     async def __aenter__(self) -> "_FakeBackend":
         return self
@@ -210,6 +228,7 @@ class _FakeBackend:
         return PlanHandle(thread_id="thread-new", turn_id="turn-new", status="planning")
 
     async def start_execution(self, **_kwargs: Any) -> PlanHandle:
+        self.execution_calls += 1
         return PlanHandle(thread_id="thread-exec", turn_id="turn-exec", status="executing")
 
     async def get_plan_status(self, handle: PlanHandle) -> AgentSnapshot:
@@ -246,11 +265,13 @@ class _FakeBackend:
         return await self.observe(handle)
 
     async def resume(self, handle: PlanHandle) -> AgentSnapshot:
+        self.resume_calls += 1
         return await self.observe(handle)
 
 
 def test_runtime_namespace_is_unique_and_does_not_copy_auth_or_mcp_secrets(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source_home = tmp_path / "user-codex"
     source_home.mkdir()
@@ -278,6 +299,17 @@ url = "http://127.0.0.1:3000/mcp?token=secret-mcp-value"
         encoding="utf-8",
     )
     before = hashlib.sha256(source_config.read_bytes()).hexdigest()
+    parsed_payloads: list[str] = []
+    original_toml_loads = __import__("tomllib").loads
+
+    def tracked_toml_loads(payload: str) -> dict[str, Any]:
+        parsed_payloads.append(payload)
+        return original_toml_loads(payload)
+
+    monkeypatch.setattr(
+        "codex_supervisor_bridge.bootstrap.codex_isolation.tomllib.loads",
+        tracked_toml_loads,
+    )
     manager = SupervisorCodexRuntimeManager(
         tmp_path / "bridge",
         uuid_factory=lambda: UUID("00000000-0000-0000-0000-000000000001"),
@@ -298,6 +330,8 @@ url = "http://127.0.0.1:3000/mcp?token=secret-mcp-value"
     assert hashlib.sha256(source_config.read_bytes()).hexdigest() == before
     assert "secret-auth-value" not in json.dumps(manager.advanced_status())
     assert "secret-provider-value" not in json.dumps(manager.advanced_status())
+    assert "secret-provider-value" not in "\n".join(parsed_payloads)
+    assert "secret-mcp-value" not in "\n".join(parsed_payloads)
 
 
 def test_runtime_epoch_increments_and_old_namespace_is_not_reused(tmp_path: Path) -> None:
@@ -341,6 +375,84 @@ def test_runtime_metadata_namespace_cannot_pivot_after_prepare(tmp_path: Path) -
     assert manager.metadata_path == original_path
 
 
+def test_unsafe_provider_overlay_failure_remains_isolation_unsupported(tmp_path: Path) -> None:
+    source_home = tmp_path / "broken-home"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text(
+        'model_provider = "unterminated\n',
+        encoding="utf-8",
+    )
+    manager = SupervisorCodexRuntimeManager(tmp_path / "bridge")
+
+    with pytest.raises(LcbRuntimeIsolationUnsupportedError):
+        manager.prepare({"CODEX_HOME": str(source_home)})
+
+    assert manager.metadata is not None
+    assert manager.metadata.failure_code == "LCB_RUNTIME_ISOLATION_UNSUPPORTED"
+    assert manager.metadata_path.is_file()
+    with pytest.raises(LcbRuntimeIsolationUnsupportedError):
+        manager.prepare({"CODEX_HOME": str(source_home)})
+
+
+def test_provider_overlay_supports_quoted_provider_table(tmp_path: Path) -> None:
+    source_home = tmp_path / "quoted-provider-home"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text(
+        """
+model = "gpt-5.6-luna"
+model_provider = "third.party"
+
+[model_providers."third.party"]
+name = "Third Party"
+base_url = "http://127.0.0.1:3000"
+wire_api = "responses"
+env_key = "THIRD_PARTY_KEY"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    manager = SupervisorCodexRuntimeManager(tmp_path / "bridge")
+
+    metadata = manager.prepare({"CODEX_HOME": str(source_home)})
+    rendered = (Path(metadata.codex_home) / "config.toml").read_text(encoding="utf-8")
+    parsed = __import__("tomllib").loads(rendered)
+
+    assert parsed["model_provider"] == "third.party"
+    assert parsed["model_providers"]["third.party"]["env_key"] == "THIRD_PARTY_KEY"
+
+
+def test_session_start_reports_isolation_unsupported_without_starting_backend(
+    tmp_path: Path,
+) -> None:
+    source_home = tmp_path / "broken-home"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text("[broken\n", encoding="utf-8")
+    runtime_manager = SupervisorCodexRuntimeManager(tmp_path / "bridge")
+    memory = MemoryService()
+    backend_created = False
+
+    def factory() -> _FakeBackend:
+        nonlocal backend_created
+        runtime_manager.prepare({"CODEX_HOME": str(source_home)})
+        backend_created = True
+        return _FakeBackend()
+
+    session = AgentSessionManager(
+        memory,
+        factory,
+        runtime_manager=runtime_manager,
+    )
+    try:
+        asyncio.run(session.start())
+
+        assert session.connected is False
+        assert backend_created is False
+        assert session.runtime_error is not None
+        assert session.runtime_error.startswith("LCB_RUNTIME_ISOLATION_UNSUPPORTED:")
+    finally:
+        memory.close()
+
+
 def test_desktop_and_supervisor_app_server_identity_must_be_different(tmp_path: Path) -> None:
     safe = _verified_metadata(tmp_path)
     shared = _verified_metadata(tmp_path, desktop_pid=102, app_server_pid=102)
@@ -370,6 +482,126 @@ class _DummyProcess:
     def wait(self, timeout: float | None = None) -> int:
         del timeout
         return self.returncode or 0
+
+
+class _ProxyChild:
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.returncode: int | None = None
+        self.terminated = False
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = 0
+
+    def wait(self, timeout: float | None = None) -> int:
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("node", timeout)
+        return self.returncode
+
+
+def _run_proxy_startup_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    replace_child_identity: bool,
+) -> tuple[int, _ProxyChild, CodexRuntimeMetadata]:
+    token = "owned-token"
+    proxy_pid = os.getpid()
+    child_pid = proxy_pid + 1000
+    proxy = _observation(
+        proxy_pid,
+        parent_pid=99,
+        executable="python.exe",
+    )
+    child_identity = _observation(
+        child_pid,
+        parent_pid=proxy_pid,
+        executable="node.exe",
+        parent_executable="python.exe",
+    )
+    replacement_identity = child_identity.model_copy(
+        update={"creation_time": "pid-reused"}
+    )
+    metadata = CodexRuntimeMetadata(
+        instance_id="csb-codex-proxy-timeout",
+        runtime_epoch=1,
+        ownership=CodexProcessOwnership.SUPERVISOR_MANAGED,
+        ownership_token_hash=hashlib.sha256(token.encode("utf-8")).hexdigest(),
+        runtime_directory=str(tmp_path / "runtime" / "csb-codex-proxy-timeout"),
+        codex_home=str(tmp_path / "runtime" / "csb-codex-proxy-timeout" / "home"),
+        started_at="2026-08-30T00:00:00+00:00",
+        supervisor_parent_pid=99,
+    )
+    metadata_path = tmp_path / "runtime.json"
+    metadata_path.write_text(
+        json.dumps(metadata.model_dump(mode="json")),
+        encoding="utf-8",
+    )
+    child = _ProxyChild(child_pid)
+
+    class _Inspector:
+        def identity(self, pid: int) -> ProcessObservation | None:
+            if pid == proxy_pid:
+                return proxy
+            if pid == child_pid:
+                return replacement_identity if replace_child_identity else child_identity
+            return None
+
+        def snapshot(self) -> list[ProcessObservation]:
+            return [proxy, child_identity]
+
+    ticks = iter([0.0, 1.0, 16.0])
+    monkeypatch.setattr(lcb_runtime_proxy, "ProcessInspector", _Inspector)
+    monkeypatch.setattr(lcb_runtime_proxy.subprocess, "Popen", lambda *_args, **_kwargs: child)
+    monkeypatch.setattr(lcb_runtime_proxy.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(lcb_runtime_proxy.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(lcb_runtime_proxy.time, "sleep", lambda *_args: None)
+    monkeypatch.setenv(lcb_runtime_proxy.SUPERVISOR_METADATA_ENV, str(metadata_path))
+    monkeypatch.setenv(lcb_runtime_proxy.SUPERVISOR_RUNTIME_ENV, metadata.instance_id)
+    monkeypatch.setenv(lcb_runtime_proxy.SUPERVISOR_EPOCH_ENV, str(metadata.runtime_epoch))
+    monkeypatch.setenv(lcb_runtime_proxy.SUPERVISOR_TOKEN_ENV, token)
+
+    result = lcb_runtime_proxy.run(metadata_path, ["node", "bridge.js"])
+    stored = CodexRuntimeMetadata.model_validate_json(
+        metadata_path.read_text(encoding="utf-8")
+    )
+    return result, child, stored
+
+
+def test_proxy_startup_timeout_stops_only_verified_lcb_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, child, stored = _run_proxy_startup_timeout(
+        tmp_path,
+        monkeypatch,
+        replace_child_identity=False,
+    )
+
+    assert result == 7
+    assert child.terminated is True
+    assert stored.failure_code == "SUPERVISOR_CODEX_RUNTIME_FAILED"
+    assert stored.status == "DEGRADED"
+
+
+def test_proxy_startup_timeout_refuses_pid_reused_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, child, stored = _run_proxy_startup_timeout(
+        tmp_path,
+        monkeypatch,
+        replace_child_identity=True,
+    )
+
+    assert result == 7
+    assert child.terminated is False
+    assert stored.failure_code == "CODEX_RUNTIME_OWNERSHIP_UNKNOWN"
+    assert stored.status == "DEGRADED"
 
 
 @pytest.mark.parametrize(
@@ -553,6 +785,111 @@ def test_plan_without_semantic_progress_opens_circuit_and_blocks_retries(tmp_pat
         memory.close()
 
 
+def test_open_circuit_blocks_execution_and_resume(tmp_path: Path) -> None:
+    memory = MemoryService()
+    backend = _FakeBackend()
+    try:
+        handle = _bind_verified_runtime(memory, "CIRCUIT-CONTROL")
+        open_runtime_circuit(
+            memory.store,
+            "CIRCUIT-CONTROL",
+            reason="CODEX_TURN_STALLED",
+            remote_status="CODEX_TURN_STALLED",
+            recovery_required=False,
+        )
+        session = AgentSessionManager(
+            memory,
+            lambda: backend,
+            runtime_manager=_FakeRuntimeManager(
+                _verified_metadata(tmp_path, instance_id="csb-codex-one")
+            ),  # type: ignore[arg-type]
+        )
+        session._backend = backend
+        workspace = WorkspaceState(
+            workspace_id="ws",
+            repository="C:/repo",
+            root="C:/repo",
+        )
+        lease = WriterLeaseToken(
+            task_id="CIRCUIT-CONTROL",
+            writer=ActiveWriter.CODEX,
+            writer_epoch=1,
+            task_revision=1,
+        )
+
+        with pytest.raises(CodexRuntimeCircuitOpenError):
+            asyncio.run(
+                session.start_execution(
+                    task_id="CIRCUIT-CONTROL",
+                    context_pack="context",
+                    approved_plan="approved",
+                    workspace=workspace,
+                    lease=lease,
+                )
+            )
+        with pytest.raises(CodexRuntimeCircuitOpenError):
+            asyncio.run(session.resume(handle))
+
+        assert backend.execution_calls == 0
+        assert backend.resume_calls == 0
+    finally:
+        memory.close()
+
+
+def test_lcb_restart_never_resumes_thread_from_another_runtime_instance(
+    tmp_path: Path,
+) -> None:
+    memory = MemoryService()
+    backend = _FakeBackend()
+    try:
+        _bind_verified_runtime(memory, "RECONNECT-AFFINITY")
+        session = AgentSessionManager(
+            memory,
+            lambda: backend,
+            runtime_manager=_FakeRuntimeManager(
+                _verified_metadata(
+                    tmp_path,
+                    instance_id="csb-codex-new",
+                    epoch=2,
+                )
+            ),  # type: ignore[arg-type]
+        )
+
+        outcomes = asyncio.run(session.start())
+
+        assert outcomes[0].task_id == "RECONNECT-AFFINITY"
+        assert outcomes[0].status == "RECONCILIATION_REQUIRED"
+        assert "instance/epoch" in outcomes[0].detail
+        assert backend.resume_calls == 0
+        asyncio.run(session.shutdown())
+    finally:
+        memory.close()
+
+
+def test_unexpected_runtime_result_opens_reconciliation_circuit() -> None:
+    memory = MemoryService()
+    try:
+        handle = _bind_verified_runtime(memory, "UNEXPECTED")
+        snapshot = AgentSnapshot(
+            status="UNKNOWN",
+            reconciliation_required=True,
+            thread_id=handle.thread_id,
+            turn_id=handle.turn_id,
+            runtime_instance_id=handle.runtime_instance_id,
+            runtime_epoch=handle.runtime_epoch,
+            runtime_ownership="SUPERVISOR_MANAGED",
+            isolation_verified=True,
+        )
+
+        runtime = record_runtime_observation(memory.store, "UNEXPECTED", snapshot)
+
+        assert runtime.circuit_state == "RECOVERY_REQUIRED"
+        assert runtime.circuit_reason == "CODEX_RUNTIME_RECONCILIATION_REQUIRED"
+        assert runtime.next_action == "RUNTIME_RECOVERY_REQUIRED"
+    finally:
+        memory.close()
+
+
 def test_lcb_without_isolation_capability_uses_control_plane_only_for_unbound_task() -> None:
     health = {
         "devspace": BackendHealth(
@@ -688,6 +1025,120 @@ def test_interrupt_unknown_outcome_opens_circuit_and_never_retries(tmp_path: Pat
         with pytest.raises(CodexRuntimeCircuitOpenError):
             asyncio.run(session.interrupt(handle))
         assert backend.interrupt_calls == 1
+    finally:
+        memory.close()
+
+
+def test_lcb_session_loss_on_pending_request_opens_disconnect_circuit(tmp_path: Path) -> None:
+    class _DisconnectedBackend(_FakeBackend):
+        async def list_pending_interactions(
+            self,
+            _handle: PlanHandle,
+        ) -> list[PendingInteraction]:
+            raise BrokenPipeError("closed stdio")
+
+    memory = MemoryService()
+    try:
+        handle = _bind_verified_runtime(memory, "SESSION-LOST")
+        backend = _DisconnectedBackend()
+        runtime_manager = _FakeRuntimeManager(
+            _verified_metadata(tmp_path, instance_id="csb-codex-one")
+        )
+        session = AgentSessionManager(
+            memory,
+            lambda: backend,
+            runtime_manager=runtime_manager,  # type: ignore[arg-type]
+        )
+        session._backend = backend
+
+        with pytest.raises(BrokenPipeError):
+            asyncio.run(session.list_pending_interactions(handle))
+
+        runtime = get_codex_runtime(memory.store, "SESSION-LOST")
+        assert runtime is not None
+        assert runtime.circuit_state == "RECOVERY_REQUIRED"
+        assert runtime.circuit_reason == "CODEX_APP_SERVER_DISCONNECTED"
+        assert runtime_manager.degraded == ["CODEX_APP_SERVER_DISCONNECTED:BrokenPipeError"]
+    finally:
+        memory.close()
+
+
+def test_profile_b_health_probe_reuses_one_persistent_runtime_session(tmp_path: Path) -> None:
+    memory = MemoryService()
+    created: list[_FakeBackend] = []
+
+    def factory() -> _FakeBackend:
+        backend = _FakeBackend()
+        created.append(backend)
+        return backend
+
+    session = AgentSessionManager(
+        memory,
+        factory,
+        runtime_manager=_FakeRuntimeManager(_verified_metadata(tmp_path)),  # type: ignore[arg-type]
+    )
+
+    async def scenario() -> None:
+        first = await session.probe_health()
+        second = await session.probe_health()
+        assert first.status == BackendHealthStatus.READY
+        assert second.status == BackendHealthStatus.READY
+        assert session.session_count == 1
+        assert len(created) == 1
+        await session.shutdown()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        memory.close()
+
+
+def test_first_plan_disconnect_degrades_runtime_and_blocks_retry(tmp_path: Path) -> None:
+    class _DisconnectedStartBackend(_FakeBackend):
+        async def start_plan(self, **_kwargs: Any) -> PlanHandle:
+            self.start_calls += 1
+            raise BrokenPipeError("closed stdio")
+
+    memory = MemoryService()
+    backend = _DisconnectedStartBackend()
+    manager = _FakeRuntimeManager(_verified_metadata(tmp_path))
+    try:
+        memory.create_task("FIRST-DISCONNECT", "first plan", repository="C:/repo")
+        session = AgentSessionManager(
+            memory,
+            lambda: backend,
+            runtime_manager=manager,  # type: ignore[arg-type]
+        )
+        workspace = WorkspaceState(
+            workspace_id="ws",
+            repository="C:/repo",
+            root="C:/repo",
+        )
+
+        with pytest.raises(BrokenPipeError):
+            asyncio.run(
+                session.start_plan(
+                    task_id="FIRST-DISCONNECT",
+                    context_pack="context",
+                    workspace=workspace,
+                )
+            )
+
+        assert get_codex_runtime(memory.store, "FIRST-DISCONNECT") is None
+        assert manager.metadata.status == "DEGRADED"
+        assert manager.metadata.failure_code == "CODEX_APP_SERVER_DISCONNECTED"
+        assert session.runtime_error == "CODEX_APP_SERVER_DISCONNECTED: BrokenPipeError"
+
+        with pytest.raises(AgentSessionUnavailableError, match="CODEX_APP_SERVER_DISCONNECTED"):
+            asyncio.run(
+                session.start_plan(
+                    task_id="FIRST-DISCONNECT",
+                    context_pack="context",
+                    workspace=workspace,
+                )
+            )
+        assert backend.start_calls == 1
+        asyncio.run(session.shutdown())
     finally:
         memory.close()
 

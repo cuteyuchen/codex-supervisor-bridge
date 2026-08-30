@@ -339,11 +339,17 @@ class LocalCodexBridgeAgentBackend:
 
     async def __aenter__(self) -> "LocalCodexBridgeAgentBackend":
         if self._client is None:
-            self._client = self._client_factory() if self._client_factory else Client(self.target)
+            client = self._client_factory() if self._client_factory else Client(self.target)
+            self._client = client
             try:
-                await self._client.__aenter__()
+                await client.__aenter__()
             except Exception as exc:
-                self._client = None
+                try:
+                    await client.__aexit__(type(exc), exc, exc.__traceback__)
+                except Exception:
+                    pass
+                finally:
+                    self._client = None
                 raise LocalCodexBridgeUnavailableError() from exc
         return self
 

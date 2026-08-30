@@ -601,6 +601,14 @@ def record_runtime_observation(
         pending = list(getattr(snapshot, "pending_interactions", []) or [])
         plan = getattr(snapshot, "plan", None)
         active = status.strip().lower() in ACTIVE_RUNTIME_STATUSES
+        unexpected = bool(getattr(snapshot, "reconciliation_required", False)) or (
+            status.strip().lower()
+            in {
+                "unknown",
+                "reconciliation_required",
+                "compensation_required",
+            }
+        )
         stalled = (
             active
             and plan is None
@@ -613,7 +621,18 @@ def record_runtime_observation(
         circuit_reason = runtime.circuit_reason
         next_action = runtime.next_action
         stored_status = status
-        if stalled:
+        if unexpected:
+            circuit_state = CodexRuntimeCircuitState.RECOVERY_REQUIRED.value
+            circuit_reason = "CODEX_RUNTIME_RECONCILIATION_REQUIRED"
+            next_action = "RUNTIME_RECOVERY_REQUIRED"
+            logger.warning(
+                "unexpected runtime result task_id=%s instance_id=%s epoch=%s status=%s",
+                task_id,
+                runtime.runtime_instance_id,
+                runtime.runtime_epoch,
+                status,
+            )
+        elif stalled:
             circuit_state = CodexRuntimeCircuitState.OPEN.value
             circuit_reason = "CODEX_TURN_STALLED"
             next_action = "USER_ACTION_REQUIRED"

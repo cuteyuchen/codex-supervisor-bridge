@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
 from mcp.server import MCPServer
 
 from codex_supervisor_bridge.backends.models import (
@@ -12,6 +13,9 @@ from codex_supervisor_bridge.backends.models import (
 )
 from codex_supervisor_bridge.integrations.local_codex_bridge_client import (
     LocalCodexBridgeAgentBackend,
+)
+from codex_supervisor_bridge.integrations.local_codex_bridge_errors import (
+    LocalCodexBridgeUnavailableError,
 )
 from codex_supervisor_bridge.memory.models import ActiveWriter
 
@@ -188,3 +192,27 @@ def test_unknown_outcome_handle_is_explicit_and_not_failed() -> None:
     assert handle.status == "UNKNOWN"
     assert handle.reconciliation_required is True
     assert "retry" in (handle.message or "")
+
+
+def test_stdio_client_enter_failure_attempts_child_cleanup() -> None:
+    class _FailingClient:
+        def __init__(self) -> None:
+            self.exit_calls = 0
+
+        async def __aenter__(self) -> None:
+            raise RuntimeError("initialize failed")
+
+        async def __aexit__(self, *_args: object) -> None:
+            self.exit_calls += 1
+
+    client = _FailingClient()
+    backend = LocalCodexBridgeAgentBackend(
+        object(),
+        client_factory=lambda: client,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(LocalCodexBridgeUnavailableError):
+        asyncio.run(backend.__aenter__())
+
+    assert client.exit_calls == 1
+    assert backend._client is None

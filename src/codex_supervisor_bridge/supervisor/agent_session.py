@@ -115,6 +115,7 @@ class AgentSessionManager:
             raise AgentSessionUnavailableError(
                 self.runtime_error or "Agent session is not connected"
             )
+        self._assert_runtime_ready_for_control()
 
     async def start(self) -> list[SessionRecoveryOutcome]:
         async with self._lock:
@@ -122,17 +123,19 @@ class AgentSessionManager:
                 return list(self.recovery_outcomes)
             if self.runtime_error is not None:
                 return list(self.recovery_outcomes)
-            backend = self._backend_factory()
-            enter = getattr(backend, "__aenter__", None)
+            backend: AgentBackend | None = None
+            enter = None
             entered = False
             try:
+                backend = self._backend_factory()
+                enter = getattr(backend, "__aenter__", None)
                 if enter is not None:
                     await enter()
                     entered = True
                 if self.runtime_manager is not None:
                     self.runtime_manager.wait_until_verified()
             except Exception as exc:
-                if entered:
+                if entered and backend is not None:
                     exit_method = getattr(backend, "__aexit__", None)
                     if exit_method is not None:
                         try:
@@ -140,15 +143,23 @@ class AgentSessionManager:
                         except Exception:
                             pass
                 if self.runtime_manager is not None:
-                    self.runtime_manager.mark_degraded(
-                        "SUPERVISOR_CODEX_RUNTIME_FAILED",
-                        type(exc).__name__,
+                    metadata = self.runtime_manager.metadata
+                    if metadata is None or metadata.failure_code is None:
+                        try:
+                            metadata = self.runtime_manager.mark_degraded(
+                                "SUPERVISOR_CODEX_RUNTIME_FAILED",
+                                type(exc).__name__,
+                            )
+                        except CodexRuntimeIsolationError:
+                            metadata = None
+                    self.runtime_error = (
+                        f"{metadata.failure_code if metadata and metadata.failure_code else 'SUPERVISOR_CODEX_RUNTIME_FAILED'}: "
+                        "isolated Codex runtime could not be started safely"
                     )
-                self.runtime_error = (
-                    "SUPERVISOR_CODEX_RUNTIME_FAILED: isolated Codex runtime "
-                    "ownership could not be verified"
-                )
-                return list(self.recovery_outcomes)
+                    return list(self.recovery_outcomes)
+                raise
+            if backend is None:
+                raise AgentSessionUnavailableError("Agent session backend was not created")
             self._backend = backend
             self.session_count += 1
             self.runtime_error = None
@@ -256,7 +267,14 @@ class AgentSessionManager:
                     status=BackendHealthStatus.UNAVAILABLE,
                     user_message="Codex needs runtime recovery.",
                     repairable=True,
-                    technical_detail="UNSAFE_SHARED_CODEX_RUNTIME or ownership unknown",
+                    technical_detail=(
+                        self.runtime_error
+                        or (
+                            f"{metadata.failure_code}: {metadata.technical_detail or 'runtime is not verified'}"
+                            if metadata is not None and metadata.failure_code
+                            else "UNSAFE_SHARED_CODEX_RUNTIME or ownership unknown"
+                        )
+                    ),
                 )
         try:
             return await backend.health()
@@ -271,6 +289,8 @@ class AgentSessionManager:
 
     async def probe_health(self) -> BackendHealth:
         """Bounded ephemeral protocol probe without holding the live session."""
+        if self.runtime_manager is not None:
+            return await self.health()
         backend = self._backend_factory()
         enter = getattr(backend, "__aenter__", None)
         if enter is not None:
@@ -293,11 +313,15 @@ class AgentSessionManager:
             existing = get_codex_runtime(self.memory.store, task_id)
             if existing is not None:
                 assert_runtime_circuit_closed(existing)
-        handle = await self.backend.start_plan(
-            task_id=task_id,
-            context_pack=context_pack,
-            workspace=workspace,
-        )
+        try:
+            handle = await self.backend.start_plan(
+                task_id=task_id,
+                context_pack=context_pack,
+                workspace=workspace,
+            )
+        except Exception as exc:
+            self._mark_runtime_disconnected(task_id, exc)
+            raise
         stamped = self._stamp_handle(handle, task_id=task_id)
         logger.info(
             "turn started task_id=%s mode=plan instance_id=%s epoch=%s",
@@ -322,13 +346,18 @@ class AgentSessionManager:
         await self._ensure_started()
         if self.runtime_manager is not None:
             self._assert_handle_runtime(handle=None, task_id=task_id, require_existing=True)
-        handle = await self.backend.start_execution(
-            task_id=task_id,
-            context_pack=context_pack,
-            approved_plan=approved_plan,
-            workspace=workspace,
-            lease=lease,
-        )
+            assert_runtime_circuit_closed(self._required_runtime(task_id))
+        try:
+            handle = await self.backend.start_execution(
+                task_id=task_id,
+                context_pack=context_pack,
+                approved_plan=approved_plan,
+                workspace=workspace,
+                lease=lease,
+            )
+        except Exception as exc:
+            self._mark_runtime_disconnected(task_id, exc)
+            raise
         stamped = self._stamp_handle(handle, task_id=task_id)
         logger.info(
             "turn started task_id=%s mode=execute instance_id=%s epoch=%s",
@@ -396,7 +425,12 @@ class AgentSessionManager:
             assert_runtime_circuit_closed(
                 self._required_runtime(handle.task_id)
             )
-        return await self.backend.steer(handle, instruction, lease=lease)
+        try:
+            return await self.backend.steer(handle, instruction, lease=lease)
+        except Exception as exc:
+            if handle.task_id:
+                self._mark_runtime_disconnected(handle.task_id, exc)
+            raise
 
     async def interrupt(self, handle: PlanHandle) -> Any:
         await self._ensure_started()
@@ -458,6 +492,12 @@ class AgentSessionManager:
     ) -> list[PendingInteraction]:
         await self._ensure_started()
         self._assert_handle_runtime(handle)
+        try:
+            pending = await self.backend.list_pending_interactions(handle)
+        except Exception as exc:
+            if handle.task_id:
+                self._mark_runtime_disconnected(handle.task_id, exc)
+            raise
         return [
             item.model_copy(
                 update={
@@ -465,7 +505,7 @@ class AgentSessionManager:
                     "runtime_epoch": handle.runtime_epoch,
                 }
             )
-            for item in await self.backend.list_pending_interactions(handle)
+            for item in pending
         ]
 
     async def respond_interaction(
@@ -485,12 +525,60 @@ class AgentSessionManager:
             )
         if handle.task_id and self.runtime_manager is not None:
             assert_runtime_circuit_closed(self._required_runtime(handle.task_id))
-        return await self.backend.respond_interaction(handle, interaction, response)
+        try:
+            return await self.backend.respond_interaction(handle, interaction, response)
+        except Exception as exc:
+            if handle.task_id:
+                self._mark_runtime_disconnected(handle.task_id, exc)
+            raise
 
     async def resume(self, handle: PlanHandle) -> Any:
         await self._ensure_started()
         self._assert_handle_runtime(handle)
-        return self._stamp_snapshot(await self.backend.resume(handle), handle)
+        if handle.task_id and self.runtime_manager is not None:
+            assert_runtime_circuit_closed(self._required_runtime(handle.task_id))
+        try:
+            snapshot = await self.backend.resume(handle)
+        except Exception as exc:
+            if handle.task_id:
+                self._mark_runtime_disconnected(handle.task_id, exc)
+            raise
+        return self._stamp_snapshot(snapshot, handle)
+
+    def _mark_runtime_disconnected(self, task_id: str, exc: Exception) -> None:
+        if self.runtime_manager is None:
+            return
+        self.runtime_error = f"CODEX_APP_SERVER_DISCONNECTED: {type(exc).__name__}"
+        if get_codex_runtime(self.memory.store, task_id) is not None:
+            open_runtime_circuit(
+                self.memory.store,
+                task_id,
+                reason="CODEX_APP_SERVER_DISCONNECTED",
+                remote_status="CODEX_APP_SERVER_DISCONNECTED",
+            )
+        try:
+            self.runtime_manager.mark_degraded(
+                "CODEX_APP_SERVER_DISCONNECTED",
+                type(exc).__name__,
+            )
+        except CodexRuntimeIsolationError:
+            pass
+
+    def _assert_runtime_ready_for_control(self) -> None:
+        if self.runtime_manager is None:
+            return
+        try:
+            metadata = self.runtime_manager.refresh()
+        except CodexRuntimeIsolationError as exc:
+            self.runtime_error = (
+                f"CODEX_RUNTIME_OWNERSHIP_UNKNOWN: {type(exc).__name__}"
+            )
+            raise AgentSessionUnavailableError(self.runtime_error) from exc
+        if metadata.status == "READY" and metadata.isolation_verified:
+            return
+        code = metadata.failure_code or "SUPERVISOR_CODEX_RUNTIME_FAILED"
+        self.runtime_error = f"{code}: Supervisor Codex runtime is not verified READY"
+        raise AgentSessionUnavailableError(self.runtime_error)
 
     def _required_runtime(self, task_id: str) -> CodexRuntimeState:
         runtime = get_codex_runtime(self.memory.store, task_id)

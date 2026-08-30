@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -128,13 +129,34 @@ class ProcessInspector:
     def _windows_snapshot() -> list[ProcessObservation]:
         script = r"""
 $items = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object {
+  $commandLine = [string]$_.CommandLine
+  $commandHash = ''
+  if ($commandLine) {
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+      $bytes = [System.Text.Encoding]::UTF8.GetBytes($commandLine)
+      $commandHash = -join ($sha256.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') })
+    } finally {
+      $sha256.Dispose()
+    }
+  }
+  $executableName = if ($_.ExecutablePath) {
+    [System.IO.Path]::GetFileName([string]$_.ExecutablePath)
+  } else {
+    [string]$_.Name
+  }
   [pscustomobject]@{
     ProcessId = [int]$_.ProcessId
     ParentProcessId = [int]$_.ParentProcessId
     CreationDate = if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('o') } else { '' }
     ExecutablePath = [string]$_.ExecutablePath
     Name = [string]$_.Name
-    CommandLine = [string]$_.CommandLine
+    CommandLineFingerprint = $commandHash
+    AppServerStdio = (
+      $executableName -in @('codex', 'codex.exe') -and
+      $commandLine -match 'app-server' -and
+      $commandLine -match 'stdio://'
+    )
   }
 }
 $items | ConvertTo-Json -Compress
@@ -162,7 +184,12 @@ $items | ConvertTo-Json -Compress
             if not isinstance(row, dict) or not isinstance(row.get("ProcessId"), int):
                 continue
             parent = parents.get(row.get("ParentProcessId"))
-            command = row.get("CommandLine") if isinstance(row.get("CommandLine"), str) else ""
+            command_fingerprint = (
+                row.get("CommandLineFingerprint")
+                if isinstance(row.get("CommandLineFingerprint"), str)
+                and row.get("CommandLineFingerprint")
+                else None
+            )
             executable = (
                 row.get("ExecutablePath")
                 if isinstance(row.get("ExecutablePath"), str) and row.get("ExecutablePath")
@@ -173,7 +200,7 @@ $items | ConvertTo-Json -Compress
                     pid=row["ProcessId"],
                     creation_time=str(row.get("CreationDate") or "unknown"),
                     executable=executable,
-                    command_line_fingerprint=_fingerprint(command) if command else None,
+                    command_line_fingerprint=command_fingerprint,
                     parent_pid=row.get("ParentProcessId")
                     if isinstance(row.get("ParentProcessId"), int)
                     else None,
@@ -185,7 +212,7 @@ $items | ConvertTo-Json -Compress
                         if parent
                         else None
                     ),
-                    app_server_stdio=_is_stdio_app_server(executable, command),
+                    app_server_stdio=bool(row.get("AppServerStdio")),
                 )
             )
         return result
@@ -281,6 +308,10 @@ class SupervisorCodexRuntimeManager:
 
     def prepare(self, base_environment: Mapping[str, str] | None = None) -> CodexRuntimeMetadata:
         if self.metadata is not None:
+            if self.metadata.failure_code == "LCB_RUNTIME_ISOLATION_UNSUPPORTED":
+                raise LcbRuntimeIsolationUnsupportedError(
+                    "LCB_RUNTIME_ISOLATION_UNSUPPORTED: safe runtime preparation failed"
+                )
             return self.metadata
         environment = dict(os.environ if base_environment is None else base_environment)
         self.runtime_root.mkdir(parents=True, exist_ok=True)
@@ -304,7 +335,19 @@ class SupervisorCodexRuntimeManager:
         )
         self.metadata = metadata
         source_home = _source_codex_home(environment)
-        self._seed_compatibility_layer(source_home, codex_home)
+        try:
+            self._seed_compatibility_layer(source_home, codex_home)
+        except LcbRuntimeIsolationUnsupportedError:
+            self.metadata = metadata.model_copy(
+                update={
+                    "status": "DEGRADED",
+                    "isolation_verified": False,
+                    "failure_code": "LCB_RUNTIME_ISOLATION_UNSUPPORTED",
+                    "technical_detail": "safe provider compatibility overlay failed",
+                }
+            )
+            self._write_metadata(self.metadata)
+            raise
         self._write_metadata(metadata)
         logger.info(
             "runtime instance created instance_id=%s epoch=%s",
@@ -520,8 +563,7 @@ class SupervisorCodexRuntimeManager:
         source_config = source_home / "config.toml"
         if source_config.is_file():
             try:
-                config = tomllib.loads(source_config.read_text(encoding="utf-8"))
-                rendered = _render_safe_codex_config(config)
+                rendered = _render_safe_codex_config_file(source_config)
             except (OSError, UnicodeError, tomllib.TOMLDecodeError, ValueError) as exc:
                 raise LcbRuntimeIsolationUnsupportedError(
                     "LCB_RUNTIME_ISOLATION_UNSUPPORTED: safe provider config overlay "
@@ -669,52 +711,108 @@ def _same_executable(left: str | None, right: str | None) -> bool:
     return os.path.normcase(left) == os.path.normcase(right)
 
 
-def _render_safe_codex_config(config: Mapping[str, Any]) -> str:
-    """Create a provider-only overlay and intentionally omit MCP/session settings."""
+def _render_safe_codex_config_file(source: Path) -> str:
+    """Parse only allowlisted provider fields, never secret-bearing sections."""
 
-    allowed_root = {
-        "model",
-        "model_provider",
-        "model_reasoning_effort",
-        "model_reasoning_summary",
-        "model_verbosity",
-        "service_tier",
-        "web_search",
-    }
-    allowed_provider = {
-        "name",
-        "base_url",
-        "wire_api",
-        "requires_openai_auth",
-        "requires_openai_account",
-        "env_key",
-        "request_max_retries",
-        "stream_max_retries",
-        "stream_idle_timeout_ms",
-    }
-    output: list[str] = []
-    for key in sorted(allowed_root):
-        if key in config:
-            output.append(f"{key} = {_toml_value(config[key])}")
-    providers = config.get("model_providers")
-    if isinstance(providers, Mapping):
-        for provider_name, provider in providers.items():
-            if not isinstance(provider_name, str) or not isinstance(provider, Mapping):
+    allowed_root = frozenset(
+        {
+            "model",
+            "model_provider",
+            "model_reasoning_effort",
+            "model_reasoning_summary",
+            "model_verbosity",
+            "service_tier",
+            "web_search",
+        }
+    )
+    allowed_provider = frozenset(
+        {
+            "name",
+            "base_url",
+            "wire_api",
+            "requires_openai_auth",
+            "requires_openai_account",
+            "env_key",
+            "request_max_retries",
+            "stream_max_retries",
+            "stream_idle_timeout_ms",
+        }
+    )
+    root_values: dict[str, Any] = {}
+    provider_values: dict[str, dict[str, Any]] = {}
+    section: tuple[str, str | None] = ("root", None)
+    with source.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
                 continue
-            output.append("")
-            output.append(f"[model_providers.{_toml_key(provider_name)}]")
-            for key in sorted(allowed_provider):
-                if key not in provider:
-                    continue
-                value = _safe_provider_value(key, provider[key])
-                output.append(f"{key} = {_toml_value(value)}")
+            if stripped.startswith("["):
+                provider_name = _provider_section_name(stripped)
+                section = (
+                    ("provider", provider_name)
+                    if provider_name is not None
+                    else ("ignored", None)
+                )
+                continue
+            key = _bare_assignment_key(raw_line)
+            if key is None:
+                continue
+            if section[0] == "root" and key in allowed_root:
+                root_values[key] = _parse_single_assignment(raw_line, key)
+            elif section[0] == "provider" and key in allowed_provider:
+                provider_name = section[1]
+                if provider_name is None:
+                    raise ValueError("provider section identity is missing")
+                value = _parse_single_assignment(raw_line, key)
+                provider_values.setdefault(provider_name, {})[key] = _safe_provider_value(
+                    key,
+                    value,
+                )
+
+    output: list[str] = []
+    for key in sorted(root_values):
+        output.append(f"{key} = {_toml_value(root_values[key])}")
+    for provider_name in sorted(provider_values):
+        output.append("")
+        output.append(f"[model_providers.{_toml_key(provider_name)}]")
+        for key in sorted(provider_values[provider_name]):
+            output.append(f"{key} = {_toml_value(provider_values[provider_name][key])}")
     if not output:
         return "# Supervisor runtime provider overlay intentionally contains no user MCP state.\n"
     return "\n".join(output).rstrip() + "\n"
 
 
+def _bare_assignment_key(line: str) -> str | None:
+    match = re.match(r"^\s*([A-Za-z0-9_-]+)\s*=", line)
+    return match.group(1) if match else None
+
+
+def _parse_single_assignment(line: str, expected_key: str) -> Any:
+    parsed = tomllib.loads(line)
+    if set(parsed) != {expected_key}:
+        raise ValueError(f"invalid allowlisted Codex config field: {expected_key}")
+    return parsed[expected_key]
+
+
+def _provider_section_name(line: str) -> str | None:
+    parsed = tomllib.loads(f"{line}\n__csb_probe = true\n")
+    providers = parsed.get("model_providers")
+    if providers is None:
+        return None
+    if not isinstance(providers, Mapping) or len(providers) != 1:
+        return None
+    provider_name, provider = next(iter(providers.items()))
+    if (
+        not isinstance(provider_name, str)
+        or not isinstance(provider, Mapping)
+        or provider.get("__csb_probe") is not True
+    ):
+        return None
+    return provider_name
+
+
 def _toml_key(value: str) -> str:
-    if value.replace("-", "").replace("_", "").isalnum():
+    if re.fullmatch(r"[A-Za-z0-9_-]+", value):
         return value
     return json.dumps(value, ensure_ascii=False)
 

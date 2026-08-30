@@ -83,6 +83,22 @@ def _same_parent_identity(
     )
 
 
+def _same_process_identity(
+    expected: ProcessObservation,
+    current: ProcessObservation,
+) -> bool:
+    return bool(
+        expected.pid == current.pid
+        and expected.creation_time == current.creation_time
+        and os.path.normcase(expected.executable) == os.path.normcase(current.executable)
+        and expected.command_line_fingerprint == current.command_line_fingerprint
+        and expected.parent_pid == current.parent_pid
+        and expected.parent_creation_time == current.parent_creation_time
+        and os.path.normcase(expected.parent_executable or "")
+        == os.path.normcase(current.parent_executable or "")
+    )
+
+
 def _fail(
     path: Path,
     metadata: CodexRuntimeMetadata,
@@ -159,22 +175,30 @@ def run(metadata_path: Path, command: Sequence[str]) -> int:
         )
         return 6
 
-    terminating = False
+    ready_metadata = metadata
+    expected_lcb_identity: ProcessObservation | None = None
+    termination_requested = False
+    termination_sent = False
 
     def terminate_child(_signum: int, _frame: object) -> None:
-        nonlocal terminating
-        if terminating or child.poll() is not None:
+        nonlocal termination_requested, termination_sent
+        termination_requested = True
+        if termination_sent or child.poll() is not None:
             return
-        terminating = True
         current = inspector.identity(child.pid)
-        if current is None or current.parent_pid != os.getpid():
+        if (
+            expected_lcb_identity is None
+            or current is None
+            or not _same_process_identity(expected_lcb_identity, current)
+        ):
             _fail(
                 metadata_path,
-                metadata,
+                ready_metadata,
                 "CODEX_RUNTIME_OWNERSHIP_UNKNOWN",
                 "LCB termination refused after process identity changed",
             )
             return
+        termination_sent = True
         child.terminate()
 
     for signal_name in ("SIGINT", "SIGTERM"):
@@ -182,14 +206,26 @@ def run(metadata_path: Path, command: Sequence[str]) -> int:
             signal.signal(getattr(signal, signal_name), terminate_child)
 
     deadline = time.monotonic() + 15.0
-    ready_metadata = metadata
     verified = False
     while time.monotonic() < deadline and child.poll() is None:
         processes = inspector.snapshot()
         lcb_identity = next((item for item in processes if item.pid == child.pid), None)
+        if (
+            expected_lcb_identity is None
+            and lcb_identity is not None
+            and lcb_identity.parent_pid == proxy_identity.pid
+            and lcb_identity.parent_creation_time == proxy_identity.creation_time
+            and os.path.normcase(lcb_identity.parent_executable or "")
+            == os.path.normcase(proxy_identity.executable)
+        ):
+            expected_lcb_identity = lcb_identity
+        if termination_requested:
+            terminate_child(0, None)
+            if termination_sent:
+                break
         app_server = _owned_app_server(processes, child.pid)
         desktops = _desktop_processes(processes)
-        if lcb_identity is not None and app_server is not None:
+        if not termination_requested and lcb_identity is not None and app_server is not None:
             candidate = metadata.model_copy(
                 update={
                     "ownership": CodexProcessOwnership.SUPERVISOR_MANAGED,
@@ -215,15 +251,33 @@ def run(metadata_path: Path, command: Sequence[str]) -> int:
                 break
         time.sleep(0.05)
     else:
-        if child.poll() is None:
+        if not verified:
             _fail(
                 metadata_path,
                 metadata,
                 "SUPERVISOR_CODEX_RUNTIME_FAILED",
-                "LCB child did not expose a verifiable Codex stdio app-server",
+                (
+                    "LCB child did not expose a verifiable Codex stdio app-server"
+                    if child.poll() is None
+                    else "LCB child exited before runtime ownership was verified"
+                ),
             )
+            if child.poll() is None:
+                terminate_child(0, None)
+
+    if not verified:
+        if child.poll() is None:
+            terminate_child(0, None)
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        return 7
 
     while verified and child.poll() is None:
+        if termination_requested:
+            terminate_child(0, None)
+            break
         processes = inspector.snapshot()
         if not _same_parent_identity(proxy_identity, processes):
             _fail(
@@ -253,6 +307,17 @@ def run(metadata_path: Path, command: Sequence[str]) -> int:
             break
         time.sleep(0.5)
 
+    if child.poll() is None:
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _fail(
+                metadata_path,
+                ready_metadata,
+                "CODEX_RUNTIME_RECONCILIATION_REQUIRED",
+                "owned LCB process did not stop within the bounded shutdown timeout",
+            )
+            return 8
     return_code = child.wait()
     try:
         latest = _read_metadata(metadata_path)

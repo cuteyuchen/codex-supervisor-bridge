@@ -14,11 +14,14 @@ from codex_supervisor_bridge.bootstrap.lcb_hardening import (
     LCB_RUNTIME_MARKER,
     LcbHardeningError,
     apply_lcb_runtime_hardening,
+    finalize_lcb_runtime_hardening,
     has_lcb_runtime_hardening,
+    has_lcb_runtime_source_hardening,
     require_lcb_runtime_hardening,
 )
 from tests.lcb_fixtures import (
     UPSTREAM_LCB_APP_SERVER_SOURCE,
+    write_fake_lcb_build,
     write_upstream_lcb_repository,
 )
 
@@ -55,7 +58,7 @@ def test_lcb_hardening_is_idempotent_and_binds_both_source_digests(tmp_path: Pat
     second = apply_lcb_runtime_hardening(repository)
 
     assert second == first
-    assert has_lcb_runtime_hardening(repository) is True
+    assert has_lcb_runtime_source_hardening(repository) is True
     assert first_payload["contract"] == LCB_RUNTIME_CONTRACT
     assert first_payload["hardening_revision"] == LCB_HARDENING_REVISION
     assert set(first_payload["files_sha256"]) == {
@@ -86,9 +89,30 @@ def test_hardened_source_guards_every_destructive_app_server_action(tmp_path: Pa
     assert "verifyOwnership();\n    platformPolicy.softTerminateChild(child);" in app_server
     assert "verifyOwnership();\n    platformPolicy.hardTerminateChild(child);" in app_server
     assert "captureProcessIdentity(child.pid, 20, 25)" in app_server
+    assert "assertInitializedCodexHome" in app_server
     assert "Supervisor process identity changed; termination refused" in runtime
     assert "metadata.lcb_runtime_contract !== SUPERVISOR_RUNTIME_CONTRACT" in runtime
     assert "metadata.lcb_hardening_revision !== SUPERVISOR_HARDENING_REVISION" in runtime
+
+
+def test_built_hardening_is_required_and_bound_to_dist_files(tmp_path: Path) -> None:
+    repository = write_upstream_lcb_repository(tmp_path / "Local-Codex-Bridge")
+    apply_lcb_runtime_hardening(repository)
+
+    assert has_lcb_runtime_hardening(repository) is False
+    with pytest.raises(LcbHardeningError, match="built hardening file is missing"):
+        finalize_lcb_runtime_hardening(repository)
+
+    write_fake_lcb_build(repository)
+    finalize_lcb_runtime_hardening(repository)
+    assert has_lcb_runtime_hardening(repository) is True
+
+    built_runtime = repository / "dist" / "src" / "supervisor-runtime.js"
+    built_runtime.write_text(
+        built_runtime.read_text(encoding="utf-8") + "// tampered\n",
+        encoding="utf-8",
+    )
+    assert has_lcb_runtime_hardening(repository) is False
 
 
 def test_ownership_token_reaches_lcb_but_is_removed_from_codex_child(tmp_path: Path) -> None:
@@ -111,7 +135,17 @@ def test_installer_applies_trusted_hardening_before_build(tmp_path: Path) -> Non
         return destination
 
     def runner(_command: list[str], cwd: Path) -> int:
-        build_observations.append(has_lcb_runtime_hardening(cwd))
+        build_observations.append(has_lcb_runtime_source_hardening(cwd))
+        dist = cwd / "dist" / "src"
+        dist.mkdir(parents=True, exist_ok=True)
+        (dist / "app-server.js").write_text(
+            (cwd / "src" / "app-server.ts").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        (dist / "supervisor-runtime.js").write_text(
+            (cwd / "src" / "supervisor-runtime.ts").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
         return 0
 
     installer = ComponentInstaller(
@@ -142,7 +176,7 @@ def test_tampered_hardening_cannot_be_reported_as_already_installed(tmp_path: Pa
     installer = ComponentInstaller(
         tmp_path / "components",
         downloader=downloader,
-        runner=lambda _command, _cwd: 0,
+        runner=lambda _command, cwd: _fake_build(cwd),
         max_retries=1,
     )
     first = installer.install(_manifest())
@@ -156,3 +190,8 @@ def test_tampered_hardening_cannot_be_reported_as_already_installed(tmp_path: Pa
     assert downloads == 2
     assert second.installed_path is not None
     assert has_lcb_runtime_hardening(second.installed_path) is True
+
+
+def _fake_build(root: Path) -> int:
+    write_fake_lcb_build(root)
+    return 0

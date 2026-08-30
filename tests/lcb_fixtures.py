@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from codex_supervisor_bridge.bootstrap.lcb_hardening import apply_lcb_runtime_hardening
+from codex_supervisor_bridge.bootstrap.lcb_hardening import (
+    apply_lcb_runtime_hardening,
+    finalize_lcb_runtime_hardening,
+)
 
 UPSTREAM_LCB_APP_SERVER_SOURCE = '''import { platformPolicyFor, type PlatformPolicy } from "./platform.js";
 
@@ -59,6 +62,11 @@ export class CodexAppServerManager {
         child.once("error", onError);
       });
       child.on("error", (error) => this.#onChildError(child, error));
+      await this.#request(
+        "initialize",
+        {},
+      );
+      await this.#write({ method: "initialized", params: {} });
   }
 
   #terminateChild(child: ChildProcessWithoutNullStreams): Promise<void> {
@@ -88,4 +96,20 @@ def write_upstream_lcb_repository(root: Path, *, entrypoint: bool = True) -> Pat
 def write_hardened_lcb_repository(root: Path, *, entrypoint: bool = True) -> Path:
     write_upstream_lcb_repository(root, entrypoint=entrypoint)
     apply_lcb_runtime_hardening(root)
+    if entrypoint:
+        write_fake_lcb_build(root)
+        finalize_lcb_runtime_hardening(root)
     return root
+
+
+def write_fake_lcb_build(root: Path) -> None:
+    dist = root / "dist" / "src"
+    dist.mkdir(parents=True, exist_ok=True)
+    (dist / "app-server.js").write_text(
+        (root / "src" / "app-server.ts").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (dist / "supervisor-runtime.js").write_text(
+        (root / "src" / "supervisor-runtime.ts").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )

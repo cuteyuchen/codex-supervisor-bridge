@@ -16,7 +16,11 @@ from pydantic import BaseModel, Field, field_validator
 
 from .archive import extract_tar_safe, extract_zip_safe
 from .download import HttpsDownloader
-from .lcb_hardening import apply_lcb_runtime_hardening, has_lcb_runtime_hardening
+from .lcb_hardening import (
+    apply_lcb_runtime_hardening,
+    finalize_lcb_runtime_hardening,
+    has_lcb_runtime_hardening,
+)
 
 INSTALL_COMMAND_TIMEOUT_SECONDS = 300.0
 
@@ -155,6 +159,8 @@ class ComponentInstaller:
                         raise RuntimeError(
                             f"install command failed with exit code {exit_code}"
                         )
+                if manifest.source_patch == "supervisor-runtime-v1":
+                    finalize_lcb_runtime_hardening(source_root)
                 self._write_install_marker(source_root, manifest)
                 promoted = self._promote(source_root, plan.target_dir)
                 self._write_current(component_root, manifest, plan.target_dir)

@@ -8,6 +8,10 @@ from typing import Any
 LCB_RUNTIME_CONTRACT = "supervisor-runtime-v1"
 LCB_HARDENING_REVISION = "csb-lcb-runtime-1"
 LCB_RUNTIME_MARKER = ".codex-supervisor-runtime-contract.json"
+LCB_RUNTIME_BUILD_FILES = (
+    "dist/src/app-server.js",
+    "dist/src/supervisor-runtime.js",
+)
 
 
 class LcbHardeningError(RuntimeError):
@@ -16,7 +20,7 @@ class LcbHardeningError(RuntimeError):
 
 _SUPERVISOR_RUNTIME_TS = r'''import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, readlinkSync } from "node:fs";
 import path from "node:path";
 
 export const SUPERVISOR_RUNTIME_CONTRACT = "supervisor-runtime-v1";
@@ -43,6 +47,7 @@ export interface SupervisorRuntimeBinding {
   readonly runtimeEpoch: number;
   readonly metadataPath: string;
   readonly ownershipTokenHash: string;
+  readonly codexHome: string;
 }
 
 const WINDOWS_IDENTITY_SCRIPT = String.raw`
@@ -107,6 +112,7 @@ function metadataBinding(pathname: string, environment: NodeJS.ProcessEnv): Supe
   if (metadata.ownership !== "SUPERVISOR_MANAGED") {
     throw new Error("Supervisor runtime ownership is not SUPERVISOR_MANAGED");
   }
+  const codexHome = nonEmptyString(metadata.codex_home, "Codex home");
   const ownershipTokenHash = createHash("sha256").update(token, "utf8").digest("hex");
   if (metadata.ownership_token_hash !== ownershipTokenHash) {
     throw new Error("Supervisor runtime ownership token mismatch");
@@ -116,7 +122,51 @@ function metadataBinding(pathname: string, environment: NodeJS.ProcessEnv): Supe
     runtimeEpoch,
     metadataPath: path.resolve(pathname),
     ownershipTokenHash,
+    codexHome,
   };
+}
+
+function posixProcessIdentity(pid: number): ProcessIdentity | null {
+  if (process.platform !== "linux") {
+    return null;
+  }
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const closingParen = stat.lastIndexOf(")");
+    if (closingParen < 0) {
+      return null;
+    }
+    const fields = stat.slice(closingParen + 2).trim().split(/\s+/);
+    const parentPid = Number(fields[1]);
+    const creationTime = fields[19];
+    if (!Number.isInteger(parentPid) || parentPid <= 0 || !creationTime) {
+      return null;
+    }
+    const command = readFileSync(`/proc/${pid}/cmdline`);
+    const executable = readlinkSync(`/proc/${pid}/exe`);
+    const parentStat = readFileSync(`/proc/${parentPid}/stat`, "utf8");
+    const parentClosingParen = parentStat.lastIndexOf(")");
+    if (parentClosingParen < 0) {
+      return null;
+    }
+    const parentFields = parentStat.slice(parentClosingParen + 2).trim().split(/\s+/);
+    const parentCreationTime = parentFields[19];
+    const parentExecutable = readlinkSync(`/proc/${parentPid}/exe`);
+    if (!parentCreationTime || !parentExecutable) {
+      return null;
+    }
+    return {
+      pid,
+      creationTime,
+      executable,
+      commandFingerprint: createHash("sha256").update(command).digest("hex"),
+      parentPid,
+      parentCreationTime,
+      parentExecutable,
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function readSupervisorRuntimeBinding(
@@ -169,7 +219,7 @@ export function captureProcessIdentity(
     return null;
   }
   if (process.platform !== "win32") {
-    return null;
+    return posixProcessIdentity(pid);
   }
   const script = WINDOWS_IDENTITY_SCRIPT.replace("__PID__", String(pid));
   for (let attempt = 0; attempt < Math.max(1, attempts); attempt += 1) {
@@ -203,6 +253,32 @@ function sameIdentity(expected: ProcessIdentity, current: ProcessIdentity): bool
     expected.parentPid === current.parentPid &&
     expected.parentCreationTime === current.parentCreationTime &&
     path.normalize(expected.parentExecutable ?? "").toLowerCase() === path.normalize(current.parentExecutable ?? "").toLowerCase();
+}
+
+function samePath(expected: string, current: string): boolean {
+  const left = path.normalize(path.resolve(expected));
+  const right = path.normalize(path.resolve(current));
+  return process.platform === "win32"
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right;
+}
+
+function initializedCodexHome(value: unknown): string | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const codexHome = (value as Record<string, unknown>).codexHome;
+  return typeof codexHome === "string" && codexHome.length > 0 ? codexHome : null;
+}
+
+export function assertInitializedCodexHome(
+  binding: SupervisorRuntimeBinding,
+  initializeResult: unknown,
+): void {
+  const initializedHome = initializedCodexHome(initializeResult);
+  if (initializedHome === null || !samePath(binding.codexHome, initializedHome)) {
+    throw new Error("Codex app-server initialized with an unexpected CODEX_HOME");
+  }
 }
 
 function assertBindingStillValid(binding: SupervisorRuntimeBinding): void {
@@ -256,6 +332,7 @@ def apply_lcb_runtime_hardening(source_root: str | Path) -> Path:
     imports = (
         'import { platformPolicyFor, type PlatformPolicy } from "./platform.js";\n'
         'import {\n'
+        '  assertInitializedCodexHome,\n'
         '  assertOwnedProcess,\n'
         '  captureProcessIdentity,\n'
         '  readSupervisorRuntimeBinding,\n'
@@ -313,6 +390,22 @@ def apply_lcb_runtime_hardening(source_root: str | Path) -> Path:
         "      this.#childTerminationPromise = terminateAppServerChild(\n        child,\n        this.#platformPolicy,\n      );\n",
         "      this.#childTerminationPromise = terminateAppServerChild(\n        child,\n        this.#platformPolicy,\n        undefined,\n        this.#supervisorRuntimeBinding\n          ? {\n              runtimeBinding: this.#supervisorRuntimeBinding,\n              expectedIdentity: this.#childIdentity,\n            }\n          : undefined,\n      );\n",
     )
+    current = _replace_once(
+        current,
+        '      await this.#request(\n        "initialize",\n',
+        '      const initializeResult = await this.#request(\n        "initialize",\n',
+    )
+    current = _replace_once(
+        current,
+        '      await this.#write({ method: "initialized", params: {} });\n',
+        '      if (this.#supervisorRuntimeBinding) {\n'
+        '        assertInitializedCodexHome(\n'
+        '          this.#supervisorRuntimeBinding,\n'
+        '          initializeResult,\n'
+        '        );\n'
+        '      }\n'
+        '      await this.#write({ method: "initialized", params: {} });\n',
+    )
     if "readSupervisorRuntimeBinding" not in current:
         raise LcbHardeningError("LCB_RUNTIME_ISOLATION_UNSUPPORTED: lifecycle patch did not apply")
 
@@ -347,9 +440,58 @@ def apply_lcb_runtime_hardening(source_root: str | Path) -> Path:
 
 
 def has_lcb_runtime_hardening(source_root: str | Path) -> bool:
-    """Return true only for a source tree carrying the complete hardened contract."""
+    """Return true only when source and built LCB lifecycle guards are verified."""
 
-    return _marker_is_valid(Path(source_root))
+    return _marker_is_valid(Path(source_root), require_build=True)
+
+
+def has_lcb_runtime_source_hardening(source_root: str | Path) -> bool:
+    """Return true when the source patch is present before the build step."""
+
+    return _marker_is_valid(Path(source_root), require_build=False)
+
+
+def finalize_lcb_runtime_hardening(source_root: str | Path) -> Path:
+    """Bind the source marker to the built JavaScript lifecycle implementation."""
+
+    root = Path(source_root)
+    if not _marker_is_valid(root, require_build=False):
+        raise LcbHardeningError(
+            "LCB_RUNTIME_ISOLATION_UNSUPPORTED: source hardening is incomplete"
+        )
+    built_digests: dict[str, str] = {}
+    for relative in LCB_RUNTIME_BUILD_FILES:
+        built = root / relative
+        if not built.is_file():
+            raise LcbHardeningError(
+                f"LCB_RUNTIME_ISOLATION_UNSUPPORTED: built hardening file is missing: {relative}"
+            )
+        try:
+            content = built.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise LcbHardeningError(
+                f"LCB_RUNTIME_ISOLATION_UNSUPPORTED: built hardening file is unreadable: {relative}"
+            ) from exc
+        required = (
+            ("assertInitializedCodexHome", "readSupervisorRuntimeBinding", "assertOwnedProcess")
+            if relative.endswith("app-server.js")
+            else ("captureProcessIdentity", "supervisor-runtime-v1", "csb-lcb-runtime-1")
+        )
+        if any(token not in content for token in required):
+            raise LcbHardeningError(
+                f"LCB_RUNTIME_ISOLATION_UNSUPPORTED: built hardening guard is missing: {relative}"
+            )
+        built_digests[relative] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    marker = root / LCB_RUNTIME_MARKER
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    payload["build_files"] = list(LCB_RUNTIME_BUILD_FILES)
+    payload["build_files_sha256"] = built_digests
+    marker.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    return marker
 
 
 def require_lcb_runtime_hardening(source_root: str | Path) -> None:
@@ -359,7 +501,7 @@ def require_lcb_runtime_hardening(source_root: str | Path) -> None:
         )
 
 
-def _marker_is_valid(root: Path) -> bool:
+def _marker_is_valid(root: Path, *, require_build: bool = False) -> bool:
     marker = root / LCB_RUNTIME_MARKER
     app_server = root / "src" / "app-server.ts"
     runtime = root / "src" / "supervisor-runtime.ts"
@@ -378,7 +520,7 @@ def _marker_is_valid(root: Path) -> bool:
     ):
         return False
     digests = payload.get("files_sha256")
-    return (
+    source_valid = (
         isinstance(digests, dict)
         and digests.get("src/app-server.ts")
         == hashlib.sha256(app_text.encode("utf-8")).hexdigest()
@@ -389,6 +531,29 @@ def _marker_is_valid(root: Path) -> bool:
         and "captureProcessIdentity" in runtime_text
         and "supervisor-runtime-v1" in runtime_text
     )
+    if not source_valid or not require_build:
+        return source_valid
+    build_digests = payload.get("build_files_sha256")
+    if payload.get("build_files") != list(LCB_RUNTIME_BUILD_FILES) or not isinstance(
+        build_digests, dict
+    ):
+        return False
+    for relative in LCB_RUNTIME_BUILD_FILES:
+        built = root / relative
+        try:
+            content = built.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return False
+        if build_digests.get(relative) != hashlib.sha256(content.encode("utf-8")).hexdigest():
+            return False
+        required = (
+            ("assertInitializedCodexHome", "readSupervisorRuntimeBinding", "assertOwnedProcess")
+            if relative.endswith("app-server.js")
+            else ("captureProcessIdentity", "supervisor-runtime-v1", "csb-lcb-runtime-1")
+        )
+        if any(token not in content for token in required):
+            return False
+    return True
 
 
 def _replace_once(text: str, old: str, new: str) -> str:
@@ -403,8 +568,11 @@ __all__ = [
     "LCB_HARDENING_REVISION",
     "LCB_RUNTIME_CONTRACT",
     "LCB_RUNTIME_MARKER",
+    "LCB_RUNTIME_BUILD_FILES",
     "LcbHardeningError",
     "apply_lcb_runtime_hardening",
+    "finalize_lcb_runtime_hardening",
     "has_lcb_runtime_hardening",
+    "has_lcb_runtime_source_hardening",
     "require_lcb_runtime_hardening",
 ]

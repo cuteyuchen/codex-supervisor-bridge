@@ -28,7 +28,7 @@ from codex_supervisor_bridge.bootstrap.models import (
 from codex_supervisor_bridge.bootstrap.paths import AppDataPaths
 from codex_supervisor_bridge.bootstrap.repair import RepairService
 from codex_supervisor_bridge.bootstrap.secrets import MemorySecretStore
-from tests.lcb_fixtures import UPSTREAM_LCB_APP_SERVER_SOURCE
+from tests.lcb_fixtures import UPSTREAM_LCB_APP_SERVER_SOURCE, write_fake_lcb_build
 
 
 def _zip_payload(component: str = "component") -> bytes:
@@ -585,11 +585,16 @@ def test_repair_executes_trusted_install_and_registers_managed_paths(
         destination.write_bytes(stream.getvalue())
         return destination
 
+    def runner(_command: list[str], cwd: Path) -> int:
+        if (cwd / "src" / "app-server.ts").is_file():
+            write_fake_lcb_build(cwd)
+        return 0
+
     installer = ComponentInstaller(
         paths.components,
         trusted_manifests=registry.manifests(),
         downloader=downloader,
-        runner=lambda command, cwd: 0,
+        runner=runner,
         max_retries=1,
     )
     service = RepairService(

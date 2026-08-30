@@ -4,7 +4,7 @@
 >
 > This document records the current product intent and the architecture decisions that supersede earlier fixed-backend assumptions. It is deliberately more durable than a browser conversation.
 
-Last updated: 2026-08-29
+Last updated: 2026-08-30
 
 ## Product goal
 
@@ -366,7 +366,7 @@ Supervisor/LCB failure could not be shown independent from the user's daily
 Desktop runtime.
 
 The installed Codex inspected on 2026-08-30 is
-`codex-cli 0.151.0-alpha.7.1`. Its current help exposes direct app-server stdio,
+`codex-cli 0.151.0-alpha.7.2`. Its current help exposes direct app-server stdio,
 daemon, and proxy modes. A passive process snapshot confirmed the active
 Desktop app-server was a `codex.exe` child of `ChatGPT.exe`; no active
 Supervisor/LCB/tunnel runtime was detected. No process was terminated.
@@ -385,12 +385,19 @@ The code-level blocker work on this branch now establishes:
   Profile B can report READY;
 - a trusted managed LCB source hardening contract (`supervisor-runtime-v1`,
   revision `csb-lcb-runtime-1`) applied before the pinned source is built;
+  the marker binds both the patched TypeScript source and the built
+  `dist/src/app-server.js` / `dist/src/supervisor-runtime.js` digests;
   Doctor, installer repair, and Profile B startup reject an absent, stale, or
-  digest-mismatched hardening marker as `LCB_RUNTIME_ISOLATION_UNSUPPORTED`;
+  digest-mismatched source or build marker as
+  `LCB_RUNTIME_ISOLATION_UNSUPPORTED`;
 - LCB capture and revalidation of the app-server PID, creation time, executable,
   command-line fingerprint, parent PID, and parent identity before stdin close,
   soft termination, or Windows hard tree termination. PID reuse and incomplete
   identity fail closed;
+- the hardened LCB verifies that the Codex app-server `initialize` response
+  reports the Supervisor namespace's `CODEX_HOME`; Linux identity capture uses
+  `/proc` start time, executable, command-line fingerprint, and parent identity
+  for the same fail-closed checks as Windows;
 - an ownership token that reaches the hardened LCB only. Supervisor contract,
   token, metadata, instance, and epoch variables are removed before LCB spawns
   the Codex child, and no secret value is persisted or logged;
@@ -407,9 +414,10 @@ The code-level blocker work on this branch now establishes:
 - passive Desktop process metadata in advanced diagnostics only; normal
   Context Packs omit PIDs and all credential values.
 
-The hardened source patch also passes TypeScript typecheck against the pinned
-LCB commit, and the patched upstream suite passes 101 tests with one platform
-skip. This is still code/fake-test evidence only. It does **not** complete the
+The hardened source patch also passes TypeScript typecheck and build against the
+pinned LCB commit. Its patched upstream suite passes 67 tests with one platform
+skip, and the platform smoke reports `TRAY_CORE_TESTS_OK`. This is still
+code/fake-test evidence only. It does **not** complete the
 release blocker. No second real Codex app-server, real process termination, Desktop
 concurrency test, real turn interrupt Gate, or runtime crash Gate may run
 without the explicit human checkpoints documented for P6.6. Until those Gates

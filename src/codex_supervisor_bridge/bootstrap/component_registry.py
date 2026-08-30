@@ -77,6 +77,7 @@ BUILTIN_MANIFESTS: dict[str, ComponentManifest] = {
             ["npm", "run", "build"],
         ],
         requires_node=True,
+        source_patch="supervisor-runtime-v1",
     ),
 }
 
@@ -146,12 +147,15 @@ class ManagedComponentRegistry:
     def verification_strategy(self, name: str) -> str:
         manifest = self.manifest(name)
         if manifest.commit_sha:
-            return (
+            detail = (
                 f"pinned {manifest.version} at commit {manifest.commit_sha}; "
                 "the upstream archive is unsigned, so the immutable GitHub "
                 "commit archive plus build and protocol health is the "
                 "verification strategy"
             )
+            if manifest.source_patch:
+                detail += f"; applied trusted source patch {manifest.source_patch}"
+            return detail
         if manifest.checksum_sha256:
             sidecar = " and official SHA256SUMS.txt" if manifest.checksum_source else ""
             return (

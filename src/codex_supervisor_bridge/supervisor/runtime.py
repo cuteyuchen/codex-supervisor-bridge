@@ -16,6 +16,7 @@ from codex_supervisor_bridge.backends.models import (
 )
 from codex_supervisor_bridge.backends.workspace import WorkspaceBackend
 from codex_supervisor_bridge.bootstrap.codex_isolation import SupervisorCodexRuntimeManager
+from codex_supervisor_bridge.bootstrap.lcb_hardening import require_lcb_runtime_hardening
 from codex_supervisor_bridge.memory.service import MemoryService
 
 from .agent_execution import AgentExecutionCoordinator
@@ -99,6 +100,12 @@ class RuntimeComposition:
             runtime_manager = SupervisorCodexRuntimeManager(resolved_root)
 
         def backend_factory() -> LocalCodexBridgeAgentBackend:
+            entrypoint = Path(str(launch_command[1])) if len(launch_command) > 1 else None
+            if entrypoint is None or not entrypoint.is_file():
+                raise RuntimeError(
+                    "LCB_RUNTIME_ISOLATION_UNSUPPORTED: Local-Codex-Bridge entrypoint is missing"
+                )
+            require_lcb_runtime_hardening(entrypoint.parent.parent.parent)
             runtime_manager.prepare(base_environment)
             wrapped_command = runtime_manager.wrapped_lcb_command(launch_command)
             return LocalCodexBridgeAgentBackend.stdio(

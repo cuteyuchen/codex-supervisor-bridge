@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from .archive import extract_tar_safe, extract_zip_safe
 from .download import HttpsDownloader
+from .lcb_hardening import apply_lcb_runtime_hardening, has_lcb_runtime_hardening
 
 INSTALL_COMMAND_TIMEOUT_SECONDS = 300.0
 
@@ -42,6 +43,7 @@ class ComponentManifest(BaseModel):
     version_contains: str | None = None
     install_commands: list[list[str]] = Field(default_factory=list)
     requires_node: bool = False
+    source_patch: str | None = None
 
     @field_validator("install_commands")
     @classmethod
@@ -141,6 +143,8 @@ class ComponentInstaller:
                 extract_root.mkdir(parents=True)
                 self._extract(manifest, archive_path, extract_root)
                 source_root = self._archive_root(manifest, extract_root)
+                if manifest.source_patch == "supervisor-runtime-v1":
+                    apply_lcb_runtime_hardening(source_root)
                 node_executable, npm_script = self._managed_toolchain()
                 for command in manifest.install_commands:
                     exit_code = self._runner(
@@ -364,6 +368,7 @@ class ComponentInstaller:
             "commit_sha": manifest.commit_sha,
             "checksum_sha256": manifest.checksum_sha256,
             "entrypoint": manifest.entrypoint,
+            "source_patch": manifest.source_patch,
             "installed_at": datetime.now(timezone.utc).isoformat(),
         }
         marker.write_text(
@@ -387,9 +392,15 @@ class ComponentInstaller:
             or payload.get("version") != manifest.version
             or payload.get("source_ref") != manifest.source_ref
             or payload.get("commit_sha") != manifest.commit_sha
+            or payload.get("source_patch") != manifest.source_patch
         ):
             return False
         if manifest.entrypoint and not (root / manifest.entrypoint).is_file():
+            return False
+        if (
+            manifest.source_patch == "supervisor-runtime-v1"
+            and not has_lcb_runtime_hardening(root)
+        ):
             return False
         if manifest.entrypoint and manifest.version_args:
             executable = root / manifest.entrypoint

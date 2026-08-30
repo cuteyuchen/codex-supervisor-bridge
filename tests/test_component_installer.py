@@ -28,6 +28,7 @@ from codex_supervisor_bridge.bootstrap.models import (
 from codex_supervisor_bridge.bootstrap.paths import AppDataPaths
 from codex_supervisor_bridge.bootstrap.repair import RepairService
 from codex_supervisor_bridge.bootstrap.secrets import MemorySecretStore
+from tests.lcb_fixtures import UPSTREAM_LCB_APP_SERVER_SOURCE
 
 
 def _zip_payload(component: str = "component") -> bytes:
@@ -576,6 +577,11 @@ def test_repair_executes_trusted_install_and_registers_managed_paths(
                 files = ["dist/src/index.js"]
             for relative in files:
                 handle.writestr(f"{root}/{relative}", "placeholder")
+            if "Local-Codex-Bridge" in root:
+                handle.writestr(
+                    f"{root}/src/app-server.ts",
+                    UPSTREAM_LCB_APP_SERVER_SOURCE,
+                )
         destination.write_bytes(stream.getvalue())
         return destination
 

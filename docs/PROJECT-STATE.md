@@ -351,11 +351,25 @@ Read-only investigation of the pinned Local-Codex-Bridge 2.1.3 source at
 commit `4ffed814f615316ade8967189a2e1772488d33c2` confirmed that LCB starts its
 own `codex app-server --listen stdio://` child and uses protocol-level
 `turn/interrupt`; it does not intentionally attach to a Codex Desktop
-app-server. The unsafe architectural gap was that the LCB child inherited the
-user's default Codex environment and state root, while Supervisor had no
-durable process ownership, runtime instance, epoch, endpoint ownership, or
-fail-closed lifecycle proof. A Supervisor/LCB failure could therefore not be
-shown to be independent from the user's daily Desktop runtime.
+app-server. Two independent unsafe gaps were confirmed:
+
+- the LCB child inherited the user's default Codex environment and `CODEX_HOME`,
+  so Desktop and LCB could share the persistent conversation/session state root;
+- LCB's Windows hard-stop path used `taskkill.exe /PID <pid> /T /F` after only
+  checking the Node `ChildProcess` PID/exit state. It had no creation time,
+  command fingerprint, parent identity, runtime instance, or ownership token
+  validation before terminating the process tree.
+
+The same lifecycle gap remained on the checked upstream `main` revision
+`ff5d880`, so a plain LCB upgrade did not resolve it. This combination meant a
+Supervisor/LCB failure could not be shown independent from the user's daily
+Desktop runtime.
+
+The installed Codex inspected on 2026-08-30 is
+`codex-cli 0.151.0-alpha.7.1`. Its current help exposes direct app-server stdio,
+daemon, and proxy modes. A passive process snapshot confirmed the active
+Desktop app-server was a `codex.exe` child of `ChatGPT.exe`; no active
+Supervisor/LCB/tunnel runtime was detected. No process was terminated.
 
 The code-level blocker work on this branch now establishes:
 
@@ -369,6 +383,17 @@ The code-level blocker work on this branch now establishes:
 - a Supervisor-owned runtime proxy that verifies the
   Supervisor -> proxy -> LCB -> Codex app-server parent/child chain before
   Profile B can report READY;
+- a trusted managed LCB source hardening contract (`supervisor-runtime-v1`,
+  revision `csb-lcb-runtime-1`) applied before the pinned source is built;
+  Doctor, installer repair, and Profile B startup reject an absent, stale, or
+  digest-mismatched hardening marker as `LCB_RUNTIME_ISOLATION_UNSUPPORTED`;
+- LCB capture and revalidation of the app-server PID, creation time, executable,
+  command-line fingerprint, parent PID, and parent identity before stdin close,
+  soft termination, or Windows hard tree termination. PID reuse and incomplete
+  identity fail closed;
+- an ownership token that reaches the hardened LCB only. Supervisor contract,
+  token, metadata, instance, and epoch variables are removed before LCB spawns
+  the Codex child, and no secret value is persisted or logged;
 - runtime-instance and epoch affinity for task/thread/turn/pending interaction
   recovery, with old affinity invalidated after runtime replacement;
 - protocol-only turn interrupt, with no process-kill fallback;
@@ -382,8 +407,10 @@ The code-level blocker work on this branch now establishes:
 - passive Desktop process metadata in advanced diagnostics only; normal
   Context Packs omit PIDs and all credential values.
 
-This is code/fake-test evidence only. It does **not** complete the release
-blocker. No second real Codex app-server, real process termination, Desktop
+The hardened source patch also passes TypeScript typecheck against the pinned
+LCB commit, and the patched upstream suite passes 101 tests with one platform
+skip. This is still code/fake-test evidence only. It does **not** complete the
+release blocker. No second real Codex app-server, real process termination, Desktop
 concurrency test, real turn interrupt Gate, or runtime crash Gate may run
 without the explicit human checkpoints documented for P6.6. Until those Gates
 prove bidirectional failure isolation, do not resume the full remote Profile B

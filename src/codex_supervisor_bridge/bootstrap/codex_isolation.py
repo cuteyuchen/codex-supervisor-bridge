@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
 
+from .lcb_hardening import LCB_HARDENING_REVISION, LCB_RUNTIME_CONTRACT
 from .process import CodexProcessOwnership
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,8 @@ SUPERVISOR_EPOCH_ENV = "CODEX_SUPERVISOR_RUNTIME_EPOCH"
 SUPERVISOR_TOKEN_ENV = "CODEX_SUPERVISOR_OWNERSHIP_TOKEN"
 SUPERVISOR_METADATA_ENV = "CODEX_SUPERVISOR_RUNTIME_METADATA"
 SUPERVISOR_PARENT_ENV = "CODEX_SUPERVISOR_PARENT_PID"
+SUPERVISOR_CONTRACT_ENV = "CODEX_SUPERVISOR_RUNTIME_CONTRACT"
+SUPERVISOR_RUNTIME_CONTRACT = LCB_RUNTIME_CONTRACT
 
 
 class CodexRuntimeIsolationError(RuntimeError):
@@ -59,6 +62,8 @@ class CodexRuntimeMetadata(BaseModel):
     schema_version: int = RUNTIME_METADATA_VERSION
     instance_id: str
     runtime_epoch: int = Field(ge=1)
+    lcb_runtime_contract: str
+    lcb_hardening_revision: str
     ownership: CodexProcessOwnership = CodexProcessOwnership.UNKNOWN
     ownership_token_hash: str
     status: str = "CREATED"
@@ -100,6 +105,8 @@ class CodexRuntimeMetadata(BaseModel):
             ),
             "runtime_directory": self.runtime_directory,
             "codex_home": self.codex_home,
+            "runtime_contract": self.lcb_runtime_contract,
+            "hardening_revision": self.lcb_hardening_revision,
             "proxy_process": self.proxy_process.model_dump(mode="json")
             if self.proxy_process
             else None,
@@ -326,6 +333,8 @@ class SupervisorCodexRuntimeManager:
         metadata = CodexRuntimeMetadata(
             instance_id=instance_id,
             runtime_epoch=epoch,
+            lcb_runtime_contract=LCB_RUNTIME_CONTRACT,
+            lcb_hardening_revision=LCB_HARDENING_REVISION,
             ownership=CodexProcessOwnership.SUPERVISOR_MANAGED,
             ownership_token_hash=_fingerprint(self._token),
             runtime_directory=str(runtime_directory),
@@ -392,6 +401,7 @@ class SupervisorCodexRuntimeManager:
         environment[SUPERVISOR_TOKEN_ENV] = self._token
         environment[SUPERVISOR_METADATA_ENV] = str(self.metadata_path)
         environment[SUPERVISOR_PARENT_ENV] = str(os.getpid())
+        environment[SUPERVISOR_CONTRACT_ENV] = SUPERVISOR_RUNTIME_CONTRACT
         return environment
 
     def wrapped_lcb_command(self, launch_command: Sequence[str]) -> list[str]:
@@ -422,6 +432,8 @@ class SupervisorCodexRuntimeManager:
         if (
             observed.instance_id != self.metadata.instance_id
             or observed.runtime_epoch != self.metadata.runtime_epoch
+            or observed.lcb_runtime_contract != self.metadata.lcb_runtime_contract
+            or observed.lcb_hardening_revision != self.metadata.lcb_hardening_revision
             or observed.ownership_token_hash != self.metadata.ownership_token_hash
             or observed.runtime_directory != self.metadata.runtime_directory
             or observed.codex_home != self.metadata.codex_home
@@ -610,6 +622,10 @@ def runtime_verification_failure(metadata: CodexRuntimeMetadata) -> str | None:
     app_server = metadata.app_server_process
     runtime_directory = Path(metadata.runtime_directory)
     codex_home = Path(metadata.codex_home)
+    if metadata.lcb_runtime_contract != LCB_RUNTIME_CONTRACT:
+        return "LCB runtime contract is unsupported"
+    if metadata.lcb_hardening_revision != LCB_HARDENING_REVISION:
+        return "LCB lifecycle hardening revision is unsupported"
     if metadata.endpoint_category != "stdio":
         return "Supervisor runtime endpoint is not private stdio"
     if metadata.ownership != CodexProcessOwnership.SUPERVISOR_MANAGED:

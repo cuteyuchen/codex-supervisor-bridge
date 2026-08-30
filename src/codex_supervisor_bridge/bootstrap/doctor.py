@@ -25,6 +25,11 @@ from .devspace import (
     DEVSPACE_TESTED_VERSIONS,
     DevSpaceVersionCompatibility,
 )
+from .lcb_hardening import (
+    LCB_HARDENING_REVISION,
+    LCB_RUNTIME_CONTRACT,
+    has_lcb_runtime_hardening,
+)
 from .models import ComponentHealth, DoctorStatus, HealthStatus
 from .paths import AppDataPaths
 from .ports import PortAllocator
@@ -593,6 +598,28 @@ class Doctor:
                     ),
                 },
             )
+        if not has_lcb_runtime_hardening(resolved):
+            return ComponentHealth(
+                capability="Codex control",
+                status=HealthStatus.DEGRADED,
+                repairable=True,
+                user_message="Codex control needs a runtime-safe build.",
+                recommended_action="repair_codex_control",
+                advanced={
+                    "provider": "local-codex-bridge",
+                    "repository": str(resolved),
+                    "entrypoint": str(entrypoint),
+                    "node_version": node_version,
+                    "supports_isolated_runtime": False,
+                    "runtime_transport": "private_stdio",
+                    "desktop_attach_fallback": False,
+                    "failure_code": "LCB_RUNTIME_ISOLATION_UNSUPPORTED",
+                    "technical_detail": (
+                        "Supervisor lifecycle hardening marker is missing; "
+                        "unpatched PID-only LCB termination is not accepted"
+                    ),
+                },
+            )
         return ComponentHealth(
             capability="Codex control",
             status=HealthStatus.READY,
@@ -606,6 +633,8 @@ class Doctor:
                 "supports_isolated_runtime": True,
                 "runtime_transport": "private_stdio",
                 "desktop_attach_fallback": False,
+                "runtime_contract": LCB_RUNTIME_CONTRACT,
+                "hardening_revision": LCB_HARDENING_REVISION,
             },
         )
 

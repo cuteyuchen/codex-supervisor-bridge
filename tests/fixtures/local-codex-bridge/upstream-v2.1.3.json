@@ -4,6 +4,18 @@
   "node_requirement": ">=24",
   "entrypoint": "dist/src/index.js",
   "npm_start_is_development_only": true,
+  "source_commit": "4ffed814f615316ade8967189a2e1772488d33c2",
+  "native_runtime_isolation": false,
+  "app_server_launch": ["codex", "app-server", "--listen", "stdio://"],
+  "windows_hard_stop": ["taskkill.exe", "/PID", "<pid>", "/T", "/F"],
+  "native_hard_stop_identity": ["pid", "exit_code"],
+  "managed_hardening": {
+    "contract": "supervisor-runtime-v1",
+    "revision": "csb-lcb-runtime-1",
+    "marker": ".codex-supervisor-runtime-contract.json",
+    "source_digests": ["src/app-server.ts", "src/supervisor-runtime.ts"],
+    "desktop_attach_fallback": false
+  },
   "required_tools": [
     "codex_turn",
     "codex_observe",

@@ -30,6 +30,10 @@ from codex_supervisor_bridge.bootstrap.codex_isolation import (
     SupervisorCodexRuntimeManager,
     runtime_process_chain_failure,
 )
+from codex_supervisor_bridge.bootstrap.lcb_hardening import (
+    LCB_HARDENING_REVISION,
+    LCB_RUNTIME_CONTRACT,
+)
 from codex_supervisor_bridge.bootstrap.process import (
     CodexProcessOwnership,
     ManagedProcessSpec,
@@ -87,6 +91,8 @@ def _verified_metadata(
     metadata = CodexRuntimeMetadata(
         instance_id=instance_id,
         runtime_epoch=epoch,
+        lcb_runtime_contract=LCB_RUNTIME_CONTRACT,
+        lcb_hardening_revision=LCB_HARDENING_REVISION,
         ownership=CodexProcessOwnership.SUPERVISOR_MANAGED,
         ownership_token_hash=hashlib.sha256(b"owned-token").hexdigest(),
         status="READY",
@@ -463,6 +469,23 @@ def test_desktop_and_supervisor_app_server_identity_must_be_different(tmp_path: 
     assert shared.failure_code == "UNSAFE_SHARED_CODEX_RUNTIME"
 
 
+def test_runtime_verification_rejects_wrong_lcb_hardening_contract(tmp_path: Path) -> None:
+    metadata = _verified_metadata(tmp_path)
+    manager = SupervisorCodexRuntimeManager(tmp_path)
+
+    wrong_contract = manager.verify_metadata(
+        metadata.model_copy(update={"lcb_runtime_contract": "unsupported-contract"})
+    )
+    wrong_revision = manager.verify_metadata(
+        metadata.model_copy(update={"lcb_hardening_revision": "unknown-revision"})
+    )
+
+    assert wrong_contract.isolation_verified is False
+    assert wrong_contract.failure_code == "CODEX_RUNTIME_OWNERSHIP_UNKNOWN"
+    assert wrong_revision.isolation_verified is False
+    assert wrong_revision.failure_code == "CODEX_RUNTIME_OWNERSHIP_UNKNOWN"
+
+
 class _DummyProcess:
     def __init__(self, pid: int) -> None:
         self.pid = pid
@@ -529,6 +552,8 @@ def _run_proxy_startup_timeout(
     metadata = CodexRuntimeMetadata(
         instance_id="csb-codex-proxy-timeout",
         runtime_epoch=1,
+        lcb_runtime_contract=LCB_RUNTIME_CONTRACT,
+        lcb_hardening_revision=LCB_HARDENING_REVISION,
         ownership=CodexProcessOwnership.SUPERVISOR_MANAGED,
         ownership_token_hash=hashlib.sha256(token.encode("utf-8")).hexdigest(),
         runtime_directory=str(tmp_path / "runtime" / "csb-codex-proxy-timeout"),
@@ -561,6 +586,7 @@ def _run_proxy_startup_timeout(
     monkeypatch.setattr(lcb_runtime_proxy.time, "monotonic", lambda: next(ticks))
     monkeypatch.setattr(lcb_runtime_proxy.time, "sleep", lambda *_args: None)
     monkeypatch.setenv(lcb_runtime_proxy.SUPERVISOR_METADATA_ENV, str(metadata_path))
+    monkeypatch.setenv(lcb_runtime_proxy.SUPERVISOR_CONTRACT_ENV, LCB_RUNTIME_CONTRACT)
     monkeypatch.setenv(lcb_runtime_proxy.SUPERVISOR_RUNTIME_ENV, metadata.instance_id)
     monkeypatch.setenv(lcb_runtime_proxy.SUPERVISOR_EPOCH_ENV, str(metadata.runtime_epoch))
     monkeypatch.setenv(lcb_runtime_proxy.SUPERVISOR_TOKEN_ENV, token)
@@ -602,6 +628,32 @@ def test_proxy_startup_timeout_refuses_pid_reused_child(
     assert child.terminated is False
     assert stored.failure_code == "CODEX_RUNTIME_OWNERSHIP_UNKNOWN"
     assert stored.status == "DEGRADED"
+
+
+def test_proxy_contract_mismatch_fails_before_lcb_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SupervisorCodexRuntimeManager(tmp_path)
+    manager.prepare({"CODEX_HOME": str(tmp_path / "empty-home")})
+    environment = manager.environment({})
+    environment[lcb_runtime_proxy.SUPERVISOR_CONTRACT_ENV] = "unsupported-contract"
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        lcb_runtime_proxy.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("LCB must not spawn after contract mismatch"),
+    )
+
+    result = lcb_runtime_proxy.run(manager.metadata_path, ["node", "bridge.js"])
+    stored = CodexRuntimeMetadata.model_validate_json(
+        manager.metadata_path.read_text(encoding="utf-8")
+    )
+
+    assert result == 4
+    assert stored.ownership == CodexProcessOwnership.UNKNOWN
+    assert stored.failure_code == "CODEX_RUNTIME_OWNERSHIP_UNKNOWN"
 
 
 @pytest.mark.parametrize(

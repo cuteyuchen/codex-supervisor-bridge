@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .codex_isolation import (
+    SUPERVISOR_CONTRACT_ENV,
     SUPERVISOR_EPOCH_ENV,
     SUPERVISOR_METADATA_ENV,
     SUPERVISOR_RUNTIME_ENV,
@@ -131,6 +132,7 @@ def run(metadata_path: Path, command: Sequence[str]) -> int:
         return 3
     if (
         metadata_path != Path(os.environ.get(SUPERVISOR_METADATA_ENV, metadata_path))
+        or metadata.lcb_runtime_contract != os.environ.get(SUPERVISOR_CONTRACT_ENV)
         or metadata.instance_id != os.environ.get(SUPERVISOR_RUNTIME_ENV)
         or str(metadata.runtime_epoch) != os.environ.get(SUPERVISOR_EPOCH_ENV)
         or metadata.ownership_token_hash != _token_hash()
@@ -156,7 +158,6 @@ def run(metadata_path: Path, command: Sequence[str]) -> int:
 
     try:
         child_environment = dict(os.environ)
-        child_environment.pop(SUPERVISOR_TOKEN_ENV, None)
         child = subprocess.Popen(
             command,
             stdin=None,

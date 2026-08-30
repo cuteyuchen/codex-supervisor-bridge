@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+import pytest
 from mcp import Client
 
 from codex_supervisor_bridge.backends.models import (
@@ -18,6 +19,7 @@ from codex_supervisor_bridge.backends.models import (
     WorkspaceState,
     WriterLeaseToken,
 )
+from codex_supervisor_bridge.bootstrap.lcb_hardening import LcbHardeningError
 from codex_supervisor_bridge.integrations.devspace_client import DevSpaceWorkspaceAdapter
 from codex_supervisor_bridge.integrations.kandev_workspace import KandevWorkspaceBackend
 from codex_supervisor_bridge.memory.agent_safety import get_agent_safety
@@ -35,6 +37,7 @@ from codex_supervisor_bridge.supervisor.agent_execution import AgentExecutionCoo
 from codex_supervisor_bridge.supervisor.checkpoints import CheckpointService
 from codex_supervisor_bridge.supervisor.direct_workspace import DirectWorkspaceCoordinator
 from codex_supervisor_bridge.supervisor.runtime import RuntimeComposition
+from tests.lcb_fixtures import write_upstream_lcb_repository
 
 
 class FakeWorkspace:
@@ -256,6 +259,26 @@ def test_profile_b_runtime_composition_uses_session_manager() -> None:
         assert composition.session_manager is not None
         assert composition.agent_coordinator.agent_backend is composition.session_manager
         assert composition.checkpoint_service is not None
+    finally:
+        memory.close()
+
+
+def test_profile_b_backend_factory_rejects_unhardened_lcb_before_spawn(
+    tmp_path: Path,
+) -> None:
+    memory = MemoryService()
+    repository = write_upstream_lcb_repository(tmp_path / "Local-Codex-Bridge")
+    try:
+        composition = RuntimeComposition.profile_b(
+            memory,
+            launch_command=["node", str(repository / "dist" / "src" / "index.js")],
+            app_data_root=tmp_path / "app-data",
+            env={"CODEX_HOME": str(tmp_path / "empty-codex-home")},
+        )
+
+        assert composition.session_manager is not None
+        with pytest.raises(LcbHardeningError, match="LCB_RUNTIME_ISOLATION_UNSUPPORTED"):
+            composition.session_manager._backend_factory()
     finally:
         memory.close()
 

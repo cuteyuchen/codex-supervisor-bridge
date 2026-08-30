@@ -68,6 +68,10 @@ from codex_supervisor_bridge.bootstrap.service import (
 from codex_supervisor_bridge.mcp.server import _is_loopback_host, build_parser
 from codex_supervisor_bridge.mcp.server import main as cli_main
 from codex_supervisor_bridge.memory.models import ActiveWriter
+from tests.lcb_fixtures import (
+    write_hardened_lcb_repository,
+    write_upstream_lcb_repository,
+)
 
 
 class FakeDoctor:
@@ -540,8 +544,7 @@ def test_doctor_reports_canonical_lcb_entrypoint_after_alias_normalization(
     alias = tmp_path / "Packages" / "Some.Package" / "LocalCache" / "Local" / "CodexSupervisorBridge"
     paths = _test_app_data_paths(canonical, alias_roots=(alias,))
     repository = canonical / "components" / "local-codex-bridge" / "2.1.3"
-    (repository / "dist" / "src").mkdir(parents=True)
-    (repository / "dist" / "src" / "index.js").write_text("placeholder", encoding="utf-8")
+    write_hardened_lcb_repository(repository)
     node = tmp_path / "node.exe"
     node.write_text("placeholder", encoding="utf-8")
     config = AppConfig.safe_defaults(paths)
@@ -1287,9 +1290,8 @@ def test_bootstrap_start_uses_local_codex_repository_launch(tmp_path: Path) -> N
         system="Linux",
     )
     repository = tmp_path / "Local-Codex-Bridge"
+    write_hardened_lcb_repository(repository)
     entrypoint = repository / "dist" / "src" / "index.js"
-    entrypoint.parent.mkdir(parents=True)
-    entrypoint.write_text("placeholder", encoding="utf-8")
     config_store = ConfigStore(paths=paths)
     config = AppConfig.safe_defaults(paths)
     config.advanced.local_codex_repository = repository
@@ -1407,9 +1409,7 @@ def test_bootstrap_start_skips_local_codex_bridge_with_old_node(tmp_path: Path) 
         system="Linux",
     )
     repository = tmp_path / "Local-Codex-Bridge"
-    entrypoint = repository / "dist" / "src" / "index.js"
-    entrypoint.parent.mkdir(parents=True)
-    entrypoint.write_text("placeholder", encoding="utf-8")
+    write_hardened_lcb_repository(repository)
     config_store = ConfigStore(paths=paths)
     config = AppConfig.safe_defaults(paths)
     config.advanced.local_codex_repository = repository
@@ -1862,9 +1862,8 @@ def test_doctor_reads_local_codex_repository_launch(tmp_path: Path) -> None:
         system="Linux",
     )
     repository = tmp_path / "Local-Codex-Bridge"
+    write_hardened_lcb_repository(repository)
     entrypoint = repository / "dist" / "src" / "index.js"
-    entrypoint.parent.mkdir(parents=True)
-    entrypoint.write_text("placeholder", encoding="utf-8")
     config_store = ConfigStore(paths=paths)
     config = AppConfig.safe_defaults(paths)
     config.advanced.local_codex_repository = repository
@@ -1890,6 +1889,34 @@ def test_doctor_reads_local_codex_repository_launch(tmp_path: Path) -> None:
         str(entrypoint.resolve()),
     ]
     assert health.advanced["node_version"] == "v24.9.0"
+
+
+def test_doctor_rejects_unhardened_lcb_lifecycle(tmp_path: Path) -> None:
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
+        system="Linux",
+    )
+    repository = write_upstream_lcb_repository(tmp_path / "Local-Codex-Bridge")
+    config = AppConfig.safe_defaults(paths)
+    config.advanced.local_codex_repository = repository
+    config.advanced.executable_paths["node"] = "C:/Program Files/nodejs/node.exe"
+    doctor = Doctor(
+        paths=paths,
+        config_store=ConfigStore(paths=paths),
+        executable_finder=lambda name: (
+            "C:/Program Files/nodejs/node.exe" if name == "node" else None
+        ),
+        command_runner=lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, "v24.9.0\n", ""
+        ),
+    )
+
+    health = doctor._codex_control(config)
+
+    assert health.status == HealthStatus.DEGRADED
+    assert health.advanced["supports_isolated_runtime"] is False
+    assert health.advanced["desktop_attach_fallback"] is False
+    assert health.advanced["failure_code"] == "LCB_RUNTIME_ISOLATION_UNSUPPORTED"
 
 
 def test_doctor_local_codex_repository_rejects_old_node(tmp_path: Path) -> None:

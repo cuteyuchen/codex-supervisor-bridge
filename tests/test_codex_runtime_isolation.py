@@ -137,6 +137,26 @@ def _verified_metadata(
     return manager.verify_metadata(metadata)
 
 
+def _test_runtime_manager(
+    root: Path,
+    **kwargs: Any,
+) -> SupervisorCodexRuntimeManager:
+    """Build a runtime manager without depending on a host Codex install."""
+
+    executable = root / ("codex.exe" if os.name == "nt" else "codex")
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_bytes(b"test-only fake Codex executable")
+    resolver = CodexExecutableResolver(
+        finder=lambda _name: str(executable),
+        environ={},
+    )
+    return SupervisorCodexRuntimeManager(
+        root,
+        executable_resolver=resolver,
+        **kwargs,
+    )
+
+
 def _bind_verified_runtime(
     memory: MemoryService,
     task_id: str,
@@ -329,7 +349,7 @@ url = "http://127.0.0.1:3000/mcp?token=secret-mcp-value"
         "codex_supervisor_bridge.bootstrap.codex_isolation.tomllib.loads",
         tracked_toml_loads,
     )
-    manager = SupervisorCodexRuntimeManager(
+    manager = _test_runtime_manager(
         tmp_path / "bridge",
         uuid_factory=lambda: UUID("00000000-0000-0000-0000-000000000001"),
     )
@@ -402,7 +422,7 @@ def test_runtime_epoch_increments_and_old_namespace_is_not_reused(tmp_path: Path
             UUID("00000000-0000-0000-0000-000000000002"),
         ]
     )
-    manager = SupervisorCodexRuntimeManager(
+    manager = _test_runtime_manager(
         tmp_path / "bridge",
         uuid_factory=lambda: next(values),
     )
@@ -417,7 +437,7 @@ def test_runtime_epoch_increments_and_old_namespace_is_not_reused(tmp_path: Path
 def test_runtime_metadata_namespace_cannot_pivot_after_prepare(tmp_path: Path) -> None:
     source_home = tmp_path / "empty-home"
     source_home.mkdir()
-    manager = SupervisorCodexRuntimeManager(
+    manager = _test_runtime_manager(
         tmp_path / "bridge",
         uuid_factory=lambda: UUID("00000000-0000-0000-0000-000000000003"),
     )
@@ -439,7 +459,7 @@ def test_runtime_refresh_fails_closed_before_reading_redirected_metadata(
 ) -> None:
     source_home = tmp_path / "empty-home"
     source_home.mkdir()
-    manager = SupervisorCodexRuntimeManager(tmp_path / "bridge")
+    manager = _test_runtime_manager(tmp_path / "bridge")
     manager.prepare({"CODEX_HOME": str(source_home)})
     metadata_path = manager.metadata_path
     before = metadata_path.read_bytes()
@@ -469,7 +489,7 @@ def test_unsafe_provider_overlay_failure_remains_isolation_unsupported(tmp_path:
         'model_provider = "unterminated\n',
         encoding="utf-8",
     )
-    manager = SupervisorCodexRuntimeManager(tmp_path / "bridge")
+    manager = _test_runtime_manager(tmp_path / "bridge")
 
     with pytest.raises(LcbRuntimeIsolationUnsupportedError):
         manager.prepare({"CODEX_HOME": str(source_home)})
@@ -498,7 +518,7 @@ env_key = "THIRD_PARTY_KEY"
         + "\n",
         encoding="utf-8",
     )
-    manager = SupervisorCodexRuntimeManager(tmp_path / "bridge")
+    manager = _test_runtime_manager(tmp_path / "bridge")
 
     metadata = manager.prepare({"CODEX_HOME": str(source_home)})
     rendered = (Path(metadata.codex_home) / "config.toml").read_text(encoding="utf-8")
@@ -514,7 +534,7 @@ def test_session_start_reports_isolation_unsupported_without_starting_backend(
     source_home = tmp_path / "broken-home"
     source_home.mkdir()
     (source_home / "config.toml").write_text("[broken\n", encoding="utf-8")
-    runtime_manager = SupervisorCodexRuntimeManager(tmp_path / "bridge")
+    runtime_manager = _test_runtime_manager(tmp_path / "bridge")
     memory = MemoryService()
     backend_created = False
 
@@ -744,7 +764,7 @@ def test_proxy_contract_mismatch_fails_before_lcb_spawn(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manager = SupervisorCodexRuntimeManager(tmp_path)
+    manager = _test_runtime_manager(tmp_path)
     manager.prepare({"CODEX_HOME": str(tmp_path / "empty-home")})
     environment = manager.environment({})
     environment[lcb_runtime_proxy.SUPERVISOR_CONTRACT_ENV] = "unsupported-contract"

@@ -9,7 +9,10 @@ from codex_supervisor_bridge.backends.models import BackendHealth, BackendHealth
 from codex_supervisor_bridge.bootstrap import (
     CodexAuthMode,
     CodexConfigInspector,
+    CodexExecutableResolver,
+    CodexExecutableSource,
     CodexReadinessDetector,
+    PhysicalPathVerificationError,
 )
 from codex_supervisor_bridge.bootstrap.configuration import ConfigStore
 from codex_supervisor_bridge.bootstrap.doctor import Doctor
@@ -89,6 +92,13 @@ def write_custom_config(
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def fake_codex_executable(tmp_path: Path) -> str:
+    path = tmp_path / "codex-bin" / "codex.exe"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("fake codex executable", encoding="utf-8")
+    return str(path)
+
+
 def test_config_inspector_reports_provider_env_key_without_value(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
     write_custom_config(config)
@@ -107,6 +117,67 @@ def test_config_inspector_reports_provider_env_key_without_value(tmp_path: Path)
     assert inspection.base_url_masked == "https://provider.example"
     rendered = json.dumps(inspection.model_dump(mode="json"))
     assert SENTINEL not in rendered
+
+
+def test_codex_executable_resolver_uses_configured_bundled_then_path_sources(
+    tmp_path: Path,
+) -> None:
+    configured = tmp_path / "configured" / "codex.exe"
+    configured.parent.mkdir()
+    configured.write_text("configured", encoding="utf-8")
+    bundled_root = tmp_path / "local" / "OpenAI" / "Codex" / "bin"
+    bundled_root.mkdir(parents=True)
+    bundled = bundled_root / "codex.exe"
+    bundled.write_text("bundled", encoding="utf-8")
+    path_executable = tmp_path / "path" / "codex.exe"
+    path_executable.parent.mkdir(parents=True)
+    path_executable.write_text("path", encoding="utf-8")
+
+    resolver = CodexExecutableResolver(
+        finder=lambda name: str(path_executable),
+        environ={"LOCALAPPDATA": str(tmp_path / "local")},
+    )
+    configured_candidate = resolver.resolve(configured)
+    bundled_candidate = resolver.resolve()
+
+    assert configured_candidate.source == CodexExecutableSource.CONFIGURED
+    assert configured_candidate.path == str(configured)
+    assert bundled_candidate.source == CodexExecutableSource.DESKTOP_BUNDLED
+    assert bundled_candidate.path == str(bundled)
+
+    path_candidate = CodexExecutableResolver(
+        finder=lambda name: str(path_executable),
+        environ={},
+    ).resolve()
+    assert path_candidate.source == CodexExecutableSource.PATH
+    assert path_candidate.path == str(path_executable)
+
+    unknown_candidate = CodexExecutableResolver(
+        finder=lambda name: None,
+        environ={},
+    ).resolve()
+    assert unknown_candidate.source == CodexExecutableSource.UNKNOWN
+    assert unknown_candidate.exists is False
+
+
+def test_codex_executable_resolver_fails_closed_on_unverified_physical_path() -> None:
+    class _RejectingPathGuard:
+        def verify_root(self, *_args: object, **_kwargs: object) -> None:
+            raise PhysicalPathVerificationError(
+                "SUPERVISOR_HOST_PATH_VIRTUALIZED",
+                "Codex executable resolves through a packaged view",
+            )
+
+    candidate = CodexExecutableResolver(
+        finder=lambda _name: r"C:\Users\Windows\AppData\Local\OpenAI\Codex\codex.exe",
+        environ={},
+        path_guard=_RejectingPathGuard(),  # type: ignore[arg-type]
+    ).resolve()
+
+    assert candidate.source == CodexExecutableSource.PATH
+    assert candidate.exists is False
+    assert candidate.technical_detail is not None
+    assert "SUPERVISOR_HOST_PATH_VIRTUALIZED" in candidate.technical_detail
 
 
 def test_config_inspector_checks_env_key_membership_without_reading_value(
@@ -221,10 +292,11 @@ def test_custom_provider_runtime_success_is_ready_without_login(tmp_path: Path) 
     workspace.mkdir()
     (workspace / ".git").mkdir()
     runner = FakeCodexRunner()
+    codex_executable = fake_codex_executable(tmp_path)
     before = config.read_bytes()
 
     readiness = CodexReadinessDetector(
-        finder=lambda name: "C:/tools/codex.exe",
+        finder=lambda name: codex_executable,
         runner=runner,
         environ={"THIRD_PARTY_API_KEY": SENTINEL},
     ).probe(executable="codex", workspace=workspace, config_path=config)
@@ -255,9 +327,10 @@ def test_env_key_missing_degrades_without_runtime_smoke(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
     write_custom_config(config)
     runner = FakeCodexRunner()
+    codex_executable = fake_codex_executable(tmp_path)
 
     readiness = CodexReadinessDetector(
-        finder=lambda name: "C:/tools/codex.exe",
+        finder=lambda name: codex_executable,
         runner=runner,
         environ={},
     ).probe(executable="codex", config_path=config)
@@ -277,9 +350,10 @@ def test_invalid_codex_config_fails_closed_without_modification(tmp_path: Path) 
     config.write_text("model_provider = [unterminated\n", encoding="utf-8")
     before = config.read_bytes()
     runner = FakeCodexRunner()
+    codex_executable = fake_codex_executable(tmp_path)
 
     readiness = CodexReadinessDetector(
-        finder=lambda name: "C:/tools/codex.exe",
+        finder=lambda name: codex_executable,
         runner=runner,
         environ={"THIRD_PARTY_API_KEY": SENTINEL},
     ).probe(executable="codex", config_path=config)
@@ -301,9 +375,10 @@ def test_provider_auth_failure_is_classified_without_secret_exposure(tmp_path: P
         smoke_returncode=1,
         smoke_stderr=f"HTTP 401 invalid api key {SENTINEL}\n",
     )
+    codex_executable = fake_codex_executable(tmp_path)
 
     readiness = CodexReadinessDetector(
-        finder=lambda name: "C:/tools/codex.exe",
+        finder=lambda name: codex_executable,
         runner=runner,
         environ={"THIRD_PARTY_API_KEY": SENTINEL},
     ).probe(executable="codex", config_path=config)
@@ -321,9 +396,10 @@ def test_provider_auth_failure_is_classified_without_secret_exposure(tmp_path: P
 def test_provider_timeout_and_model_unavailable_are_separate_failures(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
     write_custom_config(config)
+    codex_executable = fake_codex_executable(tmp_path)
     timeout_runner = FakeCodexRunner(timeout=True)
     timeout_readiness = CodexReadinessDetector(
-        finder=lambda name: "C:/tools/codex.exe",
+        finder=lambda name: codex_executable,
         runner=timeout_runner,
         environ={"THIRD_PARTY_API_KEY": SENTINEL},
     ).probe(executable="codex", config_path=config)
@@ -337,7 +413,7 @@ def test_provider_timeout_and_model_unavailable_are_separate_failures(tmp_path: 
         smoke_stderr="model_not_found\n",
     )
     model_readiness = CodexReadinessDetector(
-        finder=lambda name: "C:/tools/codex.exe",
+        finder=lambda name: codex_executable,
         runner=model_runner,
         environ={"THIRD_PARTY_API_KEY": SENTINEL},
     ).probe(executable="codex", config_path=config)
@@ -362,10 +438,11 @@ def test_secret_sentinel_is_absent_from_full_doctor_output(
 
     paths = AppDataPaths.from_environment()
     runner = FakeCodexRunner()
+    codex_executable = fake_codex_executable(tmp_path)
     doctor = Doctor(
         paths=paths,
         config_store=ConfigStore(paths=paths),
-        executable_finder=lambda name: "C:/tools/codex.exe" if name == "codex" else None,
+        executable_finder=lambda name: codex_executable if name == "codex" else None,
         command_runner=runner,
     )
     status = doctor.run()
@@ -387,6 +464,7 @@ def test_doctor_preserves_runtime_smoke_timeout_budget(tmp_path: Path) -> None:
     app_root = tmp_path / "app"
     project = tmp_path / "project"
     (project / ".git").mkdir(parents=True)
+    codex_executable = fake_codex_executable(tmp_path)
     commands: list[tuple[list[str], dict[str, object]]] = []
 
     def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -406,7 +484,7 @@ def test_doctor_preserves_runtime_smoke_timeout_budget(tmp_path: Path) -> None:
             },
             system="Windows",
         ),
-        executable_finder=lambda name: "C:/tools/codex.exe" if name == "codex" else None,
+        executable_finder=lambda name: codex_executable if name == "codex" else None,
         command_runner=runner,
     )
     status = doctor.run()

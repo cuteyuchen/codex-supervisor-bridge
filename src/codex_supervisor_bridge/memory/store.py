@@ -7,7 +7,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 from uuid import uuid4
 
 from codex_supervisor_bridge.db.migrations import apply_migrations
@@ -37,6 +37,9 @@ from .models import (
     utcnow,
 )
 
+if TYPE_CHECKING:
+    from codex_supervisor_bridge.bootstrap.physical import PhysicalPathGuard
+
 
 def _iso(value: datetime | None = None) -> str:
     return (value or utcnow()).astimezone(timezone.utc).isoformat()
@@ -54,13 +57,28 @@ def _id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex}"
 
 
+def _default_path_guard() -> "PhysicalPathGuard":
+    from codex_supervisor_bridge.bootstrap.physical import PhysicalPathGuard
+
+    return PhysicalPathGuard()
+
+
 class MemoryStore:
     """Single-file durable memory store with optimistic revision locking."""
 
-    def __init__(self, path: str | Path = ":memory:") -> None:
+    def __init__(
+        self,
+        path: str | Path = ":memory:",
+        *,
+        path_guard: PhysicalPathGuard | None = None,
+    ) -> None:
         self.path = str(path)
+        self.path_guard = path_guard or _default_path_guard()
         if self.path != ":memory:":
-            Path(self.path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+            database_path = Path(self.path).expanduser()
+            self.path_guard.ensure_directory(database_path.parent, role="path")
+            self.path_guard.before_write(database_path, role="path")
+            self.path = str(database_path)
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(
             self.path,

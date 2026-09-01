@@ -13,6 +13,7 @@ from typing import Sequence
 from .codex_isolation import (
     SUPERVISOR_CONTRACT_ENV,
     SUPERVISOR_EPOCH_ENV,
+    SUPERVISOR_HOST_INSTANCE_ENV,
     SUPERVISOR_METADATA_ENV,
     SUPERVISOR_RUNTIME_ENV,
     SUPERVISOR_TOKEN_ENV,
@@ -21,6 +22,7 @@ from .codex_isolation import (
     ProcessObservation,
     runtime_verification_failure,
 )
+from .physical import PhysicalPathGuard, PhysicalPathVerificationError
 from .process import CodexProcessOwnership
 
 
@@ -32,15 +34,21 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _atomic_metadata(path: Path, metadata: CodexRuntimeMetadata) -> None:
-    temporary = path.with_suffix(path.suffix + ".proxy.tmp")
-    temporary.write_text(
+    guard = PhysicalPathGuard()
+    guard.write_text(
+        path,
         json.dumps(metadata.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+        role="runtime",
     )
-    os.replace(temporary, path)
 
 
-def _read_metadata(path: Path) -> CodexRuntimeMetadata:
+def _read_metadata(
+    path: Path,
+    *,
+    path_guard: PhysicalPathGuard | None = None,
+) -> CodexRuntimeMetadata:
+    guard = path_guard or PhysicalPathGuard()
+    guard.verify_root(path, role="runtime")
     return CodexRuntimeMetadata.model_validate_json(path.read_text(encoding="utf-8"))
 
 
@@ -126,9 +134,13 @@ def run(metadata_path: Path, command: Sequence[str]) -> int:
         command = command[1:]
     if not command:
         return 2
+    path_guard = PhysicalPathGuard()
     try:
-        metadata = _read_metadata(metadata_path)
-    except (OSError, ValueError):
+        # Validate the metadata path before reading it.  The proxy must never
+        # inspect or mutate a path that resolves through Desktop/package state.
+        path_guard.verify_root(metadata_path, role="runtime")
+        metadata = _read_metadata(metadata_path, path_guard=path_guard)
+    except (OSError, ValueError, PhysicalPathVerificationError):
         return 3
     if (
         metadata_path != Path(os.environ.get(SUPERVISOR_METADATA_ENV, metadata_path))
@@ -136,6 +148,9 @@ def run(metadata_path: Path, command: Sequence[str]) -> int:
         or metadata.instance_id != os.environ.get(SUPERVISOR_RUNTIME_ENV)
         or str(metadata.runtime_epoch) != os.environ.get(SUPERVISOR_EPOCH_ENV)
         or metadata.ownership_token_hash != _token_hash()
+        or metadata.supervisor_host_instance_id
+        != os.environ.get(SUPERVISOR_HOST_INSTANCE_ENV)
+        or metadata.codex_executable != os.environ.get("CODEX_EXE")
     ):
         _fail(
             metadata_path,
@@ -146,6 +161,29 @@ def run(metadata_path: Path, command: Sequence[str]) -> int:
         return 4
 
     inspector = ProcessInspector()
+    path_guard.verify_root(metadata_path, role="runtime")
+    path_guard.verify_root(
+        Path(metadata.codex_home),
+        role="codex_home",
+        require_directory=True,
+    )
+    if not metadata.codex_executable:
+        _fail(
+            metadata_path,
+            metadata,
+            "SUPERVISOR_CODEX_RUNTIME_FAILED",
+            "Supervisor Codex executable identity is missing",
+        )
+        return 5
+    path_guard.verify_root(Path(metadata.codex_executable), role="process")
+    if metadata.supervisor_parent_process is None:
+        _fail(
+            metadata_path,
+            metadata,
+            "CODEX_RUNTIME_OWNERSHIP_UNKNOWN",
+            "Supervisor parent process identity is missing",
+        )
+        return 5
     proxy_identity = inspector.identity(os.getpid())
     if proxy_identity is None:
         _fail(
@@ -155,8 +193,17 @@ def run(metadata_path: Path, command: Sequence[str]) -> int:
             "runtime proxy process identity is unavailable",
         )
         return 5
+    if not _proxy_parent_matches(proxy_identity, metadata.supervisor_parent_process):
+        _fail(
+            metadata_path,
+            metadata,
+            "CODEX_RUNTIME_OWNERSHIP_UNKNOWN",
+            "runtime proxy parent is not the persisted Supervisor Host process",
+        )
+        return 5
 
     try:
+        path_guard.before_spawn(list(command), role="runtime")
         child_environment = dict(os.environ)
         child = subprocess.Popen(
             command,
@@ -293,10 +340,14 @@ def run(metadata_path: Path, command: Sequence[str]) -> int:
         current_app_server = _owned_app_server(processes, child.pid)
         if (
             current_lcb is None
-            or current_lcb.creation_time != ready_metadata.lcb_process.creation_time
+            or ready_metadata.lcb_process is None
+            or not _same_process_identity(ready_metadata.lcb_process, current_lcb)
             or current_app_server is None
-            or current_app_server.creation_time
-            != ready_metadata.app_server_process.creation_time
+            or ready_metadata.app_server_process is None
+            or not _same_process_identity(
+                ready_metadata.app_server_process,
+                current_app_server,
+            )
         ):
             _fail(
                 metadata_path,
@@ -335,6 +386,18 @@ def run(metadata_path: Path, command: Sequence[str]) -> int:
     except (OSError, ValueError):
         pass
     return int(return_code)
+
+
+def _proxy_parent_matches(
+    proxy: ProcessObservation,
+    expected_parent: ProcessObservation,
+) -> bool:
+    return bool(
+        proxy.parent_pid == expected_parent.pid
+        and proxy.parent_creation_time == expected_parent.creation_time
+        and os.path.normcase(proxy.parent_executable or "")
+        == os.path.normcase(expected_parent.executable)
+    )
 
 
 def main() -> None:

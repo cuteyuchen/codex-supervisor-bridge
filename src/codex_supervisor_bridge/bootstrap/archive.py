@@ -5,34 +5,53 @@ import tarfile
 import zipfile
 from pathlib import Path
 
+from .physical import PhysicalPathGuard
+
 
 class UnsafeArchiveError(ValueError):
     """Raised when an archive tries to escape its extraction root."""
 
 
-def extract_zip_safe(archive_path: Path, destination: Path) -> None:
+def extract_zip_safe(
+    archive_path: Path,
+    destination: Path,
+    *,
+    path_guard: PhysicalPathGuard | None = None,
+) -> None:
     """Extract a ZIP archive without path traversal, drive escapes, or links."""
-    destination.mkdir(parents=True, exist_ok=True)
+    guard = path_guard or PhysicalPathGuard()
+    guard.verify_root(archive_path, role="components")
+    guard.ensure_directory(destination, role="components")
     with zipfile.ZipFile(archive_path) as archive:
         for member in archive.infolist():
             _validate_zip_member(member)
             target = _resolve_member(destination, member.filename)
             if _is_zip_dir(member):
-                target.mkdir(parents=True, exist_ok=True)
+                guard.ensure_directory(target, role="components")
                 continue
             if _is_zip_symlink(member):
                 raise UnsafeArchiveError(
                     f"archive member is a symlink: {member.filename}"
                 )
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(member) as source, target.open("wb") as out:
-                while chunk := source.read(1024 * 1024):
-                    out.write(chunk)
+            guard.ensure_directory(target.parent, role="components")
+            with archive.open(member) as source:
+                guard.write_stream(
+                    target,
+                    iter(lambda: source.read(1024 * 1024), b""),
+                    role="components",
+                )
 
 
-def extract_tar_safe(archive_path: Path, destination: Path) -> None:
+def extract_tar_safe(
+    archive_path: Path,
+    destination: Path,
+    *,
+    path_guard: PhysicalPathGuard | None = None,
+) -> None:
     """Extract a tar archive without path traversal, links, or device nodes."""
-    destination.mkdir(parents=True, exist_ok=True)
+    guard = path_guard or PhysicalPathGuard()
+    guard.verify_root(archive_path, role="components")
+    guard.ensure_directory(destination, role="components")
     with tarfile.open(archive_path, mode="r:*") as archive:
         for member in archive:
             if member.issym() or member.islnk():
@@ -45,17 +64,21 @@ def extract_tar_safe(archive_path: Path, destination: Path) -> None:
                 )
             target = _resolve_member(destination, member.name)
             if member.isdir():
-                target.mkdir(parents=True, exist_ok=True)
+                guard.ensure_directory(target, role="components")
                 continue
             if not member.isreg():
                 continue
-            target.parent.mkdir(parents=True, exist_ok=True)
+            guard.ensure_directory(target.parent, role="components")
+            guard.before_write(target, role="components")
             source = archive.extractfile(member)
             if source is None:
                 continue
-            with source, target.open("wb") as out:
-                while chunk := source.read(1024 * 1024):
-                    out.write(chunk)
+            with source:
+                guard.write_stream(
+                    target,
+                    iter(lambda: source.read(1024 * 1024), b""),
+                    role="components",
+                )
 
 
 def _validate_zip_member(member: zipfile.ZipInfo) -> None:

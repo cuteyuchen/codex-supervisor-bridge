@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -17,11 +18,13 @@ from mcp.shared.auth import OAuthToken
 from pydantic import ValidationError
 
 import codex_supervisor_bridge.bootstrap.paths as paths_module
+import codex_supervisor_bridge.mcp.server as server_module
 from codex_supervisor_bridge.bootstrap import (
     AppConfig,
     AppDataMigrationError,
     AppDataPaths,
     AuthorizationStatus,
+    CodexProcessOwnership,
     CodexReadinessDetector,
     CommandAuthorizationPolicy,
     CommandRequest,
@@ -47,6 +50,7 @@ from codex_supervisor_bridge.bootstrap import (
     MemorySecretStore,
     PortAllocator,
     ProcessManager,
+    ProcessObservation,
     ProcessState,
     ProfileABHarness,
     ProfileScenarioRunner,
@@ -56,6 +60,7 @@ from codex_supervisor_bridge.bootstrap import (
     SecureRemoteAccessConfig,
     SecureRemoteAccessController,
     SecureRemoteAccessValidator,
+    StandaloneSupervisorHost,
     authorize_command,
     migrate_legacy_app_data,
     redact_oauth_payload,
@@ -72,6 +77,13 @@ from tests.lcb_fixtures import (
     write_hardened_lcb_repository,
     write_upstream_lcb_repository,
 )
+
+
+def fake_codex_executable(tmp_path: Path) -> str:
+    path = tmp_path / "codex-bin" / "codex.exe"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("fake codex executable", encoding="utf-8")
+    return str(path)
 
 
 class FakeDoctor:
@@ -93,6 +105,31 @@ class FakeDoctor:
     def run(self, options: object | None = None) -> DoctorStatus:
         del options
         return DoctorStatus(status=self.status, components=list(self.components))
+
+
+class _TestHostProcessInspector:
+    """Provide an explicit managed-host identity for library-level tests."""
+
+    def identity(self, pid: int) -> ProcessObservation:
+        return ProcessObservation(
+            pid=pid,
+            creation_time="test-host-creation",
+            executable="supervisor-host-test.exe",
+            command_line_fingerprint="test-host-command",
+            parent_pid=1,
+            parent_creation_time="test-host-parent",
+            parent_executable="powershell.exe",
+        )
+
+    def snapshot(self) -> list[ProcessObservation]:
+        return [self.identity(os.getpid())]
+
+
+def _test_supervisor_host(paths: AppDataPaths) -> StandaloneSupervisorHost:
+    return StandaloneSupervisorHost(
+        paths=paths,
+        process_inspector=_TestHostProcessInspector(),
+    )
 
 
 def test_windows_paths_follow_local_app_data(tmp_path: Path) -> None:
@@ -350,6 +387,72 @@ def test_only_legacy_persistent_state_migrates_with_backup_and_inactive_marker(
     backups = list((canonical / ".migration-backups").iterdir())
     assert len(backups) == 1
     assert (backups[0] / "data" / "supervisor.db").is_file()
+
+
+def test_legacy_running_record_with_stale_pid_is_cleared_before_migration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical = tmp_path / "Canonical Bridge Data"
+    legacy = tmp_path / "Legacy Bridge Data"
+    paths = _test_app_data_paths(canonical, legacy)
+    (legacy / "runtime").mkdir(parents=True)
+    (legacy / "runtime" / "processes.json").write_text(
+        json.dumps(
+            {
+                "bridge": {
+                    "status": "RUNNING",
+                    "pid": 777,
+                    "process_identity": {
+                        "pid": 777,
+                        "creation_time": "old",
+                        "executable": "bridge.exe",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "codex_supervisor_bridge.bootstrap.process._pid_exists",
+        lambda _pid: False,
+    )
+
+    migrated = migrate_legacy_app_data(paths)
+
+    assert migrated.status == "CLEAN"
+    migrated_state = json.loads(
+        (canonical / "runtime" / "processes.json").read_text(encoding="utf-8")
+    )
+    assert migrated_state["bridge"]["status"] == "STOPPED"
+    assert migrated_state["bridge"]["pid"] is None
+
+
+def test_legacy_live_record_with_unknown_identity_blocks_migration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical = tmp_path / "Canonical Bridge Data"
+    legacy = tmp_path / "Legacy Bridge Data"
+    paths = _test_app_data_paths(canonical, legacy)
+    (legacy / "runtime").mkdir(parents=True)
+    (legacy / "runtime" / "processes.json").write_text(
+        json.dumps({"bridge": {"status": "RUNNING", "pid": 777}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "codex_supervisor_bridge.bootstrap.process._pid_exists",
+        lambda _pid: True,
+    )
+    monkeypatch.setattr(
+        "codex_supervisor_bridge.bootstrap.process._process_identity",
+        lambda _pid: None,
+    )
+
+    with pytest.raises(AppDataMigrationError, match="ownership is unknown"):
+        migrate_legacy_app_data(paths)
+
+    assert not (canonical / "runtime" / "processes.json").exists()
 
 
 def test_legacy_migration_replaces_only_empty_canonical_state_directories(
@@ -661,7 +764,7 @@ def test_configure_persists_user_intent_and_cli_flags(tmp_path: Path) -> None:
     project.mkdir()
     local_repository = tmp_path / "Local-Codex-Bridge"
     local_repository.mkdir()
-    service = BootstrapService(paths=paths)
+    service = BootstrapService(paths=paths, host=_test_supervisor_host(paths))
     result = service.configure(
         project_directory=project,
         development_style=DevelopmentStyle.CODEX_FIRST,
@@ -752,6 +855,22 @@ class DummyProcess:
         return self.returncode or 0
 
 
+def fake_process_identity(pid: int) -> dict[str, object]:
+    parent_pid = 40000
+    return {
+        "executable": "fake-supervisor-process.exe",
+        "started_at": pid + 100000,
+        "parent_pid": parent_pid,
+        "command_fingerprint": f"fake-command-{pid}",
+        "parent_process_identity": {
+            "executable": "fake-supervisor-parent.exe",
+            "started_at": 1,
+            "parent_pid": 4,
+            "command_fingerprint": "fake-parent-command",
+        },
+    }
+
+
 def test_process_manager_tracks_lifecycle_and_stale_pid(tmp_path: Path) -> None:
     launched: list[DummyProcess] = []
 
@@ -761,7 +880,12 @@ def test_process_manager_tracks_lifecycle_and_stale_pid(tmp_path: Path) -> None:
         launched.append(process)
         return process
 
-    manager = ProcessManager(tmp_path / "runtime", tmp_path / "logs", launcher=launch)
+    manager = ProcessManager(
+        tmp_path / "runtime",
+        tmp_path / "logs",
+        launcher=launch,
+        identity_reader=fake_process_identity,
+    )
     spec = ManagedProcessSpec(name="bridge", command=["dummy"])
     running = manager.start(spec)
     assert running.status == "RUNNING"
@@ -788,7 +912,12 @@ def test_process_manager_honors_startup_readiness_timeout(tmp_path: Path) -> Non
         launched.append(process)
         return process
 
-    manager = ProcessManager(tmp_path / "runtime", tmp_path / "logs", launcher=launch)
+    manager = ProcessManager(
+        tmp_path / "runtime",
+        tmp_path / "logs",
+        launcher=launch,
+        identity_reader=fake_process_identity,
+    )
     state = manager.start(
         ManagedProcessSpec(
             name="slow",
@@ -836,7 +965,19 @@ def test_process_manager_does_not_start_duplicate_for_ambiguous_live_pid(tmp_pat
 
 def test_process_manager_recovers_verified_persisted_process(tmp_path: Path, monkeypatch) -> None:
     launched: list[object] = []
-    identity = {"executable": "C:/managed/node.exe", "started_at": 123456}
+    parent_identity = {
+        "executable": "C:/Windows/System32/services.exe",
+        "started_at": 987654,
+        "parent_pid": 4,
+        "command_fingerprint": "parent-command",
+    }
+    identity = {
+        "executable": "C:/managed/node.exe",
+        "started_at": 123456,
+        "parent_pid": 100,
+        "command_fingerprint": "bridge-command",
+        "parent_process_identity": parent_identity,
+    }
     manager = ProcessManager(
         tmp_path / "runtime",
         tmp_path / "logs",
@@ -850,6 +991,8 @@ def test_process_manager_recovers_verified_persisted_process(tmp_path: Path, mon
                     "pid": 42,
                     "restart_count": 0,
                     "process_identity": identity,
+                    "identity_status": "VERIFIED",
+                    "ownership": "SUPERVISOR_MANAGED",
                 }
             }
         ),
@@ -902,6 +1045,64 @@ def test_process_manager_rejects_reused_pid_with_different_identity(
 
     assert state.status == "UNKNOWN"
     assert state.technical_detail == "persisted PID is alive without a verified managed identity"
+
+
+def test_process_manager_restart_clears_reused_pid_without_touching_live_process(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    launched: list[DummyProcess] = []
+
+    def launch(*args: object, **kwargs: object) -> DummyProcess:
+        del args, kwargs
+        process = DummyProcess()
+        launched.append(process)
+        return process
+
+    old_identity = fake_process_identity(42)
+    reused_identity = {
+        **old_identity,
+        "started_at": 654321,
+        "command_fingerprint": "reused-command",
+    }
+    manager = ProcessManager(
+        tmp_path / "runtime",
+        tmp_path / "logs",
+        launcher=launch,
+        identity_reader=lambda pid: reused_identity if pid == 42 else fake_process_identity(pid),
+    )
+    (tmp_path / "runtime" / "processes.json").write_text(
+        json.dumps(
+            {
+                "bridge": {
+                    "status": "RUNNING",
+                    "pid": 42,
+                    "restart_count": 0,
+                    "process_identity": old_identity,
+                    "identity_status": "VERIFIED",
+                    "ownership": "SUPERVISOR_MANAGED",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "codex_supervisor_bridge.bootstrap.process._pid_exists",
+        lambda pid: pid == 42,
+    )
+
+    restarted = manager.restart(
+        ManagedProcessSpec(
+            name="bridge",
+            command=["dummy"],
+            ownership=CodexProcessOwnership.SUPERVISOR_MANAGED,
+        )
+    )
+
+    assert restarted.status == "RUNNING"
+    assert len(launched) == 1
+    assert restarted.pid == launched[0].pid
+    assert restarted.identity_status == "VERIFIED"
 
 
 def test_windows_pid_probe_uses_process_identity(monkeypatch) -> None:
@@ -1179,10 +1380,15 @@ def test_bootstrap_start_reports_supervisor_launch_failure(tmp_path: Path) -> No
             del spec, restart
             raise OSError("launcher unavailable")
 
-    service = BootstrapService(paths=AppDataPaths.from_environment(
+    paths = AppDataPaths.from_environment(
         environ={"CODEX_SUPERVISOR_DATA_DIR": str(tmp_path / "app")},
         system="Linux",
-    ), process_manager=FailingProcessManager())
+    )
+    service = BootstrapService(
+        paths=paths,
+        host=_test_supervisor_host(paths),
+        process_manager=FailingProcessManager(),
+    )
     result = service.start(project_directory=tmp_path)
 
     assert result.repairs[-1].action == "start_supervisor"
@@ -1238,6 +1444,7 @@ def test_bootstrap_start_uses_local_codex_protocol_bootstrap(tmp_path: Path) -> 
 
     result = BootstrapService(
         paths=paths,
+        host=_test_supervisor_host(paths),
         config_store=config_store,
         process_manager=process_manager,
         doctor=FakeDoctor(
@@ -1301,6 +1508,7 @@ def test_bootstrap_start_uses_local_codex_repository_launch(tmp_path: Path) -> N
 
     result = BootstrapService(
         paths=paths,
+        host=_test_supervisor_host(paths),
         config_store=config_store,
         process_manager=process_manager,
         doctor=FakeDoctor(
@@ -1375,6 +1583,7 @@ def test_bootstrap_start_skips_incompatible_devspace_release(tmp_path: Path) -> 
 
     result = BootstrapService(
         paths=paths,
+        host=_test_supervisor_host(paths),
         process_manager=process_manager,
         doctor=doctor,
     ).start(project_directory=tmp_path)
@@ -1437,6 +1646,7 @@ def test_bootstrap_start_skips_local_codex_bridge_with_old_node(tmp_path: Path) 
 
     result = BootstrapService(
         paths=paths,
+        host=_test_supervisor_host(paths),
         config_store=config_store,
         process_manager=process_manager,
         doctor=doctor,
@@ -1502,6 +1712,7 @@ def test_bootstrap_start_launches_all_healthy_components(tmp_path: Path) -> None
 
     result = BootstrapService(
         paths=paths,
+        host=_test_supervisor_host(paths),
         config_store=config_store,
         process_manager=process_manager,
         doctor=doctor,
@@ -1516,12 +1727,23 @@ def test_bootstrap_start_launches_all_healthy_components(tmp_path: Path) -> None
     assert devspace_spec.env["DEVSPACE_TOOL_MODE"] == "codex"
     assert devspace_spec.env["DEVSPACE_WIDGETS"] == "changes"
     command = list(supervisor_spec.command)
+    assert command[:3] == [
+        sys.executable,
+        "-m",
+        "codex_supervisor_bridge.bootstrap.host",
+    ]
     devspace_url_index = command.index("--devspace-mcp-url") + 1
     configured_devspace_port = config_store.load().config.advanced.ports["devspace"]
     assert command[devspace_url_index] == (
         f"http://127.0.0.1:{configured_devspace_port}/mcp"
     )
     assert supervisor_spec.startup_timeout >= 60
+    assert supervisor_spec.env is not None
+    assert supervisor_spec.env["CODEX_SUPERVISOR_HOST_AUTHORITY"] == "standalone-v1"
+    assert supervisor_spec.env["CODEX_SUPERVISOR_HOST_INSTANCE_ID"]
+    assert supervisor_spec.env["CODEX_SUPERVISOR_HOST_IDENTITY_PATH"] == str(
+        _test_supervisor_host(paths).host_identity_path
+    )
     assert any(item.action == "start_process:devspace" for item in result.repairs)
     assert any(item.action == "agent_session:local_codex_bridge" for item in result.repairs)
     assert not any(spec.name == "local_codex_bridge" for spec in process_manager.started)
@@ -1562,6 +1784,7 @@ def test_bootstrap_start_uses_managed_node_to_launch_devspace(tmp_path: Path) ->
 
     result = BootstrapService(
         paths=paths,
+        host=_test_supervisor_host(paths),
         config_store=config_store,
         process_manager=process_manager,
         doctor=FakeDoctor(
@@ -1797,7 +2020,10 @@ def test_bootstrap_user_view_hides_internal_repair_names(tmp_path: Path) -> None
     )
     from codex_supervisor_bridge.bootstrap import BootstrapService
 
-    status = BootstrapService(paths=paths).repair_and_status(project_directory=tmp_path)
+    status = BootstrapService(
+        paths=paths,
+        host=_test_supervisor_host(paths),
+    ).repair_and_status(project_directory=tmp_path)
     rendered = json.dumps(status.user_view(), ensure_ascii=False).lower()
     assert "devspace" not in rendered
     assert "mcp" not in rendered
@@ -2304,12 +2530,16 @@ def test_devspace_local_oauth_real_loopback_protocol() -> None:
     assert "fake-refresh-token" not in redacted
 
 
-def test_codex_readiness_requires_real_runtime_probe() -> None:
+def test_codex_readiness_requires_real_runtime_probe(tmp_path: Path) -> None:
     def runner(command: list[str], **kwargs: object) -> object:
         del kwargs
         return subprocess.CompletedProcess(command, 0, "codex 1.2.3\n", "")
 
-    detector = CodexReadinessDetector(finder=lambda name: "C:/tools/codex.exe", runner=runner)
+    codex_executable = fake_codex_executable(tmp_path)
+    detector = CodexReadinessDetector(
+        finder=lambda name: codex_executable,
+        runner=runner,
+    )
     readiness = detector.probe()
     assert readiness.process_launchable is True
     assert readiness.runtime_ready is False
@@ -2497,7 +2727,12 @@ def test_process_manager_does_not_launch_duplicate_while_running(tmp_path: Path)
         launched.append(process)
         return process
 
-    manager = ProcessManager(tmp_path / "runtime", tmp_path / "logs", launcher=launch)
+    manager = ProcessManager(
+        tmp_path / "runtime",
+        tmp_path / "logs",
+        launcher=launch,
+        identity_reader=fake_process_identity,
+    )
     spec = ManagedProcessSpec(name="bridge", command=["dummy"])
 
     first = manager.start(spec)
@@ -2517,7 +2752,12 @@ def test_process_manager_detects_crash_on_next_health_check(tmp_path: Path) -> N
         launched.append(process)
         return process
 
-    manager = ProcessManager(tmp_path / "runtime", tmp_path / "logs", launcher=launch)
+    manager = ProcessManager(
+        tmp_path / "runtime",
+        tmp_path / "logs",
+        launcher=launch,
+        identity_reader=fake_process_identity,
+    )
     spec = ManagedProcessSpec(name="bridge", command=["dummy"])
 
     assert manager.start(spec).status == "RUNNING"
@@ -2542,7 +2782,12 @@ def test_process_manager_restart_limit_is_bounded(tmp_path: Path) -> None:
         launched.append(process)
         return process
 
-    manager = ProcessManager(tmp_path / "runtime", tmp_path / "logs", launcher=launch)
+    manager = ProcessManager(
+        tmp_path / "runtime",
+        tmp_path / "logs",
+        launcher=launch,
+        identity_reader=fake_process_identity,
+    )
     spec = ManagedProcessSpec(name="bridge", command=["dummy"], max_restarts=2)
 
     assert manager.start(spec).status == "CRASHED"
@@ -2565,7 +2810,12 @@ def test_process_manager_restart_reuses_log_and_persists_count(tmp_path: Path) -
         launched.append(process)
         return process
 
-    manager = ProcessManager(tmp_path / "runtime", tmp_path / "logs", launcher=launch)
+    manager = ProcessManager(
+        tmp_path / "runtime",
+        tmp_path / "logs",
+        launcher=launch,
+        identity_reader=fake_process_identity,
+    )
     spec = ManagedProcessSpec(name="bridge", command=["dummy"])
 
     running = manager.start(spec)
@@ -2588,7 +2838,12 @@ def test_process_manager_readiness_probe_can_succeed(tmp_path: Path) -> None:
         launched.append(process)
         return process
 
-    manager = ProcessManager(tmp_path / "runtime", tmp_path / "logs", launcher=launch)
+    manager = ProcessManager(
+        tmp_path / "runtime",
+        tmp_path / "logs",
+        launcher=launch,
+        identity_reader=fake_process_identity,
+    )
     state = manager.start(
         ManagedProcessSpec(
             name="bridge",
@@ -2610,7 +2865,12 @@ def test_process_manager_graceful_stop_falls_back_to_hard_kill(tmp_path: Path) -
         launched.append(process)
         return process
 
-    manager = ProcessManager(tmp_path / "runtime", tmp_path / "logs", launcher=launch)
+    manager = ProcessManager(
+        tmp_path / "runtime",
+        tmp_path / "logs",
+        launcher=launch,
+        identity_reader=fake_process_identity,
+    )
     assert manager.start(ManagedProcessSpec(name="bridge", command=["dummy"])).status == "RUNNING"
     stopped = manager.stop("bridge")
 
@@ -2631,6 +2891,7 @@ def test_codex_readiness_full_probe_matrix(tmp_path: Path) -> None:
         return subprocess.CompletedProcess(command, returncode, stdout, stderr)
 
     calls: list[list[str]] = []
+    codex_executable = fake_codex_executable(tmp_path)
 
     def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         del kwargs
@@ -2647,15 +2908,20 @@ def test_codex_readiness_full_probe_matrix(tmp_path: Path) -> None:
             pass
         return completed(command)
 
-    missing = CodexReadinessDetector(finder=lambda name: None, runner=runner).probe()
+    missing = CodexReadinessDetector(
+        finder=lambda name: None,
+        runner=runner,
+        environ={},
+    ).probe()
     assert missing.status == HealthStatus.UNAVAILABLE
     assert missing.process_launchable is False
     assert missing.technical_detail == "executable not found"
     assert calls == []
 
     version_failed = CodexReadinessDetector(
-        finder=lambda name: "C:/tools/codex.exe",
+        finder=lambda name: codex_executable,
         runner=lambda command, **kwargs: completed(command, returncode=1, stderr="panic"),
+        environ={},
     ).probe()
     assert version_failed.status == HealthStatus.DEGRADED
     assert version_failed.process_launchable is False
@@ -2666,8 +2932,9 @@ def test_codex_readiness_full_probe_matrix(tmp_path: Path) -> None:
         raise OSError("cannot launch")
 
     launch_failed = CodexReadinessDetector(
-        finder=lambda name: "C:/tools/codex.exe",
+        finder=lambda name: codex_executable,
         runner=raising_runner,
+        environ={},
     ).probe()
     assert launch_failed.status == HealthStatus.DEGRADED
     assert launch_failed.process_launchable is False
@@ -2678,41 +2945,45 @@ def test_codex_readiness_full_probe_matrix(tmp_path: Path) -> None:
     (workspace / ".git").mkdir()
 
     runtime_missing = CodexReadinessDetector(
-        finder=lambda name: "C:/tools/codex.exe",
+        finder=lambda name: codex_executable,
         runner=lambda command, **kwargs: completed(
             command,
             stdout="codex 1.2.3\n",
             stderr="not logged in\n",
         ),
+        environ={},
     ).probe(workspace=workspace)
     assert runtime_missing.status == HealthStatus.DEGRADED
     assert runtime_missing.runtime_ready is False
     assert runtime_missing.workspace_ready is True
 
     no_git = CodexReadinessDetector(
-        finder=lambda name: "C:/tools/codex.exe",
+        finder=lambda name: codex_executable,
         runner=runner,
+        environ={},
     ).probe(workspace=tmp_path / "not-a-git-project")
     assert no_git.status == HealthStatus.DEGRADED
     assert no_git.workspace_ready is False
     assert no_git.user_message == "Codex 当前配置可以正常使用，但所选项目不可用。"
 
     ready = CodexReadinessDetector(
-        finder=lambda name: "C:/tools/codex.exe",
+        finder=lambda name: codex_executable,
         runner=runner,
+        environ={},
     ).probe(workspace=workspace)
     assert ready.status == HealthStatus.READY
     assert ready.process_launchable is True
     assert ready.runtime_ready is True
     assert ready.workspace_ready is True
     assert ready.version == "codex 1.2.3"
-    assert ready.executable == "C:/tools/codex.exe"
+    assert ready.executable == codex_executable
 
     explicit = tmp_path / "codex.exe"
     explicit.write_text("placeholder", encoding="utf-8")
     explicit_probe = CodexReadinessDetector(
         finder=lambda name: None,
         runner=runner,
+        environ={},
     ).probe(executable=str(explicit), workspace=workspace)
     assert explicit_probe.status == HealthStatus.READY
     assert explicit_probe.executable == str(explicit)
@@ -2730,6 +3001,13 @@ def test_configure_cli_persists_user_intent_end_to_end(
     project.mkdir()
     monkeypatch.setenv("CODEX_SUPERVISOR_DATA_DIR", str(app))
     monkeypatch.setenv("SUPERVISOR_DB_PATH", str(app / "data" / "supervisor.db"))
+    monkeypatch.setattr(
+        server_module,
+        "StandaloneSupervisorHost",
+        lambda *, paths=None: _test_supervisor_host(
+            paths or AppDataPaths.from_environment()
+        ),
+    )
 
     cli_main(
         [
@@ -2771,6 +3049,13 @@ def test_configure_cli_advanced_json_keeps_gui_diagnostics(
     project.mkdir()
     monkeypatch.setenv("CODEX_SUPERVISOR_DATA_DIR", str(app))
     monkeypatch.setenv("SUPERVISOR_DB_PATH", str(app / "data" / "supervisor.db"))
+    monkeypatch.setattr(
+        server_module,
+        "StandaloneSupervisorHost",
+        lambda *, paths=None: _test_supervisor_host(
+            paths or AppDataPaths.from_environment()
+        ),
+    )
 
     cli_main(
         [
@@ -2799,6 +3084,13 @@ def test_doctor_cli_emits_structured_ux_without_provider_names(
     project.mkdir()
     monkeypatch.setenv("CODEX_SUPERVISOR_DATA_DIR", str(app))
     monkeypatch.setenv("SUPERVISOR_DB_PATH", str(app / "data" / "supervisor.db"))
+    monkeypatch.setattr(
+        server_module,
+        "StandaloneSupervisorHost",
+        lambda *, paths=None: _test_supervisor_host(
+            paths or AppDataPaths.from_environment()
+        ),
+    )
 
     cli_main(["doctor", "--json"])
 

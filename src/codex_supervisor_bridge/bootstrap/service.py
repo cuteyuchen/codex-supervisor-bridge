@@ -10,12 +10,21 @@ from pathlib import Path
 from codex_supervisor_bridge.backends.models import BackendHealth, BackendHealthStatus
 from codex_supervisor_bridge.capabilities import CapabilityResolver
 
+from .codex_isolation import SUPERVISOR_HOST_INSTANCE_ENV
 from .configuration import AppConfig, CommandPolicy, ConfigStore, DevelopmentStyle
 from .devspace import DevSpaceBootstrap
 from .doctor import Doctor, DoctorOptions
+from .host import (
+    SUPERVISOR_HOST_AUTHORITY_ENV,
+    SUPERVISOR_HOST_AUTHORITY_VALUE,
+    SUPERVISOR_HOST_IDENTITY_PATH_ENV,
+    SUPERVISOR_HOST_IDENTITY_UNKNOWN,
+    StandaloneSupervisorHost,
+)
 from .local_codex import LocalCodexBridgeBootstrap
 from .models import BootstrapStatus, DoctorStatus, HealthStatus, RepairAction
 from .paths import AppDataPaths
+from .physical import PhysicalPathGuard, PhysicalPathVerificationError
 from .process import ManagedProcessSpec, ProcessManager
 from .remote import (
     OpenAISecureMcpTunnelConfig,
@@ -38,14 +47,21 @@ class BootstrapService:
         repair: RepairService | None = None,
         process_manager: ProcessManager | None = None,
         auto_install: bool = False,
+        host: StandaloneSupervisorHost | None = None,
     ) -> None:
-        self.paths = paths or AppDataPaths.from_environment()
-        self.config_store = config_store or ConfigStore(paths=self.paths)
-        self.process_manager = process_manager or ProcessManager(self.paths.runtime, self.paths.logs)
+        self.host = host or StandaloneSupervisorHost(paths=paths)
+        self.paths = self.host.paths
+        self.path_guard = self.host.path_guard
+        self.config_store = config_store or ConfigStore(
+            paths=self.paths,
+            path_guard=self.path_guard,
+        )
+        self.process_manager = process_manager or self.host.process_manager()
         self.doctor = doctor or Doctor(
             paths=self.paths,
             config_store=self.config_store,
             process_manager=self.process_manager,
+            path_guard=self.path_guard,
         )
         self.repair = repair or RepairService(
             paths=self.paths,
@@ -53,6 +69,7 @@ class BootstrapService:
             doctor=self.doctor,
             process_manager=self.process_manager,
             auto_install=auto_install,
+            path_guard=self.path_guard,
         )
 
     def status(self, *, project_directory: Path | None = None) -> BootstrapStatus:
@@ -84,6 +101,7 @@ class BootstrapService:
         local_codex_repository: Path | None = None,
         node_executable: str | None = None,
     ) -> BootstrapStatus:
+        self.host.assert_ready()
         config = self.config_store.load().config
         if project_directory is not None:
             config.basic.project_directory = project_directory.expanduser().resolve()
@@ -117,6 +135,7 @@ class BootstrapService:
     ) -> BootstrapStatus:
         """Store OpenAI tunnel metadata and the runtime key in SecretStore."""
 
+        self.host.assert_ready()
         if not runtime_key or "\n" in runtime_key or "\r" in runtime_key:
             raise ValueError("runtime key must be provided through hidden input")
         config = self.config_store.load().config
@@ -135,6 +154,7 @@ class BootstrapService:
         return self.status(project_directory=config.basic.project_directory)
 
     def repair_and_status(self, *, project_directory: Path | None = None) -> BootstrapStatus:
+        self.host.assert_ready()
         before = self.doctor.run(DoctorOptions(project_directory=project_directory))
         repairs = self.repair.repair(before, project_directory=project_directory)
         after = self.status(project_directory=project_directory)
@@ -151,7 +171,10 @@ class BootstrapService:
 
         from .reconciliation import ReconciliationService
 
-        return ReconciliationService(paths=self.paths).plan(
+        return ReconciliationService(
+            paths=self.paths,
+            path_guard=self.path_guard,
+        ).plan(
             selected_authority=selected_authority,
             legacy_root=legacy_root,
         )
@@ -167,13 +190,20 @@ class BootstrapService:
 
         from .reconciliation import ReconciliationService
 
-        return ReconciliationService(paths=self.paths).apply(
+        self.host.assert_ready()
+        return ReconciliationService(paths=self.paths, path_guard=self.path_guard).apply(
             plan_id=plan_id,
             selected_authority=selected_authority,
             legacy_root=legacy_root,
         )
 
     def start(self, *, project_directory: Path | None = None) -> BootstrapStatus:
+        host_identity = self.host.ensure_identity()
+        if not host_identity.host_instance_id:
+            raise PhysicalPathVerificationError(
+                SUPERVISOR_HOST_IDENTITY_UNKNOWN,
+                "Supervisor Host authority identity is unavailable",
+            )
         result = self.repair_and_status(project_directory=project_directory)
         config = self.config_store.load().config
         if self.paths.root_report.split_brain:
@@ -221,6 +251,7 @@ class BootstrapService:
                 project_directory=project_directory or config.basic.project_directory,
                 executable=devspace_executable,
                 entrypoint=devspace_entrypoint,
+                path_guard=self.path_guard,
             )
             try:
                 component = self.process_manager.start(
@@ -259,13 +290,13 @@ class BootstrapService:
         if port is None or devspace_port is None:
             return result
         supervisor_log = self.paths.logs / "supervisor.log"
-        readiness_offset = _file_size(supervisor_log)
+        readiness_offset = _file_size(supervisor_log, path_guard=self.path_guard)
         spec = ManagedProcessSpec(
             name="supervisor",
             command=[
                 sys.executable,
                 "-m",
-                "codex_supervisor_bridge.mcp.server",
+                "codex_supervisor_bridge.bootstrap.host",
                 "--database",
                 str(config.advanced.sqlite_path or self.paths.database),
                 "--host",
@@ -283,10 +314,14 @@ class BootstrapService:
             env={
                 **os.environ,
                 "CODEX_SUPERVISOR_DATA_DIR": str(self.paths.filesystem_root),
+                SUPERVISOR_HOST_AUTHORITY_ENV: SUPERVISOR_HOST_AUTHORITY_VALUE,
+                SUPERVISOR_HOST_INSTANCE_ENV: host_identity.host_instance_id,
+                SUPERVISOR_HOST_IDENTITY_PATH_ENV: str(self.host.host_identity_path),
             },
             readiness_probe=lambda: _read_readiness_marker(
                 supervisor_log,
                 start_offset=readiness_offset,
+                path_guard=self.path_guard,
             )
             is not None,
         )
@@ -303,7 +338,7 @@ class BootstrapService:
                 )
             )
             return result
-        readiness = _read_readiness_marker(state.log_path)
+        readiness = _read_readiness_marker(state.log_path, path_guard=self.path_guard)
         start_status = (
             HealthStatus.READY
             if state.status == "RUNNING" and (readiness is None or readiness == HealthStatus.READY)
@@ -408,44 +443,80 @@ class BootstrapService:
         remote = config.advanced.remote_access
         if remote is not None and remote.provider == RemoteAccessMode.OPENAI_SECURE_MCP_TUNNEL:
             executable = config.advanced.executable_paths.get("tunnel_client")
+            remote_path_error: PhysicalPathVerificationError | None = None
             if executable is None:
                 managed = self.paths.components / "openai-tunnel-client" / "current.json"
                 try:
                     import json
 
+                    self.path_guard.verify_subpath(
+                        managed,
+                        managed.parent,
+                        role="components",
+                    )
                     pointer = json.loads(managed.read_text(encoding="utf-8"))
-                    executable = str(Path(pointer["path"]) / "tunnel-client.exe")
+                    managed_root = self.paths.canonicalize_path(str(pointer["path"]))
+                    self.path_guard.verify_subpath(
+                        managed_root,
+                        self.paths.components,
+                        role="components",
+                        require_directory=True,
+                    )
+                    executable_path = managed_root / "tunnel-client.exe"
+                    self.path_guard.verify_subpath(
+                        executable_path,
+                        managed_root,
+                        role="components",
+                    )
+                    executable = str(executable_path)
+                except PhysicalPathVerificationError as exc:
+                    remote_path_error = exc
                 except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
                     executable = "tunnel-client"
-            controller = OpenAISecureMcpTunnelController(
-                process_manager=self.process_manager,
-                secret_store=self._default_secret_store(),
-                executable=executable,
-                runtime_dir=self.paths.runtime,
-            )
-            supervisor_state = self.process_manager.health("supervisor")
-            remote_health = controller.start(
-                remote,
-                supervisor_ready=supervisor_state.status == "RUNNING" and readiness == HealthStatus.READY,
-            )
-            result.repairs.append(
-                RepairAction(
-                    action="start_remote_access",
-                    status=(
-                        HealthStatus.READY
-                        if remote_health.ready and remote_health.healthy
-                        else HealthStatus.DEGRADED
-                    ),
-                    message=(
-                        "ChatGPT connection is ready."
-                        if remote_health.ready and remote_health.healthy
-                        else "ChatGPT connection is not ready."
-                    ),
-                    requires_user_action=remote_health.state
-                    in {"TUNNEL_NOT_CONFIGURED", "TUNNEL_RUNTIME_KEY_MISSING"},
-                    advanced=remote_health.model_dump(mode="json"),
+            if remote_path_error is not None:
+                result.repairs.append(
+                    RepairAction(
+                        action="start_remote_access",
+                        status=HealthStatus.DEGRADED,
+                        message="ChatGPT connection needs a verified Supervisor component path.",
+                        requires_user_action=True,
+                        advanced={
+                            "failure_code": remote_path_error.code,
+                            "technical_detail": str(remote_path_error),
+                        },
+                    )
                 )
-            )
+            else:
+                controller = OpenAISecureMcpTunnelController(
+                    process_manager=self.process_manager,
+                    secret_store=self._default_secret_store(),
+                    executable=executable,
+                    runtime_dir=self.paths.runtime,
+                    path_guard=self.path_guard,
+                )
+                supervisor_state = self.process_manager.health("supervisor")
+                remote_health = controller.start(
+                    remote,
+                    supervisor_ready=supervisor_state.status == "RUNNING" and readiness == HealthStatus.READY,
+                )
+                result.repairs.append(
+                    RepairAction(
+                        action="start_remote_access",
+                        status=(
+                            HealthStatus.READY
+                            if remote_health.ready and remote_health.healthy
+                            else HealthStatus.DEGRADED
+                        ),
+                        message=(
+                            "ChatGPT connection is ready."
+                            if remote_health.ready and remote_health.healthy
+                            else "ChatGPT connection is not ready."
+                        ),
+                        requires_user_action=remote_health.state
+                        in {"TUNNEL_NOT_CONFIGURED", "TUNNEL_RUNTIME_KEY_MISSING"},
+                        advanced=remote_health.model_dump(mode="json"),
+                    )
+                )
         final = self.status(project_directory=project_directory)
         if readiness is not None and readiness != HealthStatus.READY:
             final.status = readiness
@@ -455,7 +526,10 @@ class BootstrapService:
 
     def _default_secret_store(self) -> SecretStore:
         if sys.platform == "win32":
-            return WindowsDpapiSecretStore(self.paths.config / "secrets")
+            return WindowsDpapiSecretStore(
+                self.paths.config / "secrets",
+                path_guard=self.path_guard,
+            )
         return MemorySecretStore()
 
 
@@ -511,14 +585,19 @@ def _read_readiness_marker(
     log_path: Path | None,
     *,
     start_offset: int = 0,
+    path_guard: PhysicalPathGuard | None = None,
 ) -> HealthStatus | None:
-    if log_path is None or not log_path.exists():
+    if log_path is None:
         return None
     try:
+        guard = path_guard or PhysicalPathGuard()
+        evidence = guard.verify_root(log_path, role="runtime")
+        if not evidence.exists:
+            return None
         with log_path.open("rb") as handle:
             handle.seek(start_offset)
             text = handle.read().decode("utf-8", errors="replace")
-    except OSError:
+    except (OSError, PhysicalPathVerificationError):
         return None
     for line in reversed(text.splitlines()):
         if "SUPERVISOR_READY" not in line:
@@ -537,8 +616,12 @@ def _readiness_marker_present(log_path: Path | None) -> bool:
     return _read_readiness_marker(log_path) is not None
 
 
-def _file_size(path: Path) -> int:
+def _file_size(path: Path, *, path_guard: PhysicalPathGuard | None = None) -> int:
     try:
+        guard = path_guard or PhysicalPathGuard()
+        evidence = guard.verify_root(path, role="runtime")
+        if not evidence.exists:
+            return 0
         return path.stat().st_size
-    except OSError:
+    except (OSError, PhysicalPathVerificationError):
         return 0

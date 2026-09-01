@@ -18,6 +18,7 @@ from codex_supervisor_bridge.bootstrap.lcb_hardening import (
     has_lcb_runtime_hardening,
     has_lcb_runtime_source_hardening,
     require_lcb_runtime_hardening,
+    require_lcb_runtime_hardening_from_entrypoint,
 )
 from tests.lcb_fixtures import (
     UPSTREAM_LCB_APP_SERVER_SOURCE,
@@ -113,6 +114,33 @@ def test_built_hardening_is_required_and_bound_to_dist_files(tmp_path: Path) -> 
         encoding="utf-8",
     )
     assert has_lcb_runtime_hardening(repository) is False
+
+
+def test_hardening_authority_resolves_root_from_actual_launch_entrypoint(tmp_path: Path) -> None:
+    repository = write_upstream_lcb_repository(tmp_path / "Local-Codex-Bridge")
+    apply_lcb_runtime_hardening(repository)
+    write_fake_lcb_build(repository)
+    finalize_lcb_runtime_hardening(repository)
+
+    entrypoint = repository / "dist" / "src" / "index.js"
+
+    assert require_lcb_runtime_hardening_from_entrypoint(entrypoint) == repository
+
+
+def test_hardening_refuses_to_mutate_a_redirected_component_root(tmp_path: Path) -> None:
+    repository = write_upstream_lcb_repository(tmp_path / "Local-Codex-Bridge")
+    app_server = repository / "src" / "app-server.ts"
+    before = app_server.read_bytes()
+
+    class _RejectingGuard:
+        def verify_root(self, *_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("LCB_PHYSICAL_ROOT_MISMATCH")
+
+    with pytest.raises(RuntimeError, match="LCB_PHYSICAL_ROOT_MISMATCH"):
+        apply_lcb_runtime_hardening(repository, path_guard=_RejectingGuard())  # type: ignore[arg-type]
+
+    assert app_server.read_bytes() == before
+    assert not (repository / LCB_RUNTIME_MARKER).exists()
 
 
 def test_ownership_token_reaches_lcb_but_is_removed_from_codex_child(tmp_path: Path) -> None:

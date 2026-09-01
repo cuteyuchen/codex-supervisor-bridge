@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import shutil
 import subprocess
 import tempfile
@@ -13,6 +14,8 @@ from urllib.parse import urlparse
 from pydantic import BaseModel
 
 from .models import HealthStatus
+from .paths import resolve_windows_local_app_data
+from .physical import PhysicalPathGuard, PhysicalPathVerificationError
 
 ProcessRunner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -37,6 +40,20 @@ class CodexAuthMode(str, Enum):
     LOCAL_NO_AUTH = "local_no_auth"
     AWS_OR_CLOUD_PROVIDER = "aws_or_cloud_provider"
     UNKNOWN = "unknown"
+
+
+class CodexExecutableSource(str, Enum):
+    CONFIGURED = "CONFIGURED"
+    DESKTOP_BUNDLED = "DESKTOP_BUNDLED"
+    PATH = "PATH"
+    UNKNOWN = "UNKNOWN"
+
+
+class CodexExecutableCandidate(BaseModel):
+    path: str | None = None
+    source: CodexExecutableSource = CodexExecutableSource.UNKNOWN
+    exists: bool = False
+    technical_detail: str | None = None
 
 
 class CodexConfigInspection(BaseModel):
@@ -72,6 +89,7 @@ class CodexRuntimeProbeResult(BaseModel):
 class CodexReadiness(BaseModel):
     status: HealthStatus
     executable: str | None = None
+    executable_source: CodexExecutableSource = CodexExecutableSource.UNKNOWN
     version: str | None = None
     process_launchable: bool = False
     runtime_ready: bool = False
@@ -254,6 +272,136 @@ class CodexRuntimeSmokeProbe:
             )
 
 
+class CodexExecutableResolver:
+    """Resolve one Codex binary without touching Desktop state or credentials."""
+
+    def __init__(
+        self,
+        *,
+        finder: Callable[[str], str | None] = shutil.which,
+        environ: Mapping[str, str] | None = None,
+        path_guard: PhysicalPathGuard | None = None,
+    ) -> None:
+        self.finder = finder
+        self._environ_provided = environ is not None
+        self.environ = environ if environ is not None else os.environ
+        self.path_guard = path_guard
+
+    def resolve(self, configured: str | Path | None = None) -> CodexExecutableCandidate:
+        explicit = str(configured).strip() if configured is not None else ""
+        if not explicit:
+            explicit = self.environ.get("CODEX_EXE", "").strip()
+        if explicit:
+            resolved = self._resolve_value(explicit)
+            if resolved is not None:
+                return self._candidate(
+                    resolved,
+                    CodexExecutableSource.CONFIGURED,
+                )
+            return CodexExecutableCandidate(
+                path=explicit,
+                source=CodexExecutableSource.CONFIGURED,
+                exists=False,
+                technical_detail="configured Codex executable was not found",
+            )
+
+        bundled = self._desktop_bundled()
+        if bundled is not None:
+            return self._candidate(
+                str(bundled),
+                CodexExecutableSource.DESKTOP_BUNDLED,
+            )
+        path_value = self.finder("codex")
+        if path_value:
+            return self._candidate(
+                path_value,
+                CodexExecutableSource.PATH,
+            )
+        return CodexExecutableCandidate(
+            source=CodexExecutableSource.UNKNOWN,
+            technical_detail="Codex executable was not found in configured, Desktop, or PATH locations",
+        )
+
+    def _resolve_value(self, value: str) -> str | None:
+        candidate = Path(value).expanduser()
+        if candidate.is_file():
+            return str(candidate)
+        return self.finder(value)
+
+    def _candidate(
+        self,
+        value: str,
+        source: CodexExecutableSource,
+    ) -> CodexExecutableCandidate:
+        path = Path(value).expanduser()
+        exists = path.is_file()
+        display_path = str(path) if exists else value
+        if self.path_guard is not None:
+            try:
+                self.path_guard.verify_root(path, role="process")
+            except PhysicalPathVerificationError as exc:
+                return CodexExecutableCandidate(
+                    path=display_path,
+                    source=source,
+                    exists=False,
+                    technical_detail=(
+                        "Codex executable physical path could not be verified: "
+                        f"{exc.code}"
+                    ),
+                )
+        if not exists:
+            return CodexExecutableCandidate(
+                path=display_path,
+                source=source,
+                exists=False,
+                technical_detail="Codex executable path does not exist",
+            )
+        return CodexExecutableCandidate(
+            path=display_path,
+            source=source,
+            exists=True,
+        )
+
+    def _desktop_bundled(self) -> Path | None:
+        roots: list[Path] = []
+        if platform.system() == "Windows":
+            has_explicit_windows_root = bool(
+                self.environ.get("LOCALAPPDATA", "").strip()
+                or self.environ.get("USERPROFILE", "").strip()
+            )
+            if not self._environ_provided or has_explicit_windows_root:
+                local_app_data, _ = resolve_windows_local_app_data(
+                    environ=self.environ,
+                    known_folder_resolver=lambda: None,
+                )
+                roots.append(local_app_data / "OpenAI" / "Codex" / "bin")
+                roots.append(local_app_data / "Programs" / "Codex")
+        else:
+            local_app_data = self.environ.get("LOCALAPPDATA", "").strip()
+            if local_app_data:
+                roots.append(Path(local_app_data) / "OpenAI" / "Codex" / "bin")
+                roots.append(Path(local_app_data) / "Programs" / "Codex")
+        program_files = self.environ.get("PROGRAMFILES", "").strip()
+        if program_files:
+            roots.append(Path(program_files) / "OpenAI" / "Codex")
+        candidates: list[Path] = []
+        for root in roots:
+            if not root.is_dir():
+                continue
+            try:
+                candidates.extend(root.glob("codex.exe"))
+                candidates.extend(root.glob("*/codex.exe"))
+                candidates.extend(root.glob("*/bin/codex.exe"))
+            except OSError:
+                continue
+        files = sorted(
+            (path for path in candidates if path.is_file()),
+            key=lambda path: str(path).casefold(),
+            reverse=True,
+        )
+        return files[0] if files else None
+
+
 class CodexReadinessDetector:
     """Probe the CLI in layered, bounded, non-mutating ways before selecting Codex."""
 
@@ -265,12 +413,19 @@ class CodexReadinessDetector:
         inspector: CodexConfigInspector | None = None,
         smoke_probe: CodexRuntimeSmokeProbe | None = None,
         environ: Mapping[str, str] | None = None,
+        resolver: CodexExecutableResolver | None = None,
+        path_guard: PhysicalPathGuard | None = None,
     ) -> None:
         self.finder = finder
         self.runner = runner or subprocess.run
         self.environ: Mapping[str, str] = environ if environ is not None else os.environ
         self.inspector = inspector or CodexConfigInspector(environ=self.environ)
         self.smoke_probe = smoke_probe or CodexRuntimeSmokeProbe(runner=self.runner)
+        self.resolver = resolver or CodexExecutableResolver(
+            finder=self.finder,
+            environ=self.environ,
+            path_guard=path_guard,
+        )
 
     def probe(
         self,
@@ -279,12 +434,20 @@ class CodexReadinessDetector:
         workspace: Path | None = None,
         config_path: str | Path | None = None,
     ) -> CodexReadiness:
-        resolved = executable if Path(executable).is_file() else self.finder(executable)
+        requested = None if executable in {"", "codex"} else executable
+        candidate = self.resolver.resolve(requested)
+        resolved = candidate.path if candidate.exists else None
         if resolved is None:
             return CodexReadiness(
                 status=HealthStatus.UNAVAILABLE,
+                executable=candidate.path,
+                executable_source=candidate.source,
                 user_message="Codex 需要安装或完成一次凭据设置。",
-                technical_detail="executable not found",
+                technical_detail=(
+                    "executable not found"
+                    if candidate.source == CodexExecutableSource.UNKNOWN
+                    else candidate.technical_detail or "executable not found"
+                ),
                 repairable=True,
             )
 
@@ -298,6 +461,7 @@ class CodexReadinessDetector:
             return CodexReadiness(
                 status=HealthStatus.DEGRADED,
                 executable=resolved,
+                executable_source=candidate.source,
                 process_launchable=False,
                 auth_mode=inspection.auth_mode,
                 config=inspection,
@@ -313,6 +477,7 @@ class CodexReadinessDetector:
             return CodexReadiness(
                 status=HealthStatus.DEGRADED,
                 executable=resolved,
+                executable_source=candidate.source,
                 version=_first_line(version.stdout or version.stderr),
                 process_launchable=True,
                 workspace_ready=workspace_ready,
@@ -326,6 +491,7 @@ class CodexReadinessDetector:
             return CodexReadiness(
                 status=HealthStatus.DEGRADED,
                 executable=resolved,
+                executable_source=candidate.source,
                 version=_first_line(version.stdout or version.stderr),
                 process_launchable=True,
                 workspace_ready=workspace_ready,
@@ -344,6 +510,7 @@ class CodexReadinessDetector:
             return CodexReadiness(
                 status=HealthStatus.DEGRADED,
                 executable=resolved,
+                executable_source=candidate.source,
                 version=_first_line(version.stdout or version.stderr),
                 process_launchable=True,
                 runtime_ready=smoke.ok,
@@ -358,6 +525,7 @@ class CodexReadinessDetector:
         return CodexReadiness(
             status=smoke.status,
             executable=resolved,
+            executable_source=candidate.source,
             version=_first_line(version.stdout or version.stderr),
             process_launchable=True,
             runtime_ready=smoke.ok,

@@ -25,13 +25,16 @@ from .devspace import (
     DEVSPACE_TESTED_VERSIONS,
     DevSpaceVersionCompatibility,
 )
+from .host import SupervisorHostEnvironmentGuard
 from .lcb_hardening import (
     LCB_HARDENING_REVISION,
     LCB_RUNTIME_CONTRACT,
-    has_lcb_runtime_hardening,
+    LcbHardeningError,
+    require_lcb_runtime_hardening_from_entrypoint,
 )
 from .models import ComponentHealth, DoctorStatus, HealthStatus
 from .paths import AppDataPaths
+from .physical import PhysicalPathGuard, PhysicalPathVerificationError
 from .ports import PortAllocator
 from .process import ProcessManager
 from .remote import (
@@ -71,6 +74,7 @@ class Doctor:
         port_allocator: PortAllocator | None = None,
         process_manager: ProcessManager | None = None,
         codex_process_inspector: ProcessInspector | None = None,
+        path_guard: PhysicalPathGuard | None = None,
     ) -> None:
         self.paths = paths or AppDataPaths.from_environment()
         self.config_store = config_store or ConfigStore(paths=self.paths)
@@ -80,6 +84,7 @@ class Doctor:
         self._ports = port_allocator or PortAllocator()
         self._process_manager = process_manager
         self._codex_process_inspector = codex_process_inspector or ProcessInspector()
+        self._path_guard = path_guard or PhysicalPathGuard()
 
     def run(self, options: DoctorOptions | None = None) -> DoctorStatus:
         options = options or DoctorOptions()
@@ -183,6 +188,11 @@ class Doctor:
         paths = (self.paths.data, self.paths.logs, self.paths.runtime, self.paths.config, self.paths.cache)
         missing = [str(path) for path in paths if not path.exists()]
         root_report = self.paths.root_report
+        host_evidence = SupervisorHostEnvironmentGuard(
+            self.paths,
+            physical_guard=self._path_guard,
+            process_inspector=self._codex_process_inspector,
+        ).inspect()
         if root_report.split_brain:
             status = HealthStatus.UNAVAILABLE
             message = "检测到两个本地状态，需要安全整理。"
@@ -208,6 +218,11 @@ class Doctor:
             message = "Application data will be prepared automatically."
             repairable = True
             recommended_action = "repair_data_directory"
+        if not host_evidence.physical_root_verified:
+            status = HealthStatus.UNAVAILABLE
+            message = "Application data is running in an unsafe physical path view."
+            repairable = False
+            recommended_action = "start_standalone_supervisor_host"
         advanced = {
             "paths": {
                 "data": str(self.paths.data),
@@ -218,6 +233,7 @@ class Doctor:
                 "missing": missing,
             },
             "app_data_roots": root_report.as_dict(),
+            "standalone_host": host_evidence.as_dict(),
         }
         return ComponentHealth(
             capability="Application data",
@@ -598,7 +614,31 @@ class Doctor:
                     ),
                 },
             )
-        if not has_lcb_runtime_hardening(resolved):
+        try:
+            require_lcb_runtime_hardening_from_entrypoint(
+                entrypoint,
+                path_guard=self._path_guard,
+            )
+        except PhysicalPathVerificationError as exc:
+            return ComponentHealth(
+                capability="Codex control",
+                status=HealthStatus.DEGRADED,
+                repairable=False,
+                user_message="Codex control needs a physical runtime path repair.",
+                recommended_action="start_standalone_supervisor_host",
+                advanced={
+                    "provider": "local-codex-bridge",
+                    "repository": str(resolved),
+                    "entrypoint": str(entrypoint),
+                    "node_version": node_version,
+                    "supports_isolated_runtime": False,
+                    "runtime_transport": "private_stdio",
+                    "desktop_attach_fallback": False,
+                    "failure_code": exc.code,
+                    "technical_detail": str(exc),
+                },
+            )
+        except (LcbHardeningError, OSError, ValueError):
             return ComponentHealth(
                 capability="Codex control",
                 status=HealthStatus.DEGRADED,
@@ -640,18 +680,51 @@ class Doctor:
 
     def _codex_runtime_isolation(self) -> ComponentHealth:
         runtime_root = self.paths.runtime / "codex"
-        metadata_paths = sorted(
-            runtime_root.glob("*/runtime.json") if runtime_root.is_dir() else (),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
+        try:
+            self._path_guard.verify_root(
+                runtime_root,
+                role="runtime",
+                require_directory=True,
+            )
+            metadata_paths = []
+            if runtime_root.is_dir():
+                for candidate in runtime_root.glob("*/runtime.json"):
+                    self._path_guard.verify_subpath(
+                        candidate,
+                        runtime_root,
+                        role="runtime",
+                    )
+                    metadata_paths.append(candidate)
+            metadata_paths.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        except (OSError, PhysicalPathVerificationError) as exc:
+            return ComponentHealth(
+                capability="Codex runtime isolation",
+                status=HealthStatus.DEGRADED,
+                repairable=False,
+                user_message="Codex needs runtime path verification.",
+                recommended_action="start_standalone_supervisor_host",
+                advanced={
+                    "ownership": "UNKNOWN",
+                    "runtime_instance": None,
+                    "runtime_epoch": 0,
+                    "desktop_runtime_detected": False,
+                    "isolation_verified": False,
+                    "failure_code": (
+                        exc.code
+                        if isinstance(exc, PhysicalPathVerificationError)
+                        else "PHYSICAL_PATH_UNVERIFIED"
+                    ),
+                    "technical_detail": "runtime namespace could not be physically verified",
+                },
+            )
         metadata: CodexRuntimeMetadata | None = None
         if metadata_paths:
             try:
+                self._path_guard.verify_root(metadata_paths[0], role="runtime")
                 metadata = CodexRuntimeMetadata.model_validate(
                     json.loads(metadata_paths[0].read_text(encoding="utf-8"))
                 )
-            except (OSError, ValueError, TypeError):
+            except (OSError, ValueError, TypeError, PhysicalPathVerificationError):
                 metadata = None
         if metadata is None:
             return ComponentHealth(
@@ -678,10 +751,31 @@ class Doctor:
         ):
             live_failure = "runtime metadata is outside the canonical runtime namespace"
         else:
-            live_failure = runtime_process_chain_failure(
-                metadata,
-                self._codex_process_inspector.snapshot(),
-            )
+            try:
+                self._path_guard.verify_subpath(
+                    runtime_directory,
+                    runtime_root,
+                    role="runtime",
+                    require_directory=True,
+                )
+                self._path_guard.verify_subpath(
+                    Path(metadata.codex_home),
+                    runtime_directory,
+                    role="codex_home",
+                    require_directory=True,
+                )
+                if metadata.codex_executable:
+                    self._path_guard.verify_root(
+                        Path(metadata.codex_executable),
+                        role="process",
+                    )
+            except PhysicalPathVerificationError as exc:
+                live_failure = f"runtime physical path verification failed: {exc.code}"
+            else:
+                live_failure = runtime_process_chain_failure(
+                    metadata,
+                    self._codex_process_inspector.snapshot(),
+                )
         advanced["live_identity_verified"] = live_failure is None
         if live_failure is not None:
             advanced["technical_detail"] = live_failure
@@ -705,6 +799,7 @@ class Doctor:
         detector = CodexReadinessDetector(
             finder=self._find,
             runner=lambda command, **kwargs: self._run(command, **kwargs),
+            path_guard=self._path_guard,
         )
         config_path = config.advanced.backend_detail.get("codex_config_path")
         readiness = detector.probe(
@@ -787,16 +882,33 @@ class Doctor:
 
         pointer = self.paths.components / name / "current.json"
         try:
+            self._path_guard.verify_subpath(
+                pointer,
+                pointer.parent,
+                role="components",
+            )
             payload = json.loads(pointer.read_text(encoding="utf-8"))
             path = self.paths.canonicalize_path(str(payload["path"]))
-        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-            return None
-        if not path.is_dir():
+            self._path_guard.verify_subpath(
+                path,
+                self.paths.components,
+                role="components",
+                require_directory=True,
+            )
+        except (
+            OSError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+            PhysicalPathVerificationError,
+        ):
             return None
         marker = path / ".codex-supervisor-installed.json"
         try:
+            self._path_guard.verify_subpath(marker, path, role="components")
             marker_payload = json.loads(marker.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, ValueError):
+        except (OSError, json.JSONDecodeError, ValueError, PhysicalPathVerificationError):
             return None
         if marker_payload.get("name") != name:
             return None

@@ -30,9 +30,14 @@ from codex_supervisor_bridge.bootstrap.codex_isolation import (
     SupervisorCodexRuntimeManager,
     runtime_process_chain_failure,
 )
+from codex_supervisor_bridge.bootstrap.codex_runtime import CodexExecutableResolver
 from codex_supervisor_bridge.bootstrap.lcb_hardening import (
     LCB_HARDENING_REVISION,
     LCB_RUNTIME_CONTRACT,
+)
+from codex_supervisor_bridge.bootstrap.physical import (
+    PhysicalPathGuard,
+    PhysicalPathVerificationError,
 )
 from codex_supervisor_bridge.bootstrap.process import (
     CodexProcessOwnership,
@@ -88,6 +93,7 @@ def _verified_metadata(
     app_server_pid: int = 102,
 ) -> CodexRuntimeMetadata:
     runtime = root / "runtime" / "codex" / instance_id
+    codex_executable = str(root / "codex.exe")
     metadata = CodexRuntimeMetadata(
         instance_id=instance_id,
         runtime_epoch=epoch,
@@ -98,14 +104,21 @@ def _verified_metadata(
         status="READY",
         runtime_directory=str(runtime),
         codex_home=str(runtime / "home"),
+        codex_executable=codex_executable,
         started_at="2026-08-30T00:00:00+00:00",
         supervisor_parent_pid=99,
+        supervisor_host_instance_id="host-fixture",
+        supervisor_parent_process=_observation(
+            99,
+            parent_pid=1,
+            executable="python.exe",
+        ),
         proxy_process=_observation(100, parent_pid=99, executable="python.exe"),
         lcb_process=_observation(101, parent_pid=100, executable="node.exe"),
         app_server_process=_observation(
             app_server_pid,
             parent_pid=101,
-            executable="codex.exe",
+            executable=codex_executable,
             app_server=True,
             parent_executable="node.exe",
         ),
@@ -340,6 +353,46 @@ url = "http://127.0.0.1:3000/mcp?token=secret-mcp-value"
     assert "secret-mcp-value" not in "\n".join(parsed_payloads)
 
 
+def test_runtime_manager_resolves_codex_without_requiring_code_exe_environment(
+    tmp_path: Path,
+) -> None:
+    codex_executable = tmp_path / "bin" / "codex.exe"
+    codex_executable.parent.mkdir()
+    codex_executable.write_bytes(b"fake codex executable")
+    source_home = tmp_path / "user-codex"
+    source_home.mkdir()
+    resolver = CodexExecutableResolver(
+        finder=lambda _name: str(codex_executable),
+        environ={},
+    )
+    manager = SupervisorCodexRuntimeManager(
+        tmp_path / "bridge",
+        executable_resolver=resolver,
+    )
+
+    metadata = manager.prepare({"CODEX_HOME": str(source_home)})
+
+    assert metadata.codex_executable == str(codex_executable)
+    assert metadata.codex_home.endswith("\\home") or metadata.codex_home.endswith("/home")
+
+
+def test_runtime_manager_fails_before_creating_namespace_when_codex_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    resolver = CodexExecutableResolver(finder=lambda _name: None, environ={})
+    bridge_root = tmp_path / "bridge"
+    manager = SupervisorCodexRuntimeManager(
+        bridge_root,
+        executable_resolver=resolver,
+    )
+
+    with pytest.raises(LcbRuntimeIsolationUnsupportedError, match="Codex executable"):
+        manager.prepare({"CODEX_HOME": str(tmp_path / "user-codex")})
+
+    assert manager.metadata is None
+    assert not bridge_root.exists()
+
+
 def test_runtime_epoch_increments_and_old_namespace_is_not_reused(tmp_path: Path) -> None:
     source_home = tmp_path / "empty-home"
     source_home.mkdir()
@@ -379,6 +432,34 @@ def test_runtime_metadata_namespace_cannot_pivot_after_prepare(tmp_path: Path) -
     assert refreshed.failure_code == "CODEX_RUNTIME_OWNERSHIP_UNKNOWN"
     assert refreshed.isolation_verified is False
     assert manager.metadata_path == original_path
+
+
+def test_runtime_refresh_fails_closed_before_reading_redirected_metadata(
+    tmp_path: Path,
+) -> None:
+    source_home = tmp_path / "empty-home"
+    source_home.mkdir()
+    manager = SupervisorCodexRuntimeManager(tmp_path / "bridge")
+    manager.prepare({"CODEX_HOME": str(source_home)})
+    metadata_path = manager.metadata_path
+    before = metadata_path.read_bytes()
+
+    class _RejectMetadataGuard(PhysicalPathGuard):
+        def verify_root(self, path, **kwargs):  # type: ignore[no-untyped-def]
+            if Path(path) == metadata_path:
+                raise PhysicalPathVerificationError(
+                    "SUPERVISOR_RUNTIME_ROOT_MISMATCH",
+                    "metadata path was redirected",
+                )
+            return super().verify_root(path, **kwargs)
+
+    manager.path_guard = _RejectMetadataGuard()
+
+    refreshed = manager.refresh()
+
+    assert refreshed.failure_code == "CODEX_RUNTIME_OWNERSHIP_UNKNOWN"
+    assert refreshed.isolation_verified is False
+    assert metadata_path.read_bytes() == before
 
 
 def test_unsafe_provider_overlay_failure_remains_isolation_unsupported(tmp_path: Path) -> None:
@@ -507,6 +588,21 @@ class _DummyProcess:
         return self.returncode or 0
 
 
+def _process_manager_identity(pid: int) -> dict[str, object]:
+    return {
+        "executable": "fake-supervisor-process.exe",
+        "started_at": pid + 100000,
+        "parent_pid": 40000,
+        "command_fingerprint": f"fake-command-{pid}",
+        "parent_process_identity": {
+            "executable": "fake-supervisor-parent.exe",
+            "started_at": 1,
+            "parent_pid": 4,
+            "command_fingerprint": "fake-parent-command",
+        },
+    }
+
+
 class _ProxyChild:
     def __init__(self, pid: int) -> None:
         self.pid = pid
@@ -535,6 +631,8 @@ def _run_proxy_startup_timeout(
     token = "owned-token"
     proxy_pid = os.getpid()
     child_pid = proxy_pid + 1000
+    codex_executable = str(tmp_path / "codex.exe")
+    Path(codex_executable).write_bytes(b"fake codex executable")
     proxy = _observation(
         proxy_pid,
         parent_pid=99,
@@ -558,8 +656,15 @@ def _run_proxy_startup_timeout(
         ownership_token_hash=hashlib.sha256(token.encode("utf-8")).hexdigest(),
         runtime_directory=str(tmp_path / "runtime" / "csb-codex-proxy-timeout"),
         codex_home=str(tmp_path / "runtime" / "csb-codex-proxy-timeout" / "home"),
+        codex_executable=codex_executable,
         started_at="2026-08-30T00:00:00+00:00",
         supervisor_parent_pid=99,
+        supervisor_host_instance_id="host-fixture",
+        supervisor_parent_process=_observation(
+            99,
+            parent_pid=1,
+            executable="python.exe",
+        ),
     )
     metadata_path = tmp_path / "runtime.json"
     metadata_path.write_text(
@@ -590,6 +695,11 @@ def _run_proxy_startup_timeout(
     monkeypatch.setenv(lcb_runtime_proxy.SUPERVISOR_RUNTIME_ENV, metadata.instance_id)
     monkeypatch.setenv(lcb_runtime_proxy.SUPERVISOR_EPOCH_ENV, str(metadata.runtime_epoch))
     monkeypatch.setenv(lcb_runtime_proxy.SUPERVISOR_TOKEN_ENV, token)
+    monkeypatch.setenv(
+        lcb_runtime_proxy.SUPERVISOR_HOST_INSTANCE_ENV,
+        metadata.supervisor_host_instance_id or "",
+    )
+    monkeypatch.setenv("CODEX_EXE", metadata.codex_executable or "")
 
     result = lcb_runtime_proxy.run(metadata_path, ["node", "bridge.js"])
     stored = CodexRuntimeMetadata.model_validate_json(
@@ -689,13 +799,19 @@ def test_non_supervisor_process_cannot_stop_or_restart(
 
 
 def test_supervisor_owned_process_may_stop(tmp_path: Path) -> None:
-    manager = ProcessManager(tmp_path / "runtime", tmp_path / "logs")
+    manager = ProcessManager(
+        tmp_path / "runtime",
+        tmp_path / "logs",
+        identity_reader=_process_manager_identity,
+    )
     process = _DummyProcess(601)
     manager._processes["codex"] = ProcessState(
         name="codex",
         status="RUNNING",
         pid=process.pid,
         ownership=CodexProcessOwnership.SUPERVISOR_MANAGED,
+        process_identity=_process_manager_identity(process.pid),
+        identity_status="VERIFIED",
         _process=process,
     )
 
@@ -1006,6 +1122,7 @@ def test_process_identity_requires_creation_command_and_parent_identity(tmp_path
     class _ChangedCommandInspector:
         def snapshot(self) -> list[ProcessObservation]:
             return [
+                metadata.supervisor_parent_process,  # type: ignore[list-item]
                 metadata.proxy_process.model_copy(  # type: ignore[union-attr]
                     update={"command_line_fingerprint": "different-command"}
                 ),
@@ -1039,6 +1156,41 @@ def test_process_identity_requires_creation_command_and_parent_identity(tmp_path
         )
         == "Codex app-server process is not running"
     )
+
+
+def test_destructive_lifecycle_refuses_reused_app_server_pid(tmp_path: Path) -> None:
+    metadata = _verified_metadata(tmp_path)
+    runtime_directory = Path(metadata.runtime_directory)
+    runtime_directory.mkdir(parents=True)
+    (runtime_directory / "runtime.json").write_text(
+        json.dumps(metadata.model_dump(mode="json")),
+        encoding="utf-8",
+    )
+
+    class _ReusedAppServerInspector:
+        def snapshot(self) -> list[ProcessObservation]:
+            assert metadata.supervisor_parent_process is not None
+            assert metadata.proxy_process is not None
+            assert metadata.lcb_process is not None
+            assert metadata.app_server_process is not None
+            return [
+                metadata.supervisor_parent_process,
+                metadata.proxy_process,
+                metadata.lcb_process,
+                metadata.app_server_process.model_copy(
+                    update={"creation_time": "reused-pid"}
+                ),
+            ]
+
+    manager = SupervisorCodexRuntimeManager(
+        tmp_path,
+        inspector=_ReusedAppServerInspector(),  # type: ignore[arg-type]
+    )
+    manager.metadata = metadata
+    manager._token = "owned-token"
+
+    with pytest.raises(RuntimeOwnershipError, match="process identity changed"):
+        manager.assert_destructive_lifecycle_allowed()
 
 
 def test_interrupt_unknown_outcome_opens_circuit_and_never_retries(tmp_path: Path) -> None:
@@ -1242,7 +1394,11 @@ def test_runtime_recovery_closes_circuit_only_after_verified_ready(tmp_path: Pat
 def test_desktop_and_supervisor_process_failures_are_bidirectionally_isolated(
     tmp_path: Path,
 ) -> None:
-    manager = ProcessManager(tmp_path / "runtime", tmp_path / "logs")
+    manager = ProcessManager(
+        tmp_path / "runtime",
+        tmp_path / "logs",
+        identity_reader=_process_manager_identity,
+    )
     desktop = _DummyProcess(801)
     supervisor = _DummyProcess(802)
     manager._processes["desktop"] = ProcessState(
@@ -1257,6 +1413,8 @@ def test_desktop_and_supervisor_process_failures_are_bidirectionally_isolated(
         status="RUNNING",
         pid=supervisor.pid,
         ownership=CodexProcessOwnership.SUPERVISOR_MANAGED,
+        process_identity=_process_manager_identity(supervisor.pid),
+        identity_status="VERIFIED",
         _process=supervisor,
     )
 
@@ -1279,6 +1437,7 @@ def test_lcb_restart_never_terminates_desktop_owned_process(tmp_path: Path) -> N
         tmp_path / "runtime",
         tmp_path / "logs",
         launcher=lambda *_args, **_kwargs: launched.append(_DummyProcess(903)) or launched[-1],
+        identity_reader=_process_manager_identity,
     )
     desktop = _DummyProcess(901)
     lcb = _DummyProcess(902)
@@ -1294,6 +1453,8 @@ def test_lcb_restart_never_terminates_desktop_owned_process(tmp_path: Path) -> N
         status="RUNNING",
         pid=lcb.pid,
         ownership=CodexProcessOwnership.SUPERVISOR_MANAGED,
+        process_identity=_process_manager_identity(lcb.pid),
+        identity_status="VERIFIED",
         _process=lcb,
     )
 

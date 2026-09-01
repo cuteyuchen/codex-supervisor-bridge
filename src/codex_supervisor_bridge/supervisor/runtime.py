@@ -16,7 +16,11 @@ from codex_supervisor_bridge.backends.models import (
 )
 from codex_supervisor_bridge.backends.workspace import WorkspaceBackend
 from codex_supervisor_bridge.bootstrap.codex_isolation import SupervisorCodexRuntimeManager
-from codex_supervisor_bridge.bootstrap.lcb_hardening import require_lcb_runtime_hardening
+from codex_supervisor_bridge.bootstrap.codex_runtime import CodexExecutableResolver
+from codex_supervisor_bridge.bootstrap.lcb_hardening import (
+    require_lcb_runtime_hardening_from_entrypoint,
+)
+from codex_supervisor_bridge.bootstrap.physical import PhysicalPathGuard
 from codex_supervisor_bridge.memory.service import MemoryService
 
 from .agent_execution import AgentExecutionCoordinator
@@ -80,6 +84,8 @@ class RuntimeComposition:
         env: dict[str, str] | None = None,
         app_data_root: str | Path | None = None,
         runtime_manager: SupervisorCodexRuntimeManager | None = None,
+        path_guard: PhysicalPathGuard | None = None,
+        host: object | None = None,
         workspace_factory: WorkspaceAdapterFactory | None = None,
         delivery_backend: str = "github",
     ) -> "RuntimeComposition":
@@ -97,7 +103,11 @@ class RuntimeComposition:
                 from codex_supervisor_bridge.bootstrap.paths import AppDataPaths
 
                 resolved_root = AppDataPaths.from_environment().filesystem_root
-            runtime_manager = SupervisorCodexRuntimeManager(resolved_root)
+            runtime_manager = SupervisorCodexRuntimeManager(
+                resolved_root,
+                path_guard=path_guard,
+                host=host,
+            )
 
         def backend_factory() -> LocalCodexBridgeAgentBackend:
             entrypoint = Path(str(launch_command[1])) if len(launch_command) > 1 else None
@@ -105,13 +115,26 @@ class RuntimeComposition:
                 raise RuntimeError(
                     "LCB_RUNTIME_ISOLATION_UNSUPPORTED: Local-Codex-Bridge entrypoint is missing"
                 )
-            require_lcb_runtime_hardening(entrypoint.parent.parent.parent)
-            runtime_manager.prepare(base_environment)
+            require_lcb_runtime_hardening_from_entrypoint(
+                entrypoint,
+                path_guard=path_guard or runtime_manager.path_guard,
+            )
+            runtime_environment = dict(base_environment)
+            codex_candidate = CodexExecutableResolver(
+                environ=runtime_environment,
+                path_guard=path_guard or runtime_manager.path_guard,
+            ).resolve()
+            if not codex_candidate.exists or not codex_candidate.path:
+                raise RuntimeError(
+                    "LCB_RUNTIME_ISOLATION_UNSUPPORTED: Codex executable could not be resolved safely"
+                )
+            runtime_environment["CODEX_EXE"] = codex_candidate.path
+            runtime_manager.prepare(runtime_environment)
             wrapped_command = runtime_manager.wrapped_lcb_command(launch_command)
             return LocalCodexBridgeAgentBackend.stdio(
                 wrapped_command[0],
                 args=list(wrapped_command[1:]),
-                env=runtime_manager.environment(base_environment),
+                env=runtime_manager.environment(runtime_environment),
             )
 
         session = AgentSessionManager(

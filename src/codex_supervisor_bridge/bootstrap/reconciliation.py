@@ -4,7 +4,6 @@ import base64
 import hashlib
 import json
 import os
-import shutil
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -25,7 +24,12 @@ from .paths import (
     AppDataRootState,
     inspect_app_data_roots,
 )
-from .process import _pid_exists
+from .physical import PhysicalPathGuard, PhysicalPathVerificationError
+from .process import (
+    _pid_exists,
+    _process_identity,
+    classify_persisted_process,
+)
 
 _PLAN_PREFIX = "rpl1_"
 _PLAN_VERSION = 1
@@ -133,11 +137,15 @@ class ReconciliationService:
         clock: Callable[[], datetime] | None = None,
         nonce_factory: Callable[[], str] | None = None,
         pid_exists: Callable[[int], bool] | None = None,
+        process_identity: Callable[[int], dict[str, Any] | None] | None = None,
+        path_guard: PhysicalPathGuard | None = None,
     ) -> None:
         self.paths = paths or AppDataPaths.from_environment()
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._nonce = nonce_factory or (lambda: uuid.uuid4().hex)
         self._pid_exists = pid_exists or _pid_exists
+        self._process_identity = process_identity or _process_identity
+        self.path_guard = path_guard or PhysicalPathGuard()
 
     def plan(
         self,
@@ -150,10 +158,23 @@ class ReconciliationService:
             raise ReconciliationError(
                 "selected authority must be 'canonical' or 'legacy'"
             )
-        other = self._select_other_root(legacy_root)
         canonical = self.paths.filesystem_root.absolute()
         canonical_display = self.paths.root.absolute()
+        self._verify_root_for_read(canonical, self.path_guard, role="app_data")
+        if legacy_root is None:
+            for discovered in self.paths.legacy_roots:
+                self._verify_root_for_read(
+                    discovered.absolute(),
+                    self.path_guard.for_legacy_migration(),
+                    role="legacy",
+                )
+        other = self._select_other_root(legacy_root)
         other = other.absolute()
+        self._verify_root_for_read(
+            other,
+            self.path_guard.for_legacy_migration(),
+            role="legacy",
+        )
         report = self._report(other)
         canonical_state = report.canonical_state
         other_state = self._state_for(report, other)
@@ -168,8 +189,21 @@ class ReconciliationService:
         )
         canonical_database = _database_snapshot(canonical)
         other_database = _database_snapshot(other)
-        canonical_runtime = _runtime_snapshot(canonical, self._pid_exists)
-        other_runtime = _runtime_snapshot(other, self._pid_exists)
+        canonical_runtime = _runtime_snapshot(
+            canonical,
+            self._pid_exists,
+            self._process_identity,
+            path_guard=self.path_guard,
+            role="runtime",
+        )
+        other_runtime = _runtime_snapshot(
+            other,
+            self._pid_exists,
+            self._process_identity,
+            path_guard=self.path_guard.for_legacy_migration(),
+            role="runtime",
+            allow_packaged_legacy=True,
+        )
 
         blocking: list[str] = []
         actions: list[str] = []
@@ -193,13 +227,15 @@ class ReconciliationService:
                 blocking.append("RECONCILIATION_BLOCKED_ACTIVE_STATE")
             if (
                 other_runtime["live_pids"]
+                or other_runtime["unknown_live_pids"]
                 or other_runtime["live_locks"]
                 or other_runtime["unknown_locks"]
             ):
                 blocking.append("BLOCKED_LIVE_LEGACY_RUNTIME")
             if (
-                canonical_runtime["live_locks"]
+                canonical_runtime["live_pids"]
                 or canonical_runtime["unknown_live_pids"]
+                or canonical_runtime["live_locks"]
                 or canonical_runtime["unknown_locks"]
             ):
                 blocking.append("BLOCKED_LIVE_CANONICAL_RUNTIME")
@@ -355,10 +391,19 @@ class ReconciliationService:
 
         backup_location: Path | None = None
         try:
+            legacy_guard = self.path_guard.for_legacy_migration()
+            self.path_guard.verify_root(self.paths.filesystem_root, role="app_data")
+            legacy_guard.verify_root(
+                Path(current.other_root),
+                role="legacy",
+                require_directory=True,
+                allow_packaged_legacy=True,
+            )
             backup_location = self._create_backup(
                 source=Path(current.other_root),
                 plan=current_plan,
                 canonical_root=self.paths.filesystem_root,
+                path_guard=self.path_guard,
             )
             # The source must still be exactly the one approved before the
             # backup is promoted to evidence. A changed source stays active.
@@ -380,6 +425,7 @@ class ReconciliationService:
                 canonical=Path(current.canonical_root),
                 plan=current_plan,
                 backup=backup_location,
+                path_guard=self.path_guard,
             )
             report = self._report(Path(current.other_root))
             if report.split_brain:
@@ -433,6 +479,33 @@ class ReconciliationService:
         )
 
     @staticmethod
+    def _verify_root_for_read(
+        root: Path,
+        guard: PhysicalPathGuard,
+        *,
+        role: str,
+    ) -> None:
+        """Prove a reconciliation root before any metadata or content read."""
+
+        try:
+            evidence = guard.verify_root(
+                root,
+                role=role,
+                require_directory=True,
+                allow_packaged_legacy=role == "legacy",
+            )
+            if evidence.exists:
+                guard.verify_tree(
+                    root,
+                    role=role,
+                    allow_packaged_legacy=role == "legacy",
+                )
+        except PhysicalPathVerificationError as exc:
+            raise ReconciliationError(
+                f"{role} root physical path verification failed: {exc}"
+            ) from exc
+
+    @staticmethod
     def _state_for(report: AppDataRootReport, root: Path) -> AppDataRootState:
         if _same_path(report.canonical_root, root):
             return report.canonical_state
@@ -447,17 +520,33 @@ class ReconciliationService:
         source: Path,
         plan: ReconciliationPlan,
         canonical_root: Path | None = None,
+        path_guard: PhysicalPathGuard | None = None,
     ) -> Path:
+        guard = path_guard or self.path_guard
+        source_guard = guard.for_legacy_migration()
         parent = (canonical_root or Path(plan.canonical_root)) / ".reconciliation-backups"
-        parent.mkdir(parents=True, exist_ok=True)
+        guard.ensure_directory(parent, role="app_data")
         stamp = plan.created_at.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         suffix = hashlib.sha256(plan.plan_id.encode("utf-8")).hexdigest()[:12]
         final_dir = parent / f"{stamp}-{suffix}"
         staging = parent / f".pending-{uuid.uuid4().hex}"
-        staging.mkdir(parents=False, exist_ok=False)
+        guard.ensure_directory(staging, role="app_data")
         try:
             target = staging / "legacy"
-            shutil.copytree(source, target, symlinks=True)
+            source_guard.verify_tree(
+                source,
+                role="legacy",
+                allow_packaged_legacy=True,
+            )
+            guard.copy_tree(
+                source,
+                target,
+                source_guard=source_guard,
+                source_role="legacy",
+                role="app_data",
+                allow_packaged_legacy=True,
+            )
+            guard.verify_tree(target, role="app_data")
             _validate_backup(source, target)
             metadata = {
                 "version": 1,
@@ -472,13 +561,15 @@ class ReconciliationService:
                 "validation": "passed",
             }
             metadata_path = staging / "reconciliation-metadata.json"
-            metadata_path.write_text(
+            guard.write_text(
+                metadata_path,
                 json.dumps(metadata, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
+                role="app_data",
             )
             _fsync_file(metadata_path)
             _fsync_tree(staging)
-            os.replace(staging, final_dir)
+            guard.before_write(final_dir, role="app_data")
+            guard.replace(staging, final_dir, role="app_data")
             _fsync_directory(parent)
             return final_dir / "legacy"
         except Exception:
@@ -492,7 +583,10 @@ class ReconciliationService:
         canonical: Path,
         plan: ReconciliationPlan,
         backup: Path,
+        path_guard: PhysicalPathGuard | None = None,
     ) -> Path:
+        guard = path_guard or PhysicalPathGuard()
+        marker_guard = guard.for_legacy_migration()
         marker = root / LEGACY_INACTIVE_MARKER
         temporary = root / f".{LEGACY_INACTIVE_MARKER}.{uuid.uuid4().hex}.tmp"
         payload = {
@@ -505,18 +599,37 @@ class ReconciliationService:
             "backup_location": str(backup),
             "reason": "explicit_split_brain_reconciliation",
         }
-        root.mkdir(parents=True, exist_ok=True)
+        marker_guard.ensure_directory(
+            root,
+            role="legacy",
+            allow_packaged_legacy=True,
+        )
+        descriptor, temporary = marker_guard.create_temp_file(
+            root,
+            prefix=f".{LEGACY_INACTIVE_MARKER}.",
+            suffix=".tmp",
+            role="legacy",
+            allow_packaged_legacy=True,
+        )
         try:
-            temporary.write_text(
-                json.dumps(payload, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            marker_guard.replace(
+                temporary,
+                marker,
+                role="legacy",
+                allow_packaged_legacy=True,
             )
-            _fsync_file(temporary)
-            os.replace(temporary, marker)
             _fsync_directory(root)
             return marker
         finally:
-            temporary.unlink(missing_ok=True)
+            marker_guard.remove(
+                temporary,
+                role="legacy",
+                allow_packaged_legacy=True,
+            )
 
 
 def _make_plan_id(
@@ -886,54 +999,105 @@ def _relation_for_database(canonical: dict[str, Any], other: dict[str, Any]) -> 
     return "IDENTICAL" if all(canonical[key] == other[key] for key in comparable) else "DIFFERENT"
 
 
-def _runtime_snapshot(root: Path, pid_exists: Callable[[int], bool]) -> dict[str, Any]:
+def _runtime_snapshot(
+    root: Path,
+    pid_exists: Callable[[int], bool],
+    process_identity: Callable[[int], dict[str, Any] | None] | None = None,
+    *,
+    path_guard: PhysicalPathGuard | None = None,
+    role: str = "runtime",
+    allow_packaged_legacy: bool = False,
+) -> dict[str, Any]:
+    """Read runtime state without confusing PID liveness with ownership."""
+
     path = root / STATE_PATHS["runtime"] / "processes.json"
+    runtime_dir = path.parent
     result: dict[str, Any] = {
-        "exists": path.is_file(),
+        "exists": False,
         "valid": True,
         "entry_count": 0,
         "active_names": [],
         "live_pids": [],
         "unknown_live_pids": [],
+        "reused_pids": [],
+        "stale_pids": [],
         "lock_names": [],
         "live_locks": [],
         "unknown_locks": [],
         "stale_locks": [],
     }
+    if path_guard is not None:
+        try:
+            path_guard.verify_root(
+                runtime_dir,
+                role=role,
+                require_directory=True,
+                allow_packaged_legacy=allow_packaged_legacy,
+            )
+            if path.exists():
+                path_guard.verify_root(
+                    path,
+                    role=role,
+                    allow_packaged_legacy=allow_packaged_legacy,
+                )
+        except PhysicalPathVerificationError:
+            result["valid"] = False
+            return result
+
+    result["exists"] = path.is_file()
     statuses_by_name: dict[str, str] = {}
-    live_by_name: dict[str, bool] = {}
-    if path.is_file():
+    state_by_name: dict[str, str] = {}
+    reader = process_identity or _process_identity
+    if result["exists"]:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("runtime metadata must be an object")
             result["entry_count"] = len(payload)
             for name, item in payload.items():
+                name_text = str(name)
                 if not isinstance(item, dict):
                     result["valid"] = False
+                    state_by_name[name_text] = "unknown"
                     continue
                 status = str(item.get("status", "")).upper()
-                statuses_by_name[str(name)] = status
+                statuses_by_name[name_text] = status
+                if status not in {"RUNNING", "UNKNOWN"}:
+                    state_by_name[name_text] = "stale"
+                    continue
+                result["active_names"].append(name_text)
                 pid = item.get("pid")
-                if status in {"RUNNING", "UNKNOWN"}:
-                    result["active_names"].append(str(name))
-                    if not isinstance(pid, int) or pid <= 0:
-                        result["valid"] = False
-                        live_by_name[str(name)] = False
-                        continue
-                    try:
-                        live = bool(pid_exists(pid))
-                    except Exception:
-                        live = False
-                        result["valid"] = False
-                    if live:
+                if not isinstance(pid, int) or pid <= 0:
+                    result["valid"] = False
+                    state_by_name[name_text] = "unknown"
+                    continue
+                classification = classify_persisted_process(
+                    status=status,
+                    pid=pid,
+                    process_identity=item.get("process_identity"),
+                    ownership=item.get("ownership"),
+                    pid_exists=pid_exists,
+                    identity_reader=reader,
+                )
+                if classification.live:
+                    if classification.pid_reused:
+                        result["reused_pids"].append(pid)
+                        state_by_name[name_text] = "stale"
+                    elif classification.identity_verified and classification.ownership_verified:
                         result["live_pids"].append(pid)
-                        if status == "UNKNOWN":
-                            result["unknown_live_pids"].append(pid)
-                    live_by_name[str(name)] = live
+                        state_by_name[name_text] = "live"
+                    else:
+                        result["unknown_live_pids"].append(pid)
+                        state_by_name[name_text] = "unknown"
+                else:
+                    state_by_name[name_text] = "stale"
+                    if classification.status == "STALE":
+                        result["stale_pids"].append(pid)
+                    else:
+                        result["valid"] = False
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             result["valid"] = False
-    runtime_dir = path.parent
+
     if runtime_dir.is_dir():
         try:
             lock_names = sorted(
@@ -942,14 +1106,10 @@ def _runtime_snapshot(root: Path, pid_exists: Callable[[int], bool]) -> dict[str
             result["lock_names"] = lock_names
             for lock_name in lock_names:
                 process_name = Path(lock_name).stem
-                status = statuses_by_name.get(process_name)
-                if status is None:
-                    result["unknown_locks"].append(lock_name)
-                elif live_by_name.get(process_name, False):
+                state = state_by_name.get(process_name)
+                if state == "live":
                     result["live_locks"].append(lock_name)
-                elif status in {"RUNNING", "UNKNOWN", "STALE", "STOPPED", "CRASHED"}:
-                    # A persisted active entry with a dead PID is stale and
-                    # can be archived; an actually live PID was handled above.
+                elif state == "stale":
                     result["stale_locks"].append(lock_name)
                 else:
                     result["unknown_locks"].append(lock_name)
@@ -958,6 +1118,8 @@ def _runtime_snapshot(root: Path, pid_exists: Callable[[int], bool]) -> dict[str
     result["active_names"] = sorted(set(result["active_names"]))
     result["live_pids"] = sorted(set(result["live_pids"]))
     result["unknown_live_pids"] = sorted(set(result["unknown_live_pids"]))
+    result["reused_pids"] = sorted(set(result["reused_pids"]))
+    result["stale_pids"] = sorted(set(result["stale_pids"]))
     result["lock_names"] = sorted(set(result["lock_names"]))
     result["live_locks"] = sorted(set(result["live_locks"]))
     result["unknown_locks"] = sorted(set(result["unknown_locks"]))

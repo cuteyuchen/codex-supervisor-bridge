@@ -4,7 +4,7 @@
 >
 > This document records the current product intent and the architecture decisions that supersede earlier fixed-backend assumptions. It is deliberately more durable than a browser conversation.
 
-Last updated: 2026-08-30
+Last updated: 2026-08-31
 
 ## Product goal
 
@@ -335,7 +335,7 @@ history and schema version 7. The P6.6 implementation branch is
 
 P6.6 is the active phase: Windows Integration / Bootstrap / Real A-B Proof.
 
-#### 2026-08-30 release blocker: Codex Desktop runtime isolation
+#### 2026-08-31 release blocker: Codex Desktop runtime isolation
 
 P6.6 remains **ACTIVE**. PR #9 is **NOT READY TO MERGE** and must remain open
 as a Draft. Remote Profile B is **NOT production safe** until the complete
@@ -346,6 +346,16 @@ unavailable after Supervisor/Local-Codex-Bridge activity. The visible failure
 included `Codex app-server process is not available`; the later incident did
 not require a repeated interrupt sequence. The earlier assumption that
 `interrupt` alone caused the failure is therefore insufficient.
+
+The first-level root cause is confirmed as
+`CONFIRMED_WINDOWS_APPDATA_EXECUTION_CONTEXT_REDIRECTION`. The same requested
+path under `C:\Users\Windows\AppData\Local\CodexSupervisorBridge` resolved to
+different physical files from different Windows execution contexts. The
+Desktop-derived child reported `PACKAGE_IDENTITY=NO_PACKAGE_IDENTITY` but still
+resolved into `C:\Users\Windows\AppData\Local\Packages\OpenAI.Codex_*\LocalCache\Local`.
+The canonical external context resolved to the non-packaged AppData root.
+The two physical files differed in final path, file identity, size, mtime, and
+SHA-256. Package identity alone cannot establish a safe Supervisor host.
 
 Read-only investigation of the pinned Local-Codex-Bridge 2.1.3 source at
 commit `4ffed814f615316ade8967189a2e1772488d33c2` confirmed that LCB starts its
@@ -364,6 +374,18 @@ The same lifecycle gap remained on the checked upstream `main` revision
 `ff5d880`, so a plain LCB upgrade did not resolve it. This combination meant a
 Supervisor/LCB failure could not be shown independent from the user's daily
 Desktop runtime.
+
+The current branch freezes a standalone-host boundary. PHASE A0/A1 adds
+`StandaloneSupervisorHost` as the Supervisor lifecycle authority and
+`PhysicalPathGuard` as a fail-closed handle-based physical namespace check for
+AppData, components, runtime, LCB, CODEX_HOME, writes, process spawn, repair,
+installation, and tunnel startup. PHASE A1 also makes
+`CodexExecutableResolver` the runtime preparation path, classifies stale
+legacy identities through `ProcessManager`, and binds hardening validation to
+the actual LCB launch entrypoint. Supervisor service children inherit the
+verified Host authority explicitly and cannot overwrite the parent-owned Host
+identity record. An unresolved or unsafe executable, root, or ownership identity
+cannot fall back to the Desktop app-server.
 
 The installed Codex inspected on 2026-08-30 is
 `codex-cli 0.151.0-alpha.7.2`. Its current help exposes direct app-server stdio,

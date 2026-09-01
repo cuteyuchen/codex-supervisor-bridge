@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .physical import PhysicalPathGuard, PhysicalPathVerificationError
+
 
 class RemoteAccessMode(str, Enum):
     """Supported remote transports."""
@@ -245,12 +247,14 @@ class OpenAISecureMcpTunnelController:
         executable: str | Path | None = None,
         runtime_dir: str | Path | None = None,
         client_version: str = "0.0.13",
+        path_guard: PhysicalPathGuard | None = None,
     ) -> None:
         self.process_manager = process_manager
         self.secret_store = secret_store
         self.executable = str(executable) if executable else "tunnel-client"
         self.runtime_dir = Path(runtime_dir) if runtime_dir else None
         self.client_version = client_version
+        self.path_guard = path_guard or PhysicalPathGuard()
         self._config: OpenAISecureMcpTunnelConfig | None = None
         self._health = RemoteAccessHealth(
             provider=RemoteAccessMode.OPENAI_SECURE_MCP_TUNNEL,
@@ -312,6 +316,19 @@ class OpenAISecureMcpTunnelController:
             return self._set_health(state=code, technical_detail="; ".join(errors))
         if self.secret_store is None:
             return self._set_health(state=RemoteAccessFailure.TUNNEL_RUNTIME_KEY_MISSING.value)
+        if self.process_manager is None:
+            return self._set_health(
+                state=RemoteAccessFailure.TUNNEL_NOT_READY.value,
+                technical_detail="ProcessManager is not configured",
+            )
+        runtime_dir = self.runtime_dir or self.process_manager.runtime_dir
+        try:
+            self.path_guard.verify_root(runtime_dir, role="runtime")
+        except PhysicalPathVerificationError as exc:
+            return self._set_health(
+                state=RemoteAccessFailure.TUNNEL_NOT_READY.value,
+                technical_detail=str(exc),
+            )
         try:
             runtime_key = self.secret_store.get(config.runtime_secret_ref)
         except (OSError, RuntimeError, ValueError):
@@ -321,18 +338,13 @@ class OpenAISecureMcpTunnelController:
             )
         if not runtime_key:
             return self._set_health(state=RemoteAccessFailure.TUNNEL_RUNTIME_KEY_MISSING.value)
-        if self.process_manager is None:
-            return self._set_health(
-                state=RemoteAccessFailure.TUNNEL_NOT_READY.value,
-                technical_detail="ProcessManager is not configured",
-                runtime_key_present=True,
-            )
         from .process import ManagedProcessSpec
 
-        runtime_dir = self.runtime_dir or self.process_manager.runtime_dir
-        runtime_dir.mkdir(parents=True, exist_ok=True)
+        self.path_guard.ensure_directory(runtime_dir, role="runtime")
         health_url_file = runtime_dir / "openai-tunnel-health.url"
-        health_url_file.unlink(missing_ok=True)
+        self.path_guard.before_write(health_url_file, role="runtime")
+        if health_url_file.exists():
+            self.path_guard.remove(health_url_file, role="runtime")
         env = {**os.environ, "CODEX_SUPERVISOR_TUNNEL_RUNTIME_KEY": runtime_key}
         command = self.build_command(config, health_url_file)
         try:
@@ -364,7 +376,7 @@ class OpenAISecureMcpTunnelController:
             )
         self._config = config
         process_running = state.status == "RUNNING"
-        health_url = _read_health_url(health_url_file)
+        health_url = _read_health_url(health_url_file, path_guard=self.path_guard)
         ready = process_running and health_url is not None and _probe_endpoint(health_url, "/readyz")
         healthy = process_running and health_url is not None and _probe_endpoint(health_url, "/healthz")
         state_code = (
@@ -423,7 +435,10 @@ class OpenAISecureMcpTunnelController:
             )
         health_url = self._health.health_url
         if health_url is None and self.runtime_dir is not None:
-            health_url = _read_health_url(self.runtime_dir / "openai-tunnel-health.url")
+            health_url = _read_health_url(
+                self.runtime_dir / "openai-tunnel-health.url",
+                path_guard=self.path_guard,
+            )
         healthy = bool(health_url and _probe_endpoint(health_url, "/healthz"))
         ready = bool(health_url and _probe_endpoint(health_url, "/readyz"))
         return self._set_health(
@@ -436,7 +451,7 @@ class OpenAISecureMcpTunnelController:
         )
 
     def _probe_ready(self, health_url_file: Path) -> bool:
-        url = _read_health_url(health_url_file)
+        url = _read_health_url(health_url_file, path_guard=self.path_guard)
         return bool(url and _probe_endpoint(url, "/healthz") and _probe_endpoint(url, "/readyz"))
 
     def _set_health(self, **updates: Any) -> RemoteAccessHealth:
@@ -474,10 +489,18 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
-def _read_health_url(path: Path) -> str | None:
+def _read_health_url(
+    path: Path,
+    *,
+    path_guard: PhysicalPathGuard | None = None,
+) -> str | None:
     try:
+        guard = path_guard or PhysicalPathGuard()
+        evidence = guard.verify_root(path, role="runtime")
+        if not evidence.exists:
+            return None
         value = path.read_text(encoding="utf-8").strip()
-    except OSError:
+    except (OSError, PhysicalPathVerificationError):
         return None
     return value or None
 

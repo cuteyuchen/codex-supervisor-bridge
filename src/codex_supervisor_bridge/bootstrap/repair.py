@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from pathlib import Path
 
 from .component_registry import ManagedComponentRegistry
@@ -12,6 +11,7 @@ from .doctor import Doctor, DoctorOptions
 from .installer import ComponentInstaller
 from .models import DoctorStatus, HealthStatus, RepairAction
 from .paths import AppDataMigrationError, AppDataPaths, migrate_legacy_app_data
+from .physical import PhysicalPathGuard
 from .ports import PortAllocator
 from .process import ProcessManager
 from .remote import RemoteAccessMode
@@ -33,21 +33,36 @@ class RepairService:
         installer: ComponentInstaller | None = None,
         registry: ManagedComponentRegistry | None = None,
         auto_install: bool = False,
+        path_guard: PhysicalPathGuard | None = None,
     ) -> None:
         self.paths = paths or AppDataPaths.from_environment()
-        self.config_store = config_store or ConfigStore(paths=self.paths)
-        self.doctor = doctor or Doctor(paths=self.paths, config_store=self.config_store)
-        self.process_manager = process_manager or ProcessManager(self.paths.runtime, self.paths.logs)
+        self.path_guard = path_guard or PhysicalPathGuard()
+        self.config_store = config_store or ConfigStore(
+            paths=self.paths,
+            path_guard=self.path_guard,
+        )
+        self.doctor = doctor or Doctor(
+            paths=self.paths,
+            config_store=self.config_store,
+            path_guard=self.path_guard,
+        )
+        self.process_manager = process_manager or ProcessManager(
+            self.paths.runtime,
+            self.paths.logs,
+            path_guard=self.path_guard,
+        )
         self.port_allocator = port_allocator or PortAllocator()
         self.secret_store = secret_store or self._default_secret_store()
         self.registry = registry or ManagedComponentRegistry()
         self.installer = installer or ComponentInstaller(
             self.paths.components,
             trusted_manifests=self.registry.manifests(),
+            path_guard=self.path_guard,
         )
         self.auto_install = auto_install
 
     def repair(self, status: DoctorStatus | None = None, *, project_directory: Path | None = None) -> list[RepairAction]:
+        self.path_guard.verify_root(self.paths.filesystem_root, role="app_data")
         status = status or self.doctor.run()
         actions: list[RepairAction] = []
         root_report = self.paths.root_report
@@ -63,7 +78,10 @@ class RepairService:
             ]
         if root_report.migration_available:
             try:
-                migrated = migrate_legacy_app_data(self.paths)
+                migrated = migrate_legacy_app_data(
+                    self.paths,
+                    path_guard=self.path_guard,
+                )
             except AppDataMigrationError as exc:
                 return [
                     RepairAction(
@@ -100,7 +118,7 @@ class RepairService:
                 )
             )
         if not self.paths.data.exists() or not self.paths.logs.exists() or not self.paths.runtime.exists() or not self.paths.config.exists() or not self.paths.cache.exists():
-            self.paths.ensure_directories()
+            self.paths.ensure_directories(path_guard=self.path_guard)
             actions.append(RepairAction(action="repair_data_directory", status=HealthStatus.READY, message="Application data is ready."))
 
         loaded = self.config_store.load()
@@ -158,6 +176,7 @@ class RepairService:
                 project_directory=project,
                 executable=config.advanced.executable_paths.get("devspace", "devspace"),
                 entrypoint=devspace_entrypoint,
+                path_guard=self.path_guard,
             )
             devspace.write_config()
             devspace.prepare_auth(self.secret_store)
@@ -295,22 +314,33 @@ class RepairService:
                 }
             }
         }
-        self.paths.config.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(prefix="mcp-", suffix=".tmp", dir=self.paths.config)
+        self.path_guard.ensure_directory(self.paths.config, role="path")
+        fd, temporary = self.path_guard.create_temp_file(
+            self.paths.config,
+            prefix="mcp-",
+            suffix=".tmp",
+            role="path",
+        )
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
                 json.dump(payload, handle, indent=2, sort_keys=True)
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, self.paths.generated_mcp_config)
+            self.path_guard.replace(
+                temporary,
+                self.paths.generated_mcp_config,
+                role="path",
+            )
         finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+            self.path_guard.remove(temporary, role="path")
 
     def _default_secret_store(self) -> SecretStore:
         import platform
 
         if platform.system() == "Windows":
-            return WindowsDpapiSecretStore(self.paths.config / "secrets")
+            return WindowsDpapiSecretStore(
+                self.paths.config / "secrets",
+                path_guard=self.path_guard,
+            )
         return MemorySecretStore()

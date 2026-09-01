@@ -4,6 +4,7 @@ import argparse
 import getpass
 import ipaddress
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -13,12 +14,16 @@ from mcp.server import MCPServer
 from codex_supervisor_bridge import __version__
 from codex_supervisor_bridge.backends.models import BackendHealth, BackendHealthStatus
 from codex_supervisor_bridge.bootstrap import (
+    SUPERVISOR_HOST_AUTHORITY_ENV,
+    SUPERVISOR_HOST_AUTHORITY_VALUE,
     BootstrapService,
     CommandPolicy,
     DevelopmentStyle,
     ReconciliationError,
     ReconciliationService,
+    StandaloneSupervisorHost,
 )
+from codex_supervisor_bridge.bootstrap.codex_isolation import SUPERVISOR_HOST_INSTANCE_ENV
 from codex_supervisor_bridge.bootstrap.configuration import ConfigStore
 from codex_supervisor_bridge.bootstrap.devspace_auth import DevSpaceLocalOAuthDriver
 from codex_supervisor_bridge.bootstrap.doctor import DoctorOptions
@@ -310,8 +315,17 @@ def build_parser(settings: Settings | None = None) -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
+    if (
+        args.command is None
+        and os.environ.get(SUPERVISOR_HOST_AUTHORITY_ENV) != SUPERVISOR_HOST_AUTHORITY_VALUE
+    ):
+        from codex_supervisor_bridge.bootstrap.host import main as host_main
+
+        host_main(raw_argv)
+        return
     if args.command is not None:
         if args.command == "remote":
             if args.remote_action != "configure":
@@ -325,7 +339,14 @@ def main(argv: list[str] | None = None) -> None:
                 return
             if not runtime_key:
                 parser.error("runtime key must not be empty")
-            bootstrap = BootstrapService(auto_install=True)
+            app_paths = AppDataPaths.from_environment()
+            host = StandaloneSupervisorHost(paths=app_paths)
+            host.assert_ready()
+            bootstrap = BootstrapService(
+                paths=app_paths,
+                host=host,
+                auto_install=True,
+            )
             result = bootstrap.configure_remote_access(
                 tunnel_id=args.tunnel_id,
                 runtime_key=runtime_key,
@@ -343,9 +364,14 @@ def main(argv: list[str] | None = None) -> None:
             if args.confirm and args.dry_run:
                 parser.error("--dry-run cannot be combined with --confirm")
             paths = AppDataPaths.from_environment()
-            reconciler = ReconciliationService(paths=paths)
+            host = StandaloneSupervisorHost(paths=paths)
+            reconciler = ReconciliationService(
+                paths=paths,
+                path_guard=host.path_guard,
+            )
             try:
                 if args.confirm:
+                    host.assert_ready()
                     result = reconciler.apply(
                         plan_id=args.confirm,
                         selected_authority=args.keep,
@@ -395,7 +421,14 @@ def main(argv: list[str] | None = None) -> None:
                 for reason in plan.blocking_reasons:
                     print(f"blocked={reason}")
             return
-        bootstrap = BootstrapService(auto_install=True)
+        app_paths = AppDataPaths.from_environment()
+        host = StandaloneSupervisorHost(paths=app_paths)
+        host.assert_ready()
+        bootstrap = BootstrapService(
+            paths=app_paths,
+            host=host,
+            auto_install=True,
+        )
         if args.command in {"doctor", "status"}:
             result = bootstrap.status(project_directory=args.project)
         elif args.command == "repair":
@@ -434,10 +467,16 @@ def main(argv: list[str] | None = None) -> None:
     if args.transport != "stdio" and not _is_loopback_host(args.host):
         parser.error("HTTP MCP must bind to loopback; use a secure HTTPS tunnel for remote access")
 
-    service = MemoryService(args.database)
     app_paths = AppDataPaths.from_environment()
+    host = StandaloneSupervisorHost(paths=app_paths)
+    host.assert_ready()
+    host_identity = host.ensure_identity()
+    service = MemoryService(args.database, path_guard=host.path_guard)
     secret_store = (
-        WindowsDpapiSecretStore(app_paths.config / "secrets")
+        WindowsDpapiSecretStore(
+            app_paths.config / "secrets",
+            path_guard=host.path_guard,
+        )
         if sys.platform == "win32"
         else MemorySecretStore()
     )
@@ -452,10 +491,11 @@ def main(argv: list[str] | None = None) -> None:
             ),
         )
 
-    config = ConfigStore(paths=app_paths).load().config
+    config = ConfigStore(paths=app_paths, path_guard=host.path_guard).load().config
     bootstrap = BootstrapService(
         paths=app_paths,
-        config_store=ConfigStore(paths=app_paths),
+        config_store=ConfigStore(paths=app_paths, path_guard=host.path_guard),
+        host=host,
     )
     doctor = bootstrap.doctor.run(
         DoctorOptions(project_directory=config.basic.project_directory)
@@ -477,11 +517,19 @@ def main(argv: list[str] | None = None) -> None:
         except FileNotFoundError:
             launch_command = None
     if selection.profile == "lightweight" and launch_command:
+        runtime_environment = lcb_environment(app_data_root=app_paths.filesystem_root)
+        if host_identity.host_instance_id is None:
+            raise RuntimeError(
+                "SUPERVISOR_HOST_IDENTITY_UNKNOWN: persistent host identity is unavailable"
+            )
+        runtime_environment[SUPERVISOR_HOST_INSTANCE_ENV] = host_identity.host_instance_id
         composition = RuntimeComposition.profile_b(
             service,
             launch_command=launch_command,
-            env=lcb_environment(app_data_root=app_paths.filesystem_root),
+            env=runtime_environment,
             app_data_root=app_paths.filesystem_root,
+            path_guard=host.path_guard,
+            host=host,
             workspace_factory=authenticated_devspace_factory,
         )
     elif selection.binding_forced and selection.profile == "lightweight":

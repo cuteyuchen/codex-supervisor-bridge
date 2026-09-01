@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import os
 import platform
-import shutil
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping
+
+from .physical import PhysicalPathGuard
 
 PERSISTENT_STATE_NAMES = ("database", "settings", "secrets", "runtime")
 STATE_PATHS = {
@@ -254,17 +255,18 @@ class AppDataPaths:
     def generated_mcp_config(self) -> Path:
         return self.config / "mcp.json"
 
-    def ensure_directories(self) -> None:
-        for path in (
-            self.filesystem_root,
-            self.data,
-            self.logs,
-            self.runtime,
-            self.config,
-            self.cache,
-            self.components,
+    def ensure_directories(self, *, path_guard: PhysicalPathGuard | None = None) -> None:
+        guard = path_guard or PhysicalPathGuard()
+        for role, path in (
+            ("app_data", self.filesystem_root),
+            ("path", self.data),
+            ("path", self.logs),
+            ("runtime", self.runtime),
+            ("path", self.config),
+            ("path", self.cache),
+            ("components", self.components),
         ):
-            path.mkdir(parents=True, exist_ok=True)
+            guard.ensure_directory(path, role=role)
 
 
 def resolve_windows_local_app_data(
@@ -324,9 +326,15 @@ def inspect_app_data_roots(
     )
 
 
-def migrate_legacy_app_data(paths: AppDataPaths) -> AppDataRootReport:
+def migrate_legacy_app_data(
+    paths: AppDataPaths,
+    *,
+    path_guard: PhysicalPathGuard | None = None,
+) -> AppDataRootReport:
     """Copy one unambiguous legacy state into the canonical root atomically."""
 
+    guard = path_guard or PhysicalPathGuard()
+    legacy_guard = guard.for_legacy_migration()
     report = paths.root_report
     if report.split_brain:
         raise AppDataMigrationError("SPLIT_BRAIN_DETECTED: persistent state exists in both roots")
@@ -335,13 +343,28 @@ def migrate_legacy_app_data(paths: AppDataPaths) -> AppDataRootReport:
             f"legacy migration is unavailable for root status {report.status}"
         )
     legacy = report.active_legacy_roots[0]
-    if _legacy_runtime_is_live(legacy.root):
-        raise AppDataMigrationError("legacy runtime contains live process state")
+    try:
+        guard.verify_root(paths.filesystem_root, role="app_data")
+        legacy_guard.verify_root(
+            legacy.root,
+            role="legacy",
+            require_directory=True,
+            allow_packaged_legacy=True,
+        )
+        _reconcile_legacy_runtime(legacy.root, legacy_guard)
+    except AppDataMigrationError:
+        raise
+    except Exception as exc:
+        raise AppDataMigrationError(str(exc)) from exc
 
     backup = paths.filesystem_root / ".migration-backups" / (
         datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
     )
-    backup.mkdir(parents=True, exist_ok=False)
+    try:
+        guard.ensure_directory(backup.parent, role="app_data")
+        guard.ensure_directory(backup, role="app_data")
+    except Exception as exc:
+        raise AppDataMigrationError(f"migration backup could not be created: {exc}") from exc
     copied: list[Path] = []
     try:
         for name in PERSISTENT_STATE_NAMES:
@@ -349,13 +372,23 @@ def migrate_legacy_app_data(paths: AppDataPaths) -> AppDataRootReport:
             source = legacy.root / relative
             if not _has_content(source):
                 continue
-            _copy_tree_or_file(source, backup / relative)
+            _copy_tree_or_file(
+                source,
+                backup / relative,
+                path_guard=guard,
+                source_guard=legacy_guard,
+            )
             target = paths.filesystem_root / relative
             if _has_content(target):
                 raise AppDataMigrationError(
                     f"canonical state appeared during migration: {relative}"
                 )
-            _copy_tree_or_file_atomic(source, target)
+            _copy_tree_or_file_atomic(
+                source,
+                target,
+                path_guard=guard,
+                source_guard=legacy_guard,
+            )
             copied.append(target)
         migrated = inspect_app_data_roots(
             paths.root,
@@ -367,13 +400,19 @@ def migrate_legacy_app_data(paths: AppDataPaths) -> AppDataRootReport:
         if not migrated.canonical_state.has_persistent_state:
             raise AppDataMigrationError("canonical state validation failed after migration")
         _validate_migrated_state(paths.filesystem_root, migrated.canonical_state.persistent_categories)
-        _write_legacy_inactive_marker(legacy.root, paths.root, backup)
+        _write_legacy_inactive_marker(legacy.root, paths.root, backup, path_guard=guard)
     except Exception:
         for target in reversed(copied):
             if target.is_dir() and not target.is_symlink():
-                shutil.rmtree(target, ignore_errors=True)
+                try:
+                    guard.remove(target, role="path", recursive=True)
+                except Exception:
+                    pass
             else:
-                target.unlink(missing_ok=True)
+                try:
+                    guard.remove(target, role="path")
+                except Exception:
+                    pass
         raise
     return inspect_app_data_roots(
         paths.root,
@@ -414,7 +453,7 @@ def _has_content(path: Path) -> bool:
 def _is_packaged_local_app_data(value: str) -> bool:
     normalized = value.replace("/", "\\").rstrip("\\")
     parts = [part.casefold() for part in normalized.split("\\") if part]
-    for index in range(len(parts) - 5):
+    for index in range(len(parts)):
         if parts[index : index + 3] == ["appdata", "local", "packages"] and parts[index + 4 : index + 6] == ["localcache", "local"]:
             return True
     return False
@@ -600,21 +639,64 @@ def _known_folder_local_app_data() -> Path | None:
         ole32.CoTaskMemFree(result)
 
 
-def _copy_tree_or_file(source: Path, target: Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if source.is_dir():
-        shutil.copytree(source, target)
+def _copy_tree_or_file(
+    source: Path,
+    target: Path,
+    *,
+    path_guard: PhysicalPathGuard | None = None,
+    source_guard: PhysicalPathGuard | None = None,
+) -> None:
+    guard = path_guard or PhysicalPathGuard()
+    source_policy = source_guard or guard
+    source_role = "legacy" if source_guard is not None else "path"
+    source_evidence = source_policy.verify_root(
+        source,
+        role=source_role,
+        allow_packaged_legacy=source_policy.allow_packaged_legacy,
+    )
+    if target.exists() or target.is_symlink():
+        raise AppDataMigrationError(f"migration target already exists: {target}")
+    if source_evidence.is_directory:
+        guard.copy_tree(
+            source,
+            target,
+            source_guard=source_policy,
+            source_role=source_role,
+            role="path",
+            allow_packaged_legacy=source_policy.allow_packaged_legacy,
+        )
         _fsync_tree(target)
     else:
-        shutil.copy2(source, target)
+        guard.copy_file(
+            source,
+            target,
+            source_guard=source_policy,
+            source_role=source_role,
+            role="path",
+            allow_packaged_legacy=source_policy.allow_packaged_legacy,
+        )
         _fsync_file(target)
 
 
-def _copy_tree_or_file_atomic(source: Path, target: Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
+def _copy_tree_or_file_atomic(
+    source: Path,
+    target: Path,
+    *,
+    path_guard: PhysicalPathGuard | None = None,
+    source_guard: PhysicalPathGuard | None = None,
+) -> None:
+    guard = path_guard or PhysicalPathGuard()
+    guard.ensure_directory(target.parent, role="path")
+    guard.before_write(target, role="path")
     temporary = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
+    guard.before_write(temporary, role="path")
     try:
-        _copy_tree_or_file(source, temporary)
+        _copy_tree_or_file(
+            source,
+            temporary,
+            path_guard=guard,
+            source_guard=source_guard,
+        )
         if target.is_dir() and not target.is_symlink():
             # Canonical bootstrap may have created an empty directory already;
             # replacing only that harmless placeholder keeps promotion atomic.
@@ -622,14 +704,14 @@ def _copy_tree_or_file_atomic(source: Path, target: Path) -> None:
                 raise AppDataMigrationError(
                     f"canonical state appeared during migration: {target.name}"
                 )
-            target.rmdir()
-        os.replace(temporary, target)
+            guard.remove(target, role="path", recursive=True)
+        guard.replace(temporary, target, role="path")
         _fsync_directory(target.parent)
     finally:
         if temporary.is_dir() and not temporary.is_symlink():
-            shutil.rmtree(temporary, ignore_errors=True)
+            guard.remove(temporary, role="path", recursive=True)
         else:
-            temporary.unlink(missing_ok=True)
+            guard.remove(temporary, role="path")
 
 
 def _fsync_file(path: Path) -> None:
@@ -660,22 +742,30 @@ def _fsync_tree(path: Path) -> None:
         _fsync_file(path)
 
 
-def _legacy_runtime_is_live(root: Path) -> bool:
-    state_path = root / "runtime" / "processes.json"
-    try:
-        import json
+def _reconcile_legacy_runtime(root: Path, guard: PhysicalPathGuard) -> None:
+    """Classify persisted identities before migration and clear only stale state."""
 
-        payload = json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return False
-    if not isinstance(payload, dict):
-        return False
-    return any(
-        isinstance(item, dict)
-        and item.get("status") in {"RUNNING", "UNKNOWN"}
-        and isinstance(item.get("pid"), int)
-        for item in payload.values()
+    from .process import ProcessManager
+
+    manager = ProcessManager(
+        root / "runtime",
+        root / "logs",
+        path_guard=guard,
     )
+    for state in manager.statuses():
+        if state.status == "RUNNING":
+            raise AppDataMigrationError(
+                f"legacy runtime contains a verified live process: {state.name}"
+            )
+        if state.status == "UNKNOWN":
+            if state.identity_status == "PID_REUSED":
+                manager.repair_stale(state.name)
+                continue
+            raise AppDataMigrationError(
+                f"legacy runtime process ownership is unknown: {state.name}"
+            )
+        if state.status in {"STALE", "CRASHED"}:
+            manager.repair_stale(state.name)
 
 
 def _validate_migrated_state(root: Path, categories: tuple[str, ...]) -> None:
@@ -695,21 +785,45 @@ def _validate_migrated_state(root: Path, categories: tuple[str, ...]) -> None:
         raise AppDataMigrationError("SecretStore validation failed after migration")
 
 
-def _write_legacy_inactive_marker(root: Path, canonical: Path, backup: Path) -> None:
+def _write_legacy_inactive_marker(
+    root: Path,
+    canonical: Path,
+    backup: Path,
+    *,
+    path_guard: PhysicalPathGuard | None = None,
+) -> None:
+    guard = path_guard or PhysicalPathGuard()
+    legacy_guard = guard.for_legacy_migration()
     payload = {
         "canonical_root": str(canonical),
         "backup": str(backup),
         "marked_at": datetime.now(timezone.utc).isoformat(),
         "reason": "migrated_to_canonical_root",
     }
-    temporary = root / f".{LEGACY_INACTIVE_MARKER}.{uuid.uuid4().hex}.tmp"
+    legacy_guard.ensure_directory(
+        root,
+        role="legacy",
+        allow_packaged_legacy=True,
+    )
+    marker = root / LEGACY_INACTIVE_MARKER
+    descriptor, temporary = legacy_guard.create_temp_file(
+        root,
+        prefix=f".{LEGACY_INACTIVE_MARKER}.",
+        suffix=".tmp",
+        role="legacy",
+        allow_packaged_legacy=True,
+    )
     try:
-        temporary.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        legacy_guard.replace(
+            temporary,
+            marker,
+            role="legacy",
+            allow_packaged_legacy=True,
         )
-        _fsync_file(temporary)
-        os.replace(temporary, root / LEGACY_INACTIVE_MARKER)
         _fsync_directory(root)
     finally:
-        temporary.unlink(missing_ok=True)
+        legacy_guard.remove(temporary, role="legacy", allow_packaged_legacy=True)

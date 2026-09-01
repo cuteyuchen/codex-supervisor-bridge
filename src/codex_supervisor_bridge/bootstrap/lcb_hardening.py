@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .physical import PhysicalPathGuard, PhysicalPathVerificationError
+
 LCB_RUNTIME_CONTRACT = "supervisor-runtime-v1"
 LCB_HARDENING_REVISION = "csb-lcb-runtime-1"
 LCB_RUNTIME_MARKER = ".codex-supervisor-runtime-contract.json"
@@ -313,16 +315,25 @@ export type { ProcessIdentity as SupervisorProcessIdentity };
 '''
 
 
-def apply_lcb_runtime_hardening(source_root: str | Path) -> Path:
+def apply_lcb_runtime_hardening(
+    source_root: str | Path,
+    *,
+    path_guard: PhysicalPathGuard | None = None,
+) -> Path:
     """Apply the deterministic Supervisor lifecycle patch to an LCB source tree."""
 
     root = Path(source_root)
+    guard = path_guard or PhysicalPathGuard()
+    guard.verify_root(root, role="lcb", require_directory=True)
     app_server = root / "src" / "app-server.ts"
+    runtime_path = root / "src" / "supervisor-runtime.ts"
+    marker = root / LCB_RUNTIME_MARKER
+    for path in (app_server, runtime_path, marker):
+        guard.verify_subpath(path, root, role="lcb")
     if not app_server.is_file():
         raise LcbHardeningError("LCB_RUNTIME_ISOLATION_UNSUPPORTED: src/app-server.ts is missing")
     current = app_server.read_text(encoding="utf-8")
-    marker = root / LCB_RUNTIME_MARKER
-    if _marker_is_valid(root):
+    if _marker_is_valid(root, path_guard=guard):
         return marker
     if "readSupervisorRuntimeBinding" in current:
         raise LcbHardeningError(
@@ -409,13 +420,19 @@ def apply_lcb_runtime_hardening(source_root: str | Path) -> Path:
     if "readSupervisorRuntimeBinding" not in current:
         raise LcbHardeningError("LCB_RUNTIME_ISOLATION_UNSUPPORTED: lifecycle patch did not apply")
 
-    (root / "src" / "supervisor-runtime.ts").write_text(
+    guard.write_text(
+        runtime_path,
         _SUPERVISOR_RUNTIME_TS,
-        encoding="utf-8",
-        newline="\n",
+        role="lcb",
     )
     runtime_source = _SUPERVISOR_RUNTIME_TS
-    marker.write_text(
+    guard.write_text(
+        app_server,
+        current,
+        role="lcb",
+    )
+    guard.write_text(
+        marker,
         json.dumps(
             {
                 "contract": LCB_RUNTIME_CONTRACT,
@@ -432,36 +449,56 @@ def apply_lcb_runtime_hardening(source_root: str | Path) -> Path:
             sort_keys=True,
         )
         + "\n",
-        encoding="utf-8",
-        newline="\n",
+        role="lcb",
     )
-    app_server.write_text(current, encoding="utf-8", newline="\n")
     return marker
 
 
 def has_lcb_runtime_hardening(source_root: str | Path) -> bool:
     """Return true only when source and built LCB lifecycle guards are verified."""
 
-    return _marker_is_valid(Path(source_root), require_build=True)
+    return _marker_is_valid(
+        Path(source_root),
+        require_build=True,
+        path_guard=PhysicalPathGuard(),
+    )
 
 
 def has_lcb_runtime_source_hardening(source_root: str | Path) -> bool:
     """Return true when the source patch is present before the build step."""
 
-    return _marker_is_valid(Path(source_root), require_build=False)
+    return _marker_is_valid(
+        Path(source_root),
+        require_build=False,
+        path_guard=PhysicalPathGuard(),
+    )
 
 
-def finalize_lcb_runtime_hardening(source_root: str | Path) -> Path:
+def finalize_lcb_runtime_hardening(
+    source_root: str | Path,
+    *,
+    path_guard: PhysicalPathGuard | None = None,
+) -> Path:
     """Bind the source marker to the built JavaScript lifecycle implementation."""
 
     root = Path(source_root)
-    if not _marker_is_valid(root, require_build=False):
+    guard = path_guard or PhysicalPathGuard()
+    guard.verify_root(root, role="lcb", require_directory=True)
+    source_files = (
+        root / LCB_RUNTIME_MARKER,
+        root / "src" / "app-server.ts",
+        root / "src" / "supervisor-runtime.ts",
+    )
+    for path in source_files:
+        guard.verify_subpath(path, root, role="lcb")
+    if not _marker_is_valid(root, require_build=False, path_guard=guard):
         raise LcbHardeningError(
             "LCB_RUNTIME_ISOLATION_UNSUPPORTED: source hardening is incomplete"
         )
     built_digests: dict[str, str] = {}
     for relative in LCB_RUNTIME_BUILD_FILES:
         built = root / relative
+        guard.verify_subpath(built, root, role="lcb")
         if not built.is_file():
             raise LcbHardeningError(
                 f"LCB_RUNTIME_ISOLATION_UNSUPPORTED: built hardening file is missing: {relative}"
@@ -483,33 +520,82 @@ def finalize_lcb_runtime_hardening(source_root: str | Path) -> Path:
             )
         built_digests[relative] = hashlib.sha256(content.encode("utf-8")).hexdigest()
     marker = root / LCB_RUNTIME_MARKER
+    guard.verify_subpath(marker, root, role="lcb")
     payload = json.loads(marker.read_text(encoding="utf-8"))
     payload["build_files"] = list(LCB_RUNTIME_BUILD_FILES)
     payload["build_files_sha256"] = built_digests
-    marker.write_text(
+    guard.write_text(
+        marker,
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-        newline="\n",
+        role="lcb",
     )
     return marker
 
 
-def require_lcb_runtime_hardening(source_root: str | Path) -> None:
-    if not has_lcb_runtime_hardening(source_root):
+def require_lcb_runtime_hardening(
+    source_root: str | Path,
+    *,
+    path_guard: PhysicalPathGuard | None = None,
+) -> None:
+    if not _marker_is_valid(
+        Path(source_root),
+        require_build=True,
+        path_guard=path_guard or PhysicalPathGuard(),
+    ):
         raise LcbHardeningError(
             "LCB_RUNTIME_ISOLATION_UNSUPPORTED: hardened Supervisor lifecycle contract is missing"
         )
 
 
-def _marker_is_valid(root: Path, *, require_build: bool = False) -> bool:
+def lcb_root_from_entrypoint(entrypoint: str | Path) -> Path:
+    """Derive the component root from the actual ``dist/src/index.js`` path."""
+
+    resolved = Path(entrypoint).expanduser().absolute()
+    if resolved.name.casefold() != "index.js":
+        raise LcbHardeningError(
+            "LCB_RUNTIME_ISOLATION_UNSUPPORTED: launch entrypoint must be dist/src/index.js"
+        )
+    if resolved.parent.name.casefold() != "src" or resolved.parent.parent.name.casefold() != "dist":
+        raise LcbHardeningError(
+            "LCB_RUNTIME_ISOLATION_UNSUPPORTED: launch entrypoint is outside the expected dist/src layout"
+        )
+    return resolved.parent.parent.parent
+
+
+def require_lcb_runtime_hardening_from_entrypoint(
+    entrypoint: str | Path,
+    *,
+    path_guard: PhysicalPathGuard | None = None,
+) -> Path:
+    """Verify the physical launch entrypoint before checking its component marker."""
+
+    guard = path_guard or PhysicalPathGuard()
+    resolved_entrypoint = Path(entrypoint).expanduser().absolute()
+    guard.verify_root(resolved_entrypoint, role="lcb")
+    root = lcb_root_from_entrypoint(resolved_entrypoint)
+    guard.verify_root(root, role="lcb", require_directory=True)
+    require_lcb_runtime_hardening(root, path_guard=guard)
+    return root
+
+
+def _marker_is_valid(
+    root: Path,
+    *,
+    require_build: bool = False,
+    path_guard: PhysicalPathGuard | None = None,
+) -> bool:
     marker = root / LCB_RUNTIME_MARKER
     app_server = root / "src" / "app-server.ts"
     runtime = root / "src" / "supervisor-runtime.ts"
+    guard = path_guard or PhysicalPathGuard()
     try:
+        guard.verify_root(root, role="lcb", require_directory=True)
+        for path in (marker, app_server, runtime):
+            guard.verify_subpath(path, root, role="lcb")
         payload: Any = json.loads(marker.read_text(encoding="utf-8"))
         app_text = app_server.read_text(encoding="utf-8")
         runtime_text = runtime.read_text(encoding="utf-8")
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError, PhysicalPathVerificationError):
         return False
     if not isinstance(payload, dict):
         return False
@@ -541,8 +627,9 @@ def _marker_is_valid(root: Path, *, require_build: bool = False) -> bool:
     for relative in LCB_RUNTIME_BUILD_FILES:
         built = root / relative
         try:
+            guard.verify_subpath(built, root, role="lcb")
             content = built.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
+        except (OSError, UnicodeError, PhysicalPathVerificationError):
             return False
         if build_digests.get(relative) != hashlib.sha256(content.encode("utf-8")).hexdigest():
             return False
@@ -574,5 +661,7 @@ __all__ = [
     "finalize_lcb_runtime_hardening",
     "has_lcb_runtime_hardening",
     "has_lcb_runtime_source_hardening",
+    "lcb_root_from_entrypoint",
     "require_lcb_runtime_hardening",
+    "require_lcb_runtime_hardening_from_entrypoint",
 ]

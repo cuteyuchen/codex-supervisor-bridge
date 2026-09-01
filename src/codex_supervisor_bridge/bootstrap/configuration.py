@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -10,6 +9,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .paths import AppDataPaths
+from .physical import PhysicalPathGuard, PhysicalPathVerificationError
 from .remote import OpenAISecureMcpTunnelConfig, RemoteAccessConfig, RemoteAccessMode
 
 CONFIG_VERSION = 1
@@ -102,14 +102,29 @@ class ConfigLoadResult(BaseModel):
 
 
 class ConfigStore:
-    def __init__(self, path: str | Path | None = None, *, paths: AppDataPaths | None = None) -> None:
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        *,
+        paths: AppDataPaths | None = None,
+        path_guard: PhysicalPathGuard | None = None,
+    ) -> None:
         self.paths = paths or AppDataPaths.from_environment()
         self.path = Path(path) if path is not None else self.paths.settings
+        self.path_guard = path_guard or PhysicalPathGuard()
 
     def load(self) -> ConfigLoadResult:
-        if not self.path.exists():
-            return ConfigLoadResult(config=AppConfig.safe_defaults(self.paths))
         try:
+            if not self.path.exists():
+                # Even a missing settings file must not be interpreted through
+                # a redirected parent directory before safe defaults are used.
+                self.path_guard.verify_root(
+                    self.path.parent,
+                    role="path",
+                    require_directory=True,
+                )
+                return ConfigLoadResult(config=AppConfig.safe_defaults(self.paths))
+            self.path_guard.verify_root(self.path, role="path")
             raw = json.loads(self.path.read_text(encoding="utf-8"))
             migrated, changed = self._migrate(raw)
             config = AppConfig.model_validate(migrated)
@@ -120,6 +135,12 @@ class ConfigStore:
                 config=AppConfig.safe_defaults(self.paths),
                 status="DEGRADED",
                 error="Configuration is invalid; safe defaults are active.",
+            )
+        except PhysicalPathVerificationError:
+            return ConfigLoadResult(
+                config=AppConfig.safe_defaults(self.paths),
+                status="DEGRADED",
+                error="Configuration path is not in the verified Supervisor namespace; safe defaults are active.",
             )
         if changed and not self.paths.root_report.split_brain:
             self.save(config)
@@ -146,18 +167,23 @@ class ConfigStore:
         return changed
 
     def save(self, config: AppConfig) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path_guard.ensure_directory(self.path.parent, role="path")
+        self.path_guard.before_write(self.path, role="path")
         payload = json.dumps(config.model_dump(mode="json"), indent=2, sort_keys=True) + "\n"
-        fd, temporary = tempfile.mkstemp(prefix="settings-", suffix=".tmp", dir=self.path.parent)
+        fd, temporary = self.path_guard.create_temp_file(
+            self.path.parent,
+            prefix="settings-",
+            suffix=".tmp",
+            role="path",
+        )
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, self.path)
+            self.path_guard.replace(temporary, self.path, role="path")
         finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+            self.path_guard.remove(temporary, role="path")
 
     @staticmethod
     def _migrate(raw: Any) -> tuple[dict[str, Any], bool]:

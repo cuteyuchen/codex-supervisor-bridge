@@ -4,7 +4,6 @@ import json
 import os
 import re
 import secrets
-import tempfile
 from pathlib import Path
 from typing import Any, Literal
 
@@ -12,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from .auth import FirstAuthorizationFlow
 from .paths import AppDataPaths
+from .physical import PhysicalPathGuard
 from .process import ManagedProcessSpec
 from .secrets import SecretStore
 
@@ -88,11 +88,13 @@ class DevSpaceBootstrap:
         config: DevSpaceBootstrapConfig,
         executable: str = "devspace",
         entrypoint: str | None = None,
+        path_guard: PhysicalPathGuard | None = None,
     ) -> None:
         self.paths = paths
         self.config = config
         self.executable = executable
         self.entrypoint = entrypoint
+        self.path_guard = path_guard or PhysicalPathGuard()
 
     @classmethod
     def from_app_data(
@@ -103,6 +105,7 @@ class DevSpaceBootstrap:
         project_directory: Path | None = None,
         executable: str = "devspace",
         entrypoint: str | None = None,
+        path_guard: PhysicalPathGuard | None = None,
     ) -> "DevSpaceBootstrap":
         roots = [project_directory.resolve()] if project_directory else []
         return cls(
@@ -110,11 +113,12 @@ class DevSpaceBootstrap:
             config=DevSpaceBootstrapConfig(
                 port=port,
                 allowed_roots=roots,
-                worktree_root=paths.cache / "devspace" / "worktrees",
-                state_dir=paths.data / "devspace",
-            ),
-            executable=executable,
-            entrypoint=entrypoint,
+            worktree_root=paths.cache / "devspace" / "worktrees",
+            state_dir=paths.data / "devspace",
+        ),
+        executable=executable,
+        entrypoint=entrypoint,
+        path_guard=path_guard,
         )
 
     @property
@@ -136,38 +140,48 @@ class DevSpaceBootstrap:
             secret_store.set(self.config.owner_secret_ref, owner_token)
         if len(owner_token) < 16:
             raise ValueError("DevSpace owner credential is too short")
-        self.config_directory.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(prefix="devspace-auth-", suffix=".tmp", dir=self.config_directory)
+        self.path_guard.ensure_directory(self.config_directory, role="path")
+        fd, temporary = self.path_guard.create_temp_file(
+            self.config_directory,
+            prefix="devspace-auth-",
+            suffix=".tmp",
+            role="path",
+        )
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
                 json.dump({"ownerToken": owner_token}, handle)
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, self.auth_path)
+            self.path_guard.replace(temporary, self.auth_path, role="path")
         finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+            self.path_guard.remove(temporary, role="path")
         return self.auth_path
 
     def write_config(self) -> Path:
-        self.config_directory.mkdir(parents=True, exist_ok=True)
+        self.path_guard.ensure_directory(self.config_directory, role="path")
         # DevSpace 1.0.x ignores this file when config.json exists. Keep the
         # managed directory single-source if an earlier P6.6 prototype left one.
-        (self.config_directory / "config.jsonc").unlink(missing_ok=True)
-        self.config.worktree_root.mkdir(parents=True, exist_ok=True)
-        self.config.state_dir.mkdir(parents=True, exist_ok=True)
+        stale_config = self.config_directory / "config.jsonc"
+        if stale_config.exists():
+            self.path_guard.remove(stale_config, role="path")
+        self.path_guard.ensure_directory(self.config.worktree_root, role="path")
+        self.path_guard.ensure_directory(self.config.state_dir, role="path")
         payload = json.dumps(self.config.document(), indent=2, sort_keys=True) + "\n"
-        fd, temporary = tempfile.mkstemp(prefix="devspace-", suffix=".tmp", dir=self.config_directory)
+        fd, temporary = self.path_guard.create_temp_file(
+            self.config_directory,
+            prefix="devspace-",
+            suffix=".tmp",
+            role="path",
+        )
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, self.config_path)
+            self.path_guard.replace(temporary, self.config_path, role="path")
         finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+            self.path_guard.remove(temporary, role="path")
         return self.config_path
 
     def process_spec(self, *, startup_timeout: float = 15.0, shutdown_timeout: float = 10.0) -> ManagedProcessSpec:

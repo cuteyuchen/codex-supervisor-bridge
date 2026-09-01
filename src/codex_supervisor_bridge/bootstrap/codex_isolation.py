@@ -19,12 +19,14 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
 
+from .codex_runtime import CodexExecutableResolver
 from .lcb_hardening import LCB_HARDENING_REVISION, LCB_RUNTIME_CONTRACT
+from .physical import PhysicalPathGuard, PhysicalPathVerificationError
 from .process import CodexProcessOwnership
 
 logger = logging.getLogger(__name__)
 
-RUNTIME_METADATA_VERSION = 1
+RUNTIME_METADATA_VERSION = 2
 INSTANCE_PREFIX = "csb-codex-"
 SUPERVISOR_RUNTIME_ENV = "CODEX_SUPERVISOR_RUNTIME_INSTANCE_ID"
 SUPERVISOR_EPOCH_ENV = "CODEX_SUPERVISOR_RUNTIME_EPOCH"
@@ -32,6 +34,7 @@ SUPERVISOR_TOKEN_ENV = "CODEX_SUPERVISOR_OWNERSHIP_TOKEN"
 SUPERVISOR_METADATA_ENV = "CODEX_SUPERVISOR_RUNTIME_METADATA"
 SUPERVISOR_PARENT_ENV = "CODEX_SUPERVISOR_PARENT_PID"
 SUPERVISOR_CONTRACT_ENV = "CODEX_SUPERVISOR_RUNTIME_CONTRACT"
+SUPERVISOR_HOST_INSTANCE_ENV = "CODEX_SUPERVISOR_HOST_INSTANCE_ID"
 SUPERVISOR_RUNTIME_CONTRACT = LCB_RUNTIME_CONTRACT
 
 
@@ -69,9 +72,12 @@ class CodexRuntimeMetadata(BaseModel):
     status: str = "CREATED"
     runtime_directory: str
     codex_home: str
+    codex_executable: str | None = None
     endpoint_category: str = "stdio"
     started_at: str
     supervisor_parent_pid: int
+    supervisor_host_instance_id: str | None = None
+    supervisor_parent_process: ProcessObservation | None = None
     proxy_process: ProcessObservation | None = None
     lcb_process: ProcessObservation | None = None
     app_server_process: ProcessObservation | None = None
@@ -105,6 +111,11 @@ class CodexRuntimeMetadata(BaseModel):
             ),
             "runtime_directory": self.runtime_directory,
             "codex_home": self.codex_home,
+            "codex_executable": self.codex_executable,
+            "supervisor_host_instance_id": self.supervisor_host_instance_id,
+            "supervisor_parent_process": self.supervisor_parent_process.model_dump(mode="json")
+            if self.supervisor_parent_process
+            else None,
             "runtime_contract": self.lcb_runtime_contract,
             "hardening_revision": self.lcb_hardening_revision,
             "proxy_process": self.proxy_process.model_dump(mode="json")
@@ -277,6 +288,9 @@ class SupervisorCodexRuntimeManager:
         uuid_factory: Callable[[], uuid.UUID] = uuid.uuid4,
         clock: Callable[[], datetime] | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        path_guard: PhysicalPathGuard | None = None,
+        executable_resolver: CodexExecutableResolver | None = None,
+        host: object | None = None,
     ) -> None:
         self.app_data_root = Path(app_data_root)
         self.runtime_root = self.app_data_root / "runtime" / "codex"
@@ -284,6 +298,11 @@ class SupervisorCodexRuntimeManager:
         self._uuid_factory = uuid_factory
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._sleep = sleep
+        self.path_guard = path_guard or PhysicalPathGuard()
+        self.executable_resolver = executable_resolver
+        # Production composition supplies the StandaloneSupervisorHost. The
+        # host proof is deliberately optional for portable fake-runtime tests.
+        self._host = host
         self._token: str | None = None
         self.metadata: CodexRuntimeMetadata | None = None
 
@@ -321,14 +340,38 @@ class SupervisorCodexRuntimeManager:
                 )
             return self.metadata
         environment = dict(os.environ if base_environment is None else base_environment)
-        self.runtime_root.mkdir(parents=True, exist_ok=True)
+        self.path_guard.verify_root(self.app_data_root, role="app_data")
+        host_instance_id = self._verify_standalone_host()
+        resolver = self.executable_resolver or CodexExecutableResolver(
+            environ=environment,
+            path_guard=self.path_guard,
+        )
+        executable_candidate = resolver.resolve()
+        if not executable_candidate.exists or not executable_candidate.path:
+            detail = executable_candidate.technical_detail or (
+                "Codex executable could not be resolved from configured, "
+                "Desktop bundled, or PATH candidates"
+            )
+            raise LcbRuntimeIsolationUnsupportedError(
+                "LCB_RUNTIME_ISOLATION_UNSUPPORTED: " + detail
+            )
+        codex_executable = executable_candidate.path
+        self.path_guard.verify_root(Path(codex_executable), role="process")
+        supervisor_parent_process = self._inspector.identity(os.getpid())
+        supervisor_host_instance_id = (
+            host_instance_id
+            or environment.get(SUPERVISOR_HOST_INSTANCE_ENV, "").strip()
+            or None
+        )
+        self.path_guard.ensure_directory(self.runtime_root, role="runtime")
         epoch = self._next_epoch()
         instance_id = f"{INSTANCE_PREFIX}{self._uuid_factory()}"
         runtime_directory = self.runtime_root / instance_id
         codex_home = runtime_directory / "home"
-        runtime_directory.mkdir(parents=True, exist_ok=False)
-        codex_home.mkdir(parents=True, exist_ok=False)
-        (runtime_directory / "lcb-checkpoints").mkdir()
+        self.path_guard.ensure_directory(runtime_directory, role="runtime")
+        self.path_guard.ensure_directory(codex_home, role="codex_home")
+        checkpoints = runtime_directory / "lcb-checkpoints"
+        self.path_guard.ensure_directory(checkpoints, role="runtime")
         self._token = uuid.uuid4().hex
         metadata = CodexRuntimeMetadata(
             instance_id=instance_id,
@@ -339,8 +382,15 @@ class SupervisorCodexRuntimeManager:
             ownership_token_hash=_fingerprint(self._token),
             runtime_directory=str(runtime_directory),
             codex_home=str(codex_home),
+            codex_executable=codex_executable,
             started_at=self._clock().isoformat(),
-            supervisor_parent_pid=os.getpid(),
+            supervisor_parent_pid=(
+                supervisor_parent_process.pid
+                if supervisor_parent_process is not None
+                else os.getpid()
+            ),
+            supervisor_host_instance_id=supervisor_host_instance_id,
+            supervisor_parent_process=supervisor_parent_process,
         )
         self.metadata = metadata
         source_home = _source_codex_home(environment)
@@ -393,6 +443,8 @@ class SupervisorCodexRuntimeManager:
             raise CodexRuntimeIsolationError("runtime ownership token is unavailable")
         environment = dict(os.environ if base_environment is None else base_environment)
         environment["CODEX_HOME"] = metadata.codex_home
+        if metadata.codex_executable:
+            environment["CODEX_EXE"] = metadata.codex_executable
         environment["LOCAL_CODEX_BRIDGE_CHECKPOINT_DIR"] = str(
             Path(metadata.runtime_directory) / "lcb-checkpoints"
         )
@@ -401,6 +453,8 @@ class SupervisorCodexRuntimeManager:
         environment[SUPERVISOR_TOKEN_ENV] = self._token
         environment[SUPERVISOR_METADATA_ENV] = str(self.metadata_path)
         environment[SUPERVISOR_PARENT_ENV] = str(os.getpid())
+        if metadata.supervisor_host_instance_id:
+            environment[SUPERVISOR_HOST_INSTANCE_ENV] = metadata.supervisor_host_instance_id
         environment[SUPERVISOR_CONTRACT_ENV] = SUPERVISOR_RUNTIME_CONTRACT
         return environment
 
@@ -424,9 +478,35 @@ class SupervisorCodexRuntimeManager:
     def refresh(self) -> CodexRuntimeMetadata:
         if self.metadata is None:
             raise CodexRuntimeIsolationError("Supervisor Codex runtime is not prepared")
+        metadata_path = self.metadata_path
         try:
-            payload = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+            self.path_guard.verify_root(
+                self.runtime_root,
+                role="runtime",
+                require_directory=True,
+            )
+            runtime_directory = Path(self.metadata.runtime_directory)
+            if runtime_directory.parent != self.runtime_root:
+                return self._fail(
+                    "CODEX_RUNTIME_OWNERSHIP_UNKNOWN",
+                    "runtime metadata namespace is outside the canonical runtime root",
+                    persist=False,
+                )
+            self.path_guard.verify_subpath(
+                runtime_directory,
+                self.runtime_root,
+                role="runtime",
+                require_directory=True,
+            )
+            self.path_guard.verify_root(metadata_path, role="runtime")
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
             observed = CodexRuntimeMetadata.model_validate(payload)
+        except PhysicalPathVerificationError as exc:
+            return self._fail(
+                "CODEX_RUNTIME_OWNERSHIP_UNKNOWN",
+                f"runtime metadata physical path verification failed: {exc.code}",
+                persist=False,
+            )
         except (OSError, ValueError, TypeError) as exc:
             return self._fail("CODEX_RUNTIME_OWNERSHIP_UNKNOWN", type(exc).__name__)
         if (
@@ -437,9 +517,13 @@ class SupervisorCodexRuntimeManager:
             or observed.ownership_token_hash != self.metadata.ownership_token_hash
             or observed.runtime_directory != self.metadata.runtime_directory
             or observed.codex_home != self.metadata.codex_home
+            or observed.codex_executable != self.metadata.codex_executable
             or observed.endpoint_category != self.metadata.endpoint_category
             or observed.started_at != self.metadata.started_at
             or observed.supervisor_parent_pid != self.metadata.supervisor_parent_pid
+            or observed.supervisor_host_instance_id
+            != self.metadata.supervisor_host_instance_id
+            or observed.supervisor_parent_process != self.metadata.supervisor_parent_process
         ):
             return self._fail(
                 "CODEX_RUNTIME_OWNERSHIP_UNKNOWN",
@@ -501,6 +585,7 @@ class SupervisorCodexRuntimeManager:
         )
 
     def assert_destructive_lifecycle_allowed(self) -> None:
+        self.path_guard.verify_root(self.runtime_root, role="runtime", require_directory=True)
         metadata = self.refresh()
         if metadata.ownership != CodexProcessOwnership.SUPERVISOR_MANAGED:
             raise RuntimeOwnershipError(
@@ -515,12 +600,27 @@ class SupervisorCodexRuntimeManager:
                 "CODEX_RUNTIME_OWNERSHIP_UNKNOWN: persisted process chain is not verified"
             )
         processes = {item.pid: item for item in self._inspector.snapshot()}
-        for expected in (metadata.proxy_process, metadata.lcb_process):
+        if self.metadata.supervisor_parent_process is not None:
+            current_parent = processes.get(self.metadata.supervisor_parent_process.pid)
+            if current_parent is None or not _same_observation_identity(
+                self.metadata.supervisor_parent_process,
+                current_parent,
+            ):
+                raise RuntimeOwnershipError(
+                    "CODEX_RUNTIME_OWNERSHIP_UNKNOWN: Supervisor parent identity changed"
+                )
+        for expected in (
+            metadata.proxy_process,
+            metadata.lcb_process,
+            metadata.app_server_process,
+        ):
             if expected is None:
                 continue
             current = processes.get(expected.pid)
             if current is None:
-                continue
+                raise RuntimeOwnershipError(
+                    "CODEX_RUNTIME_OWNERSHIP_UNKNOWN: managed process is not running"
+                )
             if not _same_observation_identity(expected, current):
                 raise RuntimeOwnershipError(
                     "CODEX_RUNTIME_OWNERSHIP_UNKNOWN: process identity changed"
@@ -561,6 +661,13 @@ class SupervisorCodexRuntimeManager:
 
     def _next_epoch(self) -> int:
         path = self.runtime_root / "epoch.json"
+        self.path_guard.verify_root(
+            self.runtime_root,
+            role="runtime",
+            require_directory=True,
+        )
+        if path.exists():
+            self.path_guard.verify_subpath(path, self.runtime_root, role="runtime")
         current = 0
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -568,7 +675,7 @@ class SupervisorCodexRuntimeManager:
         except (OSError, ValueError, TypeError):
             current = 0
         epoch = max(0, current) + 1
-        _atomic_json(path, {"epoch": epoch})
+        _atomic_json(path, {"epoch": epoch}, path_guard=self.path_guard)
         return epoch
 
     def _seed_compatibility_layer(self, source_home: Path, target_home: Path) -> None:
@@ -581,9 +688,16 @@ class SupervisorCodexRuntimeManager:
                     "LCB_RUNTIME_ISOLATION_UNSUPPORTED: safe provider config overlay "
                     f"could not be created ({type(exc).__name__})"
                 ) from exc
-            (target_home / "config.toml").write_text(rendered, encoding="utf-8")
+            target = target_home / "config.toml"
+            _atomic_text(target, rendered, path_guard=self.path_guard, role="codex_home")
 
-    def _fail(self, code: str, detail: str) -> CodexRuntimeMetadata:
+    def _fail(
+        self,
+        code: str,
+        detail: str,
+        *,
+        persist: bool = True,
+    ) -> CodexRuntimeMetadata:
         if self.metadata is None:
             raise CodexRuntimeIsolationError(f"{code}: {detail}")
         ownership = (
@@ -603,11 +717,53 @@ class SupervisorCodexRuntimeManager:
                 "technical_detail": detail,
             }
         )
-        self._write_metadata(self.metadata)
+        if persist:
+            self._write_metadata(self.metadata)
         return self.metadata
 
     def _write_metadata(self, metadata: CodexRuntimeMetadata) -> None:
-        _atomic_json(self.metadata_path, metadata.model_dump(mode="json"))
+        _atomic_json(
+            self.metadata_path,
+            metadata.model_dump(mode="json"),
+            path_guard=self.path_guard,
+        )
+
+    def _verify_standalone_host(self) -> str | None:
+        """Require the real Standalone Host proof for production composition."""
+
+        if self._host is None:
+            return None
+        try:
+            evidence = self._host.assert_ready()  # type: ignore[attr-defined]
+            identity = self._host.ensure_identity(evidence=evidence)  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001 - fail-closed host boundary
+            raise LcbRuntimeIsolationUnsupportedError(
+                "LCB_RUNTIME_ISOLATION_UNSUPPORTED: Standalone Supervisor Host "
+                f"proof failed ({type(exc).__name__})"
+            ) from exc
+        if not getattr(evidence, "physical_root_verified", False):
+            raise LcbRuntimeIsolationUnsupportedError(
+                "LCB_RUNTIME_ISOLATION_UNSUPPORTED: Supervisor Host physical root "
+                "is not verified"
+            )
+        ownership = getattr(getattr(identity, "ownership", None), "value", None)
+        if ownership != "SUPERVISOR_HOST_MANAGED":
+            raise LcbRuntimeIsolationUnsupportedError(
+                "LCB_RUNTIME_ISOLATION_UNSUPPORTED: Supervisor Host ownership is "
+                "not SUPERVISOR_HOST_MANAGED"
+            )
+        if getattr(identity, "pid", None) != os.getpid():
+            raise LcbRuntimeIsolationUnsupportedError(
+                "LCB_RUNTIME_ISOLATION_UNSUPPORTED: Supervisor Host PID does not "
+                "match the runtime owner"
+            )
+        instance_id = getattr(identity, "host_instance_id", None)
+        if not isinstance(instance_id, str) or not instance_id.strip():
+            raise LcbRuntimeIsolationUnsupportedError(
+                "LCB_RUNTIME_ISOLATION_UNSUPPORTED: Supervisor Host instance "
+                "identity is missing"
+            )
+        return instance_id.strip()
 
 
 def _source_codex_home(environment: Mapping[str, str]) -> Path:
@@ -622,12 +778,24 @@ def runtime_verification_failure(metadata: CodexRuntimeMetadata) -> str | None:
     app_server = metadata.app_server_process
     runtime_directory = Path(metadata.runtime_directory)
     codex_home = Path(metadata.codex_home)
+    if metadata.schema_version != RUNTIME_METADATA_VERSION:
+        return "Supervisor runtime metadata schema is unsupported"
     if metadata.lcb_runtime_contract != LCB_RUNTIME_CONTRACT:
         return "LCB runtime contract is unsupported"
     if metadata.lcb_hardening_revision != LCB_HARDENING_REVISION:
         return "LCB lifecycle hardening revision is unsupported"
     if metadata.endpoint_category != "stdio":
         return "Supervisor runtime endpoint is not private stdio"
+    if not metadata.codex_executable:
+        return "Supervisor Codex executable identity is missing"
+    if not metadata.supervisor_host_instance_id:
+        return "Supervisor Host instance identity is missing"
+    if metadata.supervisor_parent_process is None:
+        return "Supervisor parent process identity is missing"
+    if metadata.supervisor_parent_process.pid != metadata.supervisor_parent_pid:
+        return "Supervisor parent PID does not match its process identity"
+    if not _observation_identity_complete(metadata.supervisor_parent_process):
+        return "Supervisor parent process identity is incomplete"
     if metadata.ownership != CodexProcessOwnership.SUPERVISOR_MANAGED:
         return "runtime ownership is not SUPERVISOR_MANAGED"
     if proxy is None or lcb is None or app_server is None:
@@ -643,6 +811,19 @@ def runtime_verification_failure(metadata: CodexRuntimeMetadata) -> str | None:
             return f"{label} process identity is incomplete"
     if proxy.parent_pid != metadata.supervisor_parent_pid:
         return "runtime proxy is not a child of the Supervisor process"
+    if not _same_observation_identity(
+        metadata.supervisor_parent_process,
+        ProcessObservation(
+            pid=proxy.parent_pid,
+            creation_time=proxy.parent_creation_time or "",
+            executable=proxy.parent_executable or "",
+            command_line_fingerprint=metadata.supervisor_parent_process.command_line_fingerprint,
+            parent_pid=metadata.supervisor_parent_process.parent_pid,
+            parent_creation_time=metadata.supervisor_parent_process.parent_creation_time,
+            parent_executable=metadata.supervisor_parent_process.parent_executable,
+        ),
+    ):
+        return "runtime proxy parent identity does not match the Supervisor Host"
     if not _parent_identity_matches(lcb, proxy):
         return "LCB parent identity does not match the Supervisor runtime proxy"
     if not _parent_identity_matches(app_server, lcb):
@@ -867,14 +1048,46 @@ def _fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
+def _atomic_json(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    path_guard: PhysicalPathGuard | None = None,
+) -> None:
+    guard = path_guard or PhysicalPathGuard()
+    _atomic_text(
+        path,
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+        path_guard=guard,
+        role="runtime",
     )
-    os.replace(temporary, path)
+
+
+def _atomic_text(
+    path: Path,
+    content: str,
+    *,
+    path_guard: PhysicalPathGuard,
+    role: str,
+) -> None:
+    """Write a managed text file only through a verified temporary path."""
+
+    path_guard.ensure_directory(path.parent, role=role)
+    path_guard.before_write(path, role=role)
+    descriptor, temporary = path_guard.create_temp_file(
+        path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        role=role,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        path_guard.replace(temporary, path, role=role)
+    finally:
+        path_guard.remove(temporary, role=role)
 
 
 __all__ = [

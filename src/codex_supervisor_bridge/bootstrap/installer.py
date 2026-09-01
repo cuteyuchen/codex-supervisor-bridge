@@ -3,9 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import subprocess
-import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -17,10 +15,12 @@ from pydantic import BaseModel, Field, field_validator
 from .archive import extract_tar_safe, extract_zip_safe
 from .download import HttpsDownloader
 from .lcb_hardening import (
+    LcbHardeningError,
     apply_lcb_runtime_hardening,
     finalize_lcb_runtime_hardening,
-    has_lcb_runtime_hardening,
+    require_lcb_runtime_hardening_from_entrypoint,
 )
+from .physical import PhysicalPathGuard, PhysicalPathVerificationError
 
 INSTALL_COMMAND_TIMEOUT_SECONDS = 300.0
 
@@ -94,9 +94,10 @@ class ComponentInstaller:
         runner: Callable[[list[str], Path], int] | None = None,
         max_retries: int = 3,
         trusted_manifests: Mapping[str, ComponentManifest] | None = None,
+        path_guard: PhysicalPathGuard | None = None,
     ) -> None:
         self.components_root = Path(components_root)
-        self.components_root.mkdir(parents=True, exist_ok=True)
+        self.path_guard = path_guard or PhysicalPathGuard()
         self._downloader = downloader or self._default_downloader
         self._runner = runner or self._default_runner
         self.max_retries = max_retries
@@ -104,9 +105,11 @@ class ComponentInstaller:
 
     def plan(self, manifest: ComponentManifest) -> InstallPlan:
         self._assert_trusted(manifest)
+        self.path_guard.ensure_directory(self.components_root, role="components")
         component_root = self.components_root / manifest.name
         staging_root = component_root / ".staging"
-        staging_root.mkdir(parents=True, exist_ok=True)
+        self.path_guard.ensure_directory(component_root, role="components")
+        self.path_guard.ensure_directory(staging_root, role="components")
         self._assert_within_root(component_root)
         self._assert_within_root(staging_root)
         return InstallPlan(
@@ -122,7 +125,7 @@ class ComponentInstaller:
         plan = self.plan(manifest)
         component_root = self.components_root / manifest.name
         self._assert_within_root(component_root)
-        component_root.mkdir(parents=True, exist_ok=True)
+        self.path_guard.ensure_directory(component_root, role="components")
         previous = self._current_version(component_root)
         if previous is not None and previous["path"] == plan.target_dir:
             if self._validate_install_marker(plan.target_dir, manifest):
@@ -132,27 +135,37 @@ class ComponentInstaller:
                     status="ALREADY_INSTALLED",
                     retry_count=0,
                 )
-        shutil.rmtree(plan.staging_dir, ignore_errors=True)
-        plan.staging_dir.mkdir(parents=True, exist_ok=True)
+        self._safe_rmtree(plan.staging_dir)
+        self.path_guard.ensure_directory(plan.staging_dir, role="components")
         last_error: str | None = None
         attempts = 0
         for attempt in range(plan.max_retries):
             attempts = attempt + 1
             staging = plan.staging_dir / f"{uuid.uuid4().hex}"
-            staging.mkdir(parents=True)
+            self.path_guard.ensure_directory(staging, role="components")
             self._assert_within_root(staging)
             try:
                 archive_path = self._download(manifest, staging)
                 extract_root = staging / "extract"
-                extract_root.mkdir(parents=True)
+                self.path_guard.ensure_directory(extract_root, role="components")
                 self._extract(manifest, archive_path, extract_root)
                 source_root = self._archive_root(manifest, extract_root)
                 if manifest.source_patch == "supervisor-runtime-v1":
-                    apply_lcb_runtime_hardening(source_root)
+                    apply_lcb_runtime_hardening(source_root, path_guard=self.path_guard)
                 node_executable, npm_script = self._managed_toolchain()
                 for command in manifest.install_commands:
+                    expanded_command = self._expand_command(
+                        command,
+                        node_executable,
+                        npm_script,
+                    )
+                    self.path_guard.before_spawn(
+                        expanded_command,
+                        cwd=source_root,
+                        role="components",
+                    )
                     exit_code = self._runner(
-                        self._expand_command(command, node_executable, npm_script),
+                        expanded_command,
                         source_root,
                     )
                     if exit_code != 0:
@@ -160,11 +173,11 @@ class ComponentInstaller:
                             f"install command failed with exit code {exit_code}"
                         )
                 if manifest.source_patch == "supervisor-runtime-v1":
-                    finalize_lcb_runtime_hardening(source_root)
+                    finalize_lcb_runtime_hardening(source_root, path_guard=self.path_guard)
                 self._write_install_marker(source_root, manifest)
                 promoted = self._promote(source_root, plan.target_dir)
                 self._write_current(component_root, manifest, plan.target_dir)
-                shutil.rmtree(plan.staging_dir, ignore_errors=True)
+                self._safe_rmtree(plan.staging_dir)
                 return InstallResult(
                     component=manifest,
                     installed_path=promoted,
@@ -173,7 +186,7 @@ class ComponentInstaller:
                 )
             except Exception as exc:  # noqa: BLE001 - bounded retry/rollback
                 last_error = f"{type(exc).__name__}: {exc}"
-                shutil.rmtree(staging, ignore_errors=True)
+                self._safe_rmtree(staging)
                 if attempt + 1 < plan.max_retries:
                     continue
                 if previous is not None:
@@ -208,9 +221,8 @@ class ComponentInstaller:
         if digest.lower() != expected.strip().lower():
             raise RuntimeError(f"checksum mismatch for {name}")
 
-    @staticmethod
-    def _default_downloader(url: str, destination: Path) -> Path:
-        return HttpsDownloader().download(url, destination)
+    def _default_downloader(self, url: str, destination: Path) -> Path:
+        return HttpsDownloader(path_guard=self.path_guard).download(url, destination)
 
     @staticmethod
     def _default_runner(command: list[str], cwd: Path) -> int:
@@ -232,19 +244,32 @@ class ComponentInstaller:
 
     def _current_version(self, component_root: Path) -> dict[str, object] | None:
         pointer = component_root / "current.json"
-        if not pointer.exists():
-            return None
         try:
+            self.path_guard.verify_subpath(pointer, component_root, role="components")
             raw = json.loads(pointer.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, PhysicalPathVerificationError):
             return None
         path = raw.get("path")
-        if not isinstance(path, str) or not Path(path).is_dir():
+        if not isinstance(path, str):
+            return None
+        try:
+            resolved_path = Path(path)
+            self.path_guard.verify_subpath(
+                resolved_path,
+                self.components_root,
+                role="components",
+                require_directory=True,
+            )
+        except PhysicalPathVerificationError:
             return None
         manifest = raw.get("manifest")
         if not isinstance(manifest, dict):
             return None
-        return {"path": Path(path), "manifest": ComponentManifest.model_validate(manifest)}
+        try:
+            parsed_manifest = ComponentManifest.model_validate(manifest)
+        except (TypeError, ValueError):
+            return None
+        return {"path": resolved_path, "manifest": parsed_manifest}
 
     def _download(
         self,
@@ -252,27 +277,36 @@ class ComponentInstaller:
         staging: Path,
     ) -> Path:
         target = staging / "download"
+        self.path_guard.before_write(target, role="components")
         payload = self._downloader(manifest.source, target)
         if isinstance(payload, bytes):
             if manifest.checksum_sha256:
                 self._verify_checksum(payload, manifest.checksum_sha256, manifest.name)
-            target.write_bytes(payload)
+            self.path_guard.write_bytes(target, payload, role="components")
         else:
+            self.path_guard.verify_root(payload, role="components")
             if manifest.checksum_sha256:
                 digest = hashlib.sha256(payload.read_bytes()).hexdigest()
                 if digest.lower() != manifest.checksum_sha256.lower():
                     raise RuntimeError(f"checksum mismatch for {manifest.name}")
         if manifest.checksum_source:
             checksum_path = staging / "SHA256SUMS.txt"
+            self.path_guard.before_write(checksum_path, role="components")
             checksum_payload = self._downloader(manifest.checksum_source, checksum_path)
             if isinstance(checksum_payload, bytes):
-                checksum_path.write_bytes(checksum_payload)
+                self.path_guard.write_bytes(
+                    checksum_path,
+                    checksum_payload,
+                    role="components",
+                )
             try:
+                self.path_guard.verify_root(checksum_path, role="components")
                 checksum_text = checksum_path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError) as exc:
                 raise RuntimeError("official checksum manifest could not be read") from exc
             expected_name = manifest.checksum_entry or Path(manifest.source).name
             expected_digest = _checksum_from_manifest(checksum_text, expected_name)
+            self.path_guard.verify_root(target, role="components")
             actual_digest = hashlib.sha256(target.read_bytes()).hexdigest()
             if expected_digest.lower() != actual_digest.lower():
                 raise RuntimeError(f"official checksum mismatch for {manifest.name}")
@@ -289,24 +323,37 @@ class ComponentInstaller:
             suffix = archive_path.suffix.lower()
             kind = "zip" if suffix == ".zip" else "tgz"
         if kind == "zip":
-            extract_zip_safe(archive_path, destination)
+            self.path_guard.ensure_directory(destination, role="components")
+            extract_zip_safe(archive_path, destination, path_guard=self.path_guard)
             return
         if kind == "tgz":
-            extract_tar_safe(archive_path, destination)
+            self.path_guard.ensure_directory(destination, role="components")
+            extract_tar_safe(archive_path, destination, path_guard=self.path_guard)
             return
         raise ValueError(f"unsupported archive kind: {manifest.archive_kind}")
 
-    @staticmethod
-    def _archive_root(manifest: ComponentManifest, extract_root: Path) -> Path:
+    def _archive_root(self, manifest: ComponentManifest, extract_root: Path) -> Path:
         if manifest.archive_root:
             root = extract_root / manifest.archive_root
             if not root.is_dir():
                 raise RuntimeError(
                     f"component {manifest.name} archive root is missing: {root}"
                 )
+            self.path_guard.verify_subpath(
+                root,
+                extract_root,
+                role="components",
+                require_directory=True,
+            )
             return root
         children = [path for path in extract_root.iterdir()]
         if len(children) == 1 and children[0].is_dir():
+            self.path_guard.verify_subpath(
+                children[0],
+                extract_root,
+                role="components",
+                require_directory=True,
+            )
             return children[0]
         if any(path.is_dir() for path in children):
             raise RuntimeError(
@@ -315,18 +362,19 @@ class ComponentInstaller:
         return extract_root
 
     def _promote(self, source: Path, target: Path) -> Path:
-        target.parent.mkdir(parents=True, exist_ok=True)
+        self.path_guard.ensure_directory(target.parent, role="components")
+        self.path_guard.before_write(target, role="components")
         old = target.parent / f".previous-{uuid.uuid4().hex}"
         if target.exists():
-            os.replace(target, old)
+            self.path_guard.replace(target, old, role="components")
         try:
-            os.replace(source, target)
+            self.path_guard.replace(source, target, role="components")
         except OSError:
             if old.exists() and not target.exists():
-                os.replace(old, target)
+                self.path_guard.replace(old, target, role="components")
             raise
         if old.exists():
-            shutil.rmtree(old, ignore_errors=True)
+            self.path_guard.remove(old, role="components", recursive=True)
         return target
 
     def _managed_toolchain(self) -> tuple[str | None, str | None]:
@@ -377,9 +425,10 @@ class ComponentInstaller:
             "source_patch": manifest.source_patch,
             "installed_at": datetime.now(timezone.utc).isoformat(),
         }
-        marker.write_text(
+        self.path_guard.write_text(
+            marker,
             json.dumps(payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+            role="components",
         )
         return marker
 
@@ -390,8 +439,15 @@ class ComponentInstaller:
     ) -> bool:
         marker = root / ".codex-supervisor-installed.json"
         try:
+            self.path_guard.verify_subpath(
+                root,
+                self.components_root,
+                role="components",
+                require_directory=True,
+            )
+            self.path_guard.verify_subpath(marker, root, role="components")
             payload = json.loads(marker.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, ValueError):
+        except (OSError, json.JSONDecodeError, ValueError, PhysicalPathVerificationError):
             return False
         if (
             payload.get("name") != manifest.name
@@ -401,16 +457,36 @@ class ComponentInstaller:
             or payload.get("source_patch") != manifest.source_patch
         ):
             return False
-        if manifest.entrypoint and not (root / manifest.entrypoint).is_file():
-            return False
-        if (
-            manifest.source_patch == "supervisor-runtime-v1"
-            and not has_lcb_runtime_hardening(root)
-        ):
-            return False
+        entrypoint = root / manifest.entrypoint if manifest.entrypoint else None
+        if entrypoint is not None:
+            try:
+                self.path_guard.verify_subpath(
+                    entrypoint,
+                    root,
+                    role="components",
+                )
+            except PhysicalPathVerificationError:
+                return False
+            if not entrypoint.is_file():
+                return False
+        if manifest.source_patch == "supervisor-runtime-v1":
+            if entrypoint is None:
+                return False
+            try:
+                require_lcb_runtime_hardening_from_entrypoint(
+                    entrypoint,
+                    path_guard=self.path_guard,
+                )
+            except (LcbHardeningError, PhysicalPathVerificationError):
+                return False
         if manifest.entrypoint and manifest.version_args:
             executable = root / manifest.entrypoint
             try:
+                self.path_guard.before_spawn(
+                    [str(executable), *manifest.version_args],
+                    cwd=root,
+                    role="components",
+                )
                 result = subprocess.run(
                     [str(executable), *manifest.version_args],
                     cwd=str(root),
@@ -419,7 +495,7 @@ class ComponentInstaller:
                     check=False,
                     timeout=15.0,
                 )
-            except (OSError, subprocess.TimeoutExpired):
+            except (OSError, subprocess.TimeoutExpired, PhysicalPathVerificationError):
                 return False
             if result.returncode != 0:
                 return False
@@ -429,12 +505,13 @@ class ComponentInstaller:
                     return False
         return True
 
-    @staticmethod
     def _write_current(
+        self,
         component_root: Path,
         manifest: ComponentManifest,
         target_dir: Path,
     ) -> Path:
+        self.path_guard.ensure_directory(component_root, role="components")
         pointer = component_root / "current.json"
         payload = {
             "name": manifest.name,
@@ -442,20 +519,20 @@ class ComponentInstaller:
             "path": str(target_dir),
             "manifest": manifest.model_dump(mode="json"),
         }
-        fd, temporary = tempfile.mkstemp(
+        fd, temporary = self.path_guard.create_temp_file(
+            component_root,
             prefix="current-",
             suffix=".tmp",
-            dir=component_root,
+            role="components",
         )
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, pointer)
+            self.path_guard.replace(temporary, pointer, role="components")
         finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+            self.path_guard.remove(temporary, role="components")
         return pointer
 
     def _assert_trusted(self, manifest: ComponentManifest) -> None:
@@ -474,6 +551,11 @@ class ComponentInstaller:
             raise ValueError(
                 f"component path escapes the managed components root: {resolved}"
             )
+
+    def _safe_rmtree(self, path: Path) -> None:
+        if not path.exists():
+            return
+        self.path_guard.remove(path, role="components", recursive=True)
 
 
 def _checksum_from_manifest(payload: str, artifact_name: str) -> str:

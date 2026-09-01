@@ -6,6 +6,8 @@ import platform
 from pathlib import Path
 from typing import Protocol
 
+from .physical import PhysicalPathGuard
+
 
 class SecretStore(Protocol):
     def set(self, name: str, value: str) -> None: ...
@@ -34,24 +36,36 @@ class MemorySecretStore:
 class WindowsDpapiSecretStore:
     """Small DPAPI-backed store; unavailable on non-Windows hosts."""
 
-    def __init__(self, directory: str | Path) -> None:
+    def __init__(
+        self,
+        directory: str | Path,
+        *,
+        path_guard: PhysicalPathGuard | None = None,
+    ) -> None:
         if platform.system() != "Windows":
             raise RuntimeError("Windows DPAPI secret storage is only available on Windows")
         self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=True)
+        self.path_guard = path_guard or PhysicalPathGuard()
 
     def set(self, name: str, value: str) -> None:
+        self.path_guard.ensure_directory(self.directory, role="path")
+        path = _secret_path(self.directory, name)
+        self.path_guard.before_write(path, role="path")
         encrypted = _protect(value.encode("utf-8"))
-        _secret_path(self.directory, name).write_bytes(encrypted)
+        self.path_guard.write_bytes(path, encrypted, role="path")
 
     def get(self, name: str) -> str | None:
         path = _secret_path(self.directory, name)
+        if path.exists():
+            self.path_guard.verify_root(path, role="path")
         if not path.exists():
             return None
         return _unprotect(path.read_bytes()).decode("utf-8")
 
     def delete(self, name: str) -> None:
-        _secret_path(self.directory, name).unlink(missing_ok=True)
+        path = _secret_path(self.directory, name)
+        if path.exists():
+            self.path_guard.remove(path, role="path")
 
 
 def _secret_path(directory: Path, name: str) -> Path:

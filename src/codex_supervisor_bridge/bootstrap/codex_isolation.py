@@ -12,8 +12,10 @@ import time
 import tomllib
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -59,6 +61,23 @@ class ProcessObservation(BaseModel):
     parent_creation_time: str | None = None
     parent_executable: str | None = None
     app_server_stdio: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessSnapshotIndex:
+    """Read-only PID index bound to one captured process snapshot."""
+
+    by_pid: Mapping[int, ProcessObservation]
+
+    @classmethod
+    def from_observations(
+        cls,
+        observations: Sequence[ProcessObservation],
+    ) -> "ProcessSnapshotIndex":
+        return cls(MappingProxyType({item.pid: item for item in observations}))
+
+    def get(self, pid: int) -> ProcessObservation | None:
+        return self.by_pid.get(pid)
 
 
 class CodexRuntimeMetadata(BaseModel):
@@ -1097,6 +1116,7 @@ __all__ = [
     "LcbRuntimeIsolationUnsupportedError",
     "ProcessInspector",
     "ProcessObservation",
+    "ProcessSnapshotIndex",
     "RuntimeOwnershipError",
     "SupervisorCodexRuntimeManager",
     "runtime_process_chain_failure",

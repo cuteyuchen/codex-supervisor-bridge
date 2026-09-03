@@ -8,6 +8,7 @@ import pytest
 
 from codex_supervisor_bridge.bootstrap import (
     LCB_PHYSICAL_ROOT_MISMATCH,
+    SUPERVISOR_HOST_EXECUTION_CONTEXT_UNSAFE,
     SUPERVISOR_HOST_PATH_VIRTUALIZED,
     SUPERVISOR_RUNTIME_ROOT_MISMATCH,
     AppDataPaths,
@@ -65,7 +66,11 @@ def _existing(path: Path, physical: str | None = None, *, directory: bool = True
     )
 
 
-def _host_observation(*, parent_pid: int | None = 1) -> ProcessObservation:
+def _host_observation(
+    *,
+    parent_pid: int | None = 1,
+    parent_executable: str | None = "powershell.exe",
+) -> ProcessObservation:
     return ProcessObservation(
         pid=os.getpid(),
         creation_time="host-created",
@@ -73,7 +78,46 @@ def _host_observation(*, parent_pid: int | None = 1) -> ProcessObservation:
         command_line_fingerprint="host-command",
         parent_pid=parent_pid,
         parent_creation_time="parent-created" if parent_pid is not None else None,
-        parent_executable="powershell.exe" if parent_pid is not None else None,
+        parent_executable=parent_executable if parent_pid is not None else None,
+    )
+
+
+def _process_observation(
+    pid: int,
+    executable: str,
+    *,
+    creation_time: str | None = None,
+    parent_pid: int | None = 1,
+    parent_creation_time: str | None = "root-created",
+    parent_executable: str | None = "services.exe",
+) -> ProcessObservation:
+    return ProcessObservation(
+        pid=pid,
+        creation_time=creation_time or f"created-{pid}",
+        executable=executable,
+        command_line_fingerprint=f"command-{pid}",
+        parent_pid=parent_pid,
+        parent_creation_time=parent_creation_time,
+        parent_executable=parent_executable,
+    )
+
+
+def _host_for_process_snapshot(
+    tmp_path: Path,
+    *observations: ProcessObservation,
+    process_inspector=None,
+) -> StandaloneSupervisorHost:
+    root = tmp_path / "CodexSupervisorBridge"
+    (root / "components" / "local-codex-bridge" / "2.1.3").mkdir(parents=True)
+    (root / "runtime").mkdir()
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(root)},
+        system="Windows",
+    )
+    return StandaloneSupervisorHost(
+        paths=paths,
+        physical_guard=PhysicalPathGuard(WindowsPhysicalPathInspector(windows=False)),
+        process_inspector=process_inspector or _ProcessMapInspector(*observations),
     )
 
 
@@ -311,7 +355,7 @@ def test_standalone_host_rejects_desktop_ancestry(tmp_path: Path) -> None:
         environ={"CODEX_SUPERVISOR_DATA_DIR": str(root)},
         system="Windows",
     )
-    process = _host_observation(parent_pid=200)
+    process = _host_observation(parent_pid=200, parent_executable="ChatGPT.exe")
     desktop_parent = ProcessObservation(
         pid=200,
         creation_time="parent-created",
@@ -413,10 +457,16 @@ def test_standalone_host_classifies_windowsapps_codex_ancestry_as_desktop(tmp_pa
         environ={"CODEX_SUPERVISOR_DATA_DIR": str(root)},
         system="Windows",
     )
-    process = _host_observation(parent_pid=201)
+    process = _host_observation(
+        parent_pid=201,
+        parent_executable=(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_2.2.1.0_x64__2p2nqsd0c76g0"
+            r"\OpenAI.Codex.exe"
+        ),
+    )
     desktop_parent = ProcessObservation(
         pid=201,
-        creation_time="desktop-parent",
+        creation_time="parent-created",
         executable=(
             r"C:\Program Files\WindowsApps\OpenAI.Codex_2.2.1.0_x64__2p2nqsd0c76g0"
             r"\OpenAI.Codex.exe"
@@ -433,6 +483,228 @@ def test_standalone_host_classifies_windowsapps_codex_ancestry_as_desktop(tmp_pa
     assert evidence.physical_root_verified is False
     assert evidence.identity is not None
     assert evidence.identity.ownership == SupervisorHostOwnership.DESKTOP_EXTERNAL
+
+
+def test_standalone_host_classifies_external_pwsh_venv_launcher_from_one_snapshot(
+    tmp_path: Path,
+) -> None:
+    current = _process_observation(
+        os.getpid(),
+        r"C:\Users\Windows\AppData\Local\Programs\Python\Python312\python.exe",
+        creation_time="host-created",
+        parent_pid=200,
+        parent_creation_time="venv-created",
+        parent_executable=r"E:\project\codex-supervisor-bridge\.venv-p66-312\Scripts\python.exe",
+    )
+    venv_launcher = _process_observation(
+        200,
+        r"E:\project\codex-supervisor-bridge\.venv-p66-312\Scripts\python.exe",
+        creation_time="venv-created",
+        parent_pid=201,
+        parent_creation_time="pwsh-created",
+        parent_executable="pwsh.exe",
+    )
+    pwsh = _process_observation(201, "pwsh.exe", creation_time="pwsh-created")
+
+    evidence = _host_for_process_snapshot(tmp_path, current, venv_launcher, pwsh).preflight()
+
+    assert evidence.physical_root_verified is True
+    assert evidence.identity is not None
+    assert evidence.identity.ownership == SupervisorHostOwnership.SUPERVISOR_HOST_MANAGED
+
+
+def test_standalone_host_classifies_desktop_ancestry_from_same_snapshot(tmp_path: Path) -> None:
+    current = _process_observation(
+        os.getpid(),
+        "python.exe",
+        creation_time="host-created",
+        parent_pid=210,
+        parent_creation_time="venv-created",
+        parent_executable="python-venv.exe",
+    )
+    venv = _process_observation(
+        210,
+        "python-venv.exe",
+        creation_time="venv-created",
+        parent_pid=211,
+        parent_creation_time="chatgpt-created",
+        parent_executable="ChatGPT.exe",
+    )
+    chatgpt = _process_observation(211, "ChatGPT.exe", creation_time="chatgpt-created")
+
+    evidence = _host_for_process_snapshot(tmp_path, current, venv, chatgpt).preflight()
+
+    assert evidence.physical_root_verified is False
+    assert evidence.failure_code == SUPERVISOR_HOST_EXECUTION_CONTEXT_UNSAFE
+    assert evidence.identity is not None
+    assert evidence.identity.ownership == SupervisorHostOwnership.DESKTOP_EXTERNAL
+
+
+def test_standalone_host_classifies_missing_ancestor_as_unknown(tmp_path: Path) -> None:
+    current = _process_observation(
+        os.getpid(),
+        "python.exe",
+        creation_time="host-created",
+        parent_pid=220,
+        parent_creation_time="missing-created",
+        parent_executable="python-venv.exe",
+    )
+
+    evidence = _host_for_process_snapshot(tmp_path, current).preflight()
+
+    assert evidence.physical_root_verified is False
+    assert evidence.failure_code == SUPERVISOR_HOST_EXECUTION_CONTEXT_UNSAFE
+    assert evidence.identity is not None
+    assert evidence.identity.ownership == SupervisorHostOwnership.UNKNOWN
+
+
+def test_standalone_host_uses_one_snapshot_for_ancestry_verdict(tmp_path: Path) -> None:
+    current = _process_observation(
+        os.getpid(),
+        "python.exe",
+        creation_time="host-created",
+        parent_pid=230,
+        parent_creation_time="venv-created",
+        parent_executable="python-venv.exe",
+    )
+    venv = _process_observation(
+        230,
+        "python-venv.exe",
+        creation_time="venv-created",
+        parent_pid=231,
+        parent_creation_time="pwsh-created",
+        parent_executable="pwsh.exe",
+    )
+    pwsh = _process_observation(231, "pwsh.exe", creation_time="pwsh-created")
+
+    class _FlappingInspector:
+        def __init__(self) -> None:
+            self.snapshot_call_count = 0
+
+        def snapshot(self) -> list[ProcessObservation]:
+            self.snapshot_call_count += 1
+            if self.snapshot_call_count == 1:
+                return [current, venv, pwsh]
+            return [current, venv]
+
+        def identity(self, _pid: int) -> ProcessObservation:
+            raise AssertionError("Host verdict must not perform a second live identity read")
+
+    inspector = _FlappingInspector()
+    evidence = _host_for_process_snapshot(
+        tmp_path,
+        process_inspector=inspector,
+    ).preflight()
+
+    assert inspector.snapshot_call_count == 1
+    assert evidence.physical_root_verified is True
+    assert evidence.identity is not None
+    assert evidence.identity.ownership == SupervisorHostOwnership.SUPERVISOR_HOST_MANAGED
+
+
+def test_standalone_host_rejects_parent_creation_time_reuse(tmp_path: Path) -> None:
+    current = _process_observation(
+        os.getpid(),
+        "python.exe",
+        creation_time="host-created",
+        parent_pid=240,
+        parent_creation_time="original-created",
+        parent_executable="python-venv.exe",
+    )
+    reused_parent = _process_observation(
+        240,
+        "python-venv.exe",
+        creation_time="reused-created",
+    )
+
+    evidence = _host_for_process_snapshot(tmp_path, current, reused_parent).preflight()
+
+    assert evidence.physical_root_verified is False
+    assert evidence.failure_code == SUPERVISOR_HOST_EXECUTION_CONTEXT_UNSAFE
+    assert evidence.identity is not None
+    assert evidence.identity.ownership == SupervisorHostOwnership.UNKNOWN
+
+
+def test_standalone_host_detects_deep_desktop_ancestry(tmp_path: Path) -> None:
+    current = _process_observation(
+        os.getpid(),
+        "python.exe",
+        creation_time="host-created",
+        parent_pid=250,
+        parent_creation_time="venv-created",
+        parent_executable="python-venv.exe",
+    )
+    venv = _process_observation(
+        250,
+        "python-venv.exe",
+        creation_time="venv-created",
+        parent_pid=251,
+        parent_creation_time="pwsh-created",
+        parent_executable="pwsh.exe",
+    )
+    pwsh = _process_observation(
+        251,
+        "pwsh.exe",
+        creation_time="pwsh-created",
+        parent_pid=252,
+        parent_creation_time="chatgpt-created",
+        parent_executable="ChatGPT.exe",
+    )
+    chatgpt = _process_observation(252, "ChatGPT.exe", creation_time="chatgpt-created")
+
+    evidence = _host_for_process_snapshot(tmp_path, current, venv, pwsh, chatgpt).preflight()
+
+    assert evidence.physical_root_verified is False
+    assert evidence.identity is not None
+    assert evidence.identity.ownership == SupervisorHostOwnership.DESKTOP_EXTERNAL
+
+
+def test_standalone_host_does_not_use_package_identity_to_override_desktop_ancestry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "codex_supervisor_bridge.bootstrap.host.current_package_identity",
+        lambda: "NO_PACKAGE_IDENTITY",
+    )
+    current = _process_observation(
+        os.getpid(),
+        "python.exe",
+        creation_time="host-created",
+        parent_pid=260,
+        parent_creation_time="chatgpt-created",
+        parent_executable="ChatGPT.exe",
+    )
+    chatgpt = _process_observation(260, "ChatGPT.exe", creation_time="chatgpt-created")
+
+    evidence = _host_for_process_snapshot(tmp_path, current, chatgpt).preflight()
+
+    assert evidence.identity is not None
+    assert evidence.identity.package_identity == "NO_PACKAGE_IDENTITY"
+    assert evidence.identity.ownership == SupervisorHostOwnership.DESKTOP_EXTERNAL
+    assert evidence.failure_code == SUPERVISOR_HOST_EXECUTION_CONTEXT_UNSAFE
+
+
+def test_standalone_host_keeps_path_safe_but_ancestry_unknown_fail_closed(tmp_path: Path) -> None:
+    current = _process_observation(
+        os.getpid(),
+        "python.exe",
+        creation_time="host-created",
+        parent_pid=270,
+        parent_creation_time="missing-created",
+        parent_executable="python-venv.exe",
+    )
+
+    evidence = _host_for_process_snapshot(tmp_path, current).preflight()
+
+    assert evidence.app_data.verified is True
+    assert evidence.components.verified is True
+    assert evidence.runtime.verified is True
+    assert evidence.lcb.verified is True
+    assert evidence.physical_root_verified is False
+    assert evidence.failure_code == SUPERVISOR_HOST_EXECUTION_CONTEXT_UNSAFE
+    assert evidence.identity is not None
+    assert evidence.identity.ownership == SupervisorHostOwnership.UNKNOWN
 
 
 def _write_persisted_host_authority(

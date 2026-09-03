@@ -14,6 +14,7 @@ from .codex_isolation import (
     SUPERVISOR_HOST_INSTANCE_ENV,
     ProcessInspector,
     ProcessObservation,
+    ProcessSnapshotIndex,
 )
 from .paths import AppDataPaths
 from .physical import (
@@ -187,8 +188,12 @@ class SupervisorHostEnvironmentGuard:
                 )
             )
 
-        observation = self.process_inspector.identity(os.getpid())
-        identity = self._identity(observation=observation)
+        process_snapshot = self._capture_process_snapshot()
+        observation = process_snapshot.get(os.getpid())
+        identity = self._identity(
+            observation=observation,
+            process_snapshot=process_snapshot,
+        )
         if identity is None:
             failures.append(
                 PhysicalPathVerificationError(
@@ -240,6 +245,7 @@ class SupervisorHostEnvironmentGuard:
                         authority_error = self._validate_inherited_authority(
                             persisted,
                             observation,
+                            process_snapshot=process_snapshot,
                         )
                         if authority_error is not None:
                             failures.append(authority_error)
@@ -247,15 +253,24 @@ class SupervisorHostEnvironmentGuard:
                             identity = self._identity(
                                 observation=observation,
                                 host_instance_id=str(persisted["host_instance_id"]),
+                                process_snapshot=process_snapshot,
                             )
                 else:
-                    identity = self._identity(persisted, observation=observation)
+                    identity = self._identity(
+                        persisted,
+                        observation=observation,
+                        process_snapshot=process_snapshot,
+                    )
         if (
             persisted is not None
             and identity is not None
             and not self._inherited_authority_requested()
         ):
-            persisted_observation = self.process_inspector.identity(persisted["pid"])
+            persisted_observation = (
+                process_snapshot.get(persisted["pid"])
+                if isinstance(persisted.get("pid"), int)
+                else None
+            )
             if persisted_observation is not None and not _matches_persisted_identity(
                 persisted,
                 persisted_observation,
@@ -364,11 +379,16 @@ class SupervisorHostEnvironmentGuard:
         *,
         observation: ProcessObservation | None = None,
         host_instance_id: str | None = None,
+        process_snapshot: ProcessSnapshotIndex | None = None,
     ) -> SupervisorHostIdentity | None:
-        observation = observation or self.process_inspector.identity(os.getpid())
+        process_snapshot = process_snapshot or self._capture_process_snapshot()
+        observation = observation if observation is not None else process_snapshot.get(os.getpid())
         if observation is None:
             return None
-        ownership = self._classify_ownership(observation)
+        ownership = self._classify_ownership(
+            observation,
+            process_snapshot=process_snapshot,
+        )
         if host_instance_id is None:
             host_instance_id = (
                 str(persisted["host_instance_id"])
@@ -426,7 +446,10 @@ class SupervisorHostEnvironmentGuard:
         self,
         persisted: Mapping[str, object],
         observation: ProcessObservation,
+        *,
+        process_snapshot: ProcessSnapshotIndex | None = None,
     ) -> PhysicalPathVerificationError | None:
+        process_snapshot = process_snapshot or self._capture_process_snapshot()
         expected_instance = self.environ.get(SUPERVISOR_HOST_INSTANCE_ENV, "").strip()
         persisted_instance = persisted.get("host_instance_id")
         if not expected_instance or persisted_instance != expected_instance:
@@ -462,7 +485,7 @@ class SupervisorHostEnvironmentGuard:
                 SUPERVISOR_HOST_IDENTITY_UNKNOWN,
                 "current process does not match the persisted Host authority",
             )
-        authority = self.process_inspector.identity(authority_pid)
+        authority = process_snapshot.get(authority_pid)
         if authority is None or not _matches_persisted_identity(persisted, authority):
             return PhysicalPathVerificationError(
                 SUPERVISOR_HOST_IDENTITY_UNKNOWN,
@@ -479,15 +502,23 @@ class SupervisorHostEnvironmentGuard:
             )
         return None
 
-    def _classify_ownership(self, observation: ProcessObservation) -> SupervisorHostOwnership:
-        snapshots = {item.pid: item for item in self.process_inspector.snapshot()}
+    def _capture_process_snapshot(self) -> ProcessSnapshotIndex:
+        return ProcessSnapshotIndex.from_observations(self.process_inspector.snapshot())
+
+    def _classify_ownership(
+        self,
+        observation: ProcessObservation,
+        *,
+        process_snapshot: ProcessSnapshotIndex | None = None,
+    ) -> SupervisorHostOwnership:
+        process_snapshot = process_snapshot or self._capture_process_snapshot()
         current = observation
         for _ in range(32):
             parent_pid = current.parent_pid
             if parent_pid is None or parent_pid == current.pid or parent_pid <= 1:
                 return SupervisorHostOwnership.SUPERVISOR_HOST_MANAGED
-            parent = snapshots.get(parent_pid)
-            if parent is None:
+            parent = process_snapshot.get(parent_pid)
+            if parent is None or not _parent_observation_matches(current, parent):
                 return SupervisorHostOwnership.UNKNOWN
             if _is_desktop_process(parent.executable):
                 return SupervisorHostOwnership.DESKTOP_EXTERNAL
@@ -549,6 +580,7 @@ class StandaloneSupervisorHost:
                 SUPERVISOR_HOST_EXECUTION_CONTEXT_UNSAFE,
                 "Standalone Supervisor Host identity is unavailable or unsafe",
             )
+        process_snapshot = self.environment_guard._capture_process_snapshot()
         persisted = self.environment_guard._read_persisted_identity()
         if self.environment_guard._inherited_authority_requested():
             if persisted is None:
@@ -567,6 +599,7 @@ class StandaloneSupervisorHost:
                     parent_creation_time=current.parent_creation_time,
                     parent_executable=current.parent_executable,
                 ),
+                process_snapshot=process_snapshot,
             )
             if inherited_error is not None:
                 raise inherited_error
@@ -584,7 +617,11 @@ class StandaloneSupervisorHost:
                 parent_executable=current.parent_executable,
             ),
         ):
-            old = self.environment_guard.process_inspector.identity(persisted["pid"])
+            old = (
+                process_snapshot.get(persisted["pid"])
+                if isinstance(persisted.get("pid"), int)
+                else None
+            )
             if old is not None and _matches_persisted_identity(persisted, old):
                 raise PhysicalPathVerificationError(
                     SUPERVISOR_HOST_ALREADY_RUNNING,
@@ -733,6 +770,21 @@ def _same_executable(left: str | None, right: str | None) -> bool:
         left
         and right
         and os.path.normcase(str(left)) == os.path.normcase(str(right))
+    )
+
+
+def _parent_observation_matches(
+    child: ProcessObservation,
+    parent: ProcessObservation,
+) -> bool:
+    return bool(
+        child.parent_pid == parent.pid
+        and child.parent_creation_time
+        and child.parent_creation_time != "unknown"
+        and child.parent_creation_time == parent.creation_time
+        and parent.creation_time
+        and parent.creation_time != "unknown"
+        and _same_executable(child.parent_executable, parent.executable)
     )
 
 

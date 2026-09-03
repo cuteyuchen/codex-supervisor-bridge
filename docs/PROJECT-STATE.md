@@ -357,6 +357,25 @@ The canonical external context resolved to the non-packaged AppData root.
 The two physical files differed in final path, file identity, size, mtime, and
 SHA-256. Package identity alone cannot establish a safe Supervisor host.
 
+#### 2026-09-03 Host ancestry TOCTOU evidence
+
+An independent PowerShell 7.6.5 session ran the formal Host preflight. The
+Physical Path Guard passed for AppData, components, Local-Codex-Bridge, and
+runtime; all four physical roots resolved under the canonical
+`C:\Users\Windows\AppData\Local\CodexSupervisorBridge`, and no AppData
+redirection was observed in that external context. The Host verdict remained
+`host_ownership=UNKNOWN` with
+`failure_code=SUPERVISOR_HOST_EXECUTION_CONTEXT_UNSAFE` because its
+`pwsh.exe -> venv python.exe -> base Python312 python.exe` ancestry could be
+split across two snapshots. `GATE_0=FAILED` and `GATE_1=NOT_STARTED` remain
+authoritative.
+
+The follow-up code fix makes one Host inspection verdict snapshot-consistent:
+current identity, complete ancestry classification, inherited authority, and
+persisted PID checks use one snapshot-scoped process index. Parent creation-time
+or executable mismatches remain `UNKNOWN` and fail closed. This is code and
+fake-test evidence only; no real Gate was rerun.
+
 Read-only investigation of the pinned Local-Codex-Bridge 2.1.3 source at
 commit `4ffed814f615316ade8967189a2e1772488d33c2` confirmed that LCB starts its
 own `codex app-server --listen stdio://` child and uses protocol-level

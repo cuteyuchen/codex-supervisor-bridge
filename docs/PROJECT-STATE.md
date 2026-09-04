@@ -387,14 +387,20 @@ snapshot, so the verdict remained `host_ownership=UNKNOWN` /
 `SUPERVISOR_HOST_EXECUTION_CONTEXT_UNSAFE`. `GATE_0=FAILED` and
 `GATE_1=NOT_STARTED`. Do not treat Gate 0 as passed.
 
+The trusted Explorer launch boundary is implemented, but a later real Gate 0
+preflight still returned `host_ownership=UNKNOWN` with
+`host_launch_boundary_verified=false` while `physical_paths_verified=true`.
 The remaining code-level root cause is
-`WINDOWS_TRUSTED_LAUNCH_BOUNDARY_MISSING`. Classification now accepts a
-verified canonical `%WINDIR%\Explorer.exe` Windows shell boundary when the
-downstream hops already matched and Explorer's parent is missing from the same
-snapshot. Fake explorer paths, Desktop/ChatGPT/Codex ancestry, parent identity
-mismatch, PID reuse, and missing non-Explorer parents stay fail-closed. Linux
-`/proc` behavior is unchanged. One inspect verdict still uses one snapshot.
-This is code and fake-test evidence only; no real Gate 0 was rerun.
+`WINDOWS_EXPLORER_BOUNDARY_PARENT_METADATA_CONTRADICTION`: production
+`ProcessInspector._windows_snapshot()` leaves Explorer
+`parent_creation_time`/`parent_executable` as `None` when the historical
+parent is gone, and the first completeness check incorrectly required those
+fields. Explorer self-identity is now separate from parent metadata. If the
+Explorer parent is still in the snapshot, mismatch stays `UNKNOWN`.
+`ProcessInspector` is unchanged. Fake explorer paths, Desktop ancestry, PID
+reuse, and missing non-Explorer parents stay fail-closed. Linux `/proc`
+behavior is unchanged. This is code and fake-test evidence only; no real
+Gate 0 was rerun. `GATE_1=NOT_STARTED`.
 
 Read-only investigation of the pinned Local-Codex-Bridge 2.1.3 source at
 commit `4ffed814f615316ade8967189a2e1772488d33c2` confirmed that LCB starts its

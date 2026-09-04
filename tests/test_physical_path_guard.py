@@ -736,13 +736,17 @@ def _external_powershell_explorer_chain(
     *,
     explorer_executable: str = CANONICAL_WINDOWS_EXPLORER,
     shell_executable: str = WINDOWSAPPS_PWSH,
+    explorer_pid: int = 15996,
     explorer_parent_pid: int = 2204,
     explorer_creation_time: str = "explorer-created",
-    explorer_parent_creation_time: str = "explorer-parent-created",
-    explorer_parent_executable: str = r"C:\WINDOWS\System32\winlogon.exe",
+    explorer_parent_creation_time: str | None = None,
+    explorer_parent_executable: str | None = None,
 ) -> tuple[ProcessObservation, ProcessObservation, ProcessObservation, ProcessObservation]:
+    # This fixture intentionally mirrors ProcessInspector._windows_snapshot()
+    # when the historical parent exited before the CIM snapshot: parent_pid is
+    # still recorded, but parent_creation_time and parent_executable are None.
     explorer = _process_observation(
-        300,
+        explorer_pid,
         explorer_executable,
         creation_time=explorer_creation_time,
         parent_pid=explorer_parent_pid,
@@ -805,6 +809,8 @@ def test_standalone_host_accepts_verified_windowsapps_pwsh_explorer_boundary(
 
     evidence = _host_for_process_snapshot(tmp_path, current, venv, shell, explorer).preflight()
 
+    assert explorer.parent_creation_time is None
+    assert explorer.parent_executable is None
     assert evidence.identity is not None
     assert evidence.identity.ownership == SupervisorHostOwnership.SUPERVISOR_HOST_MANAGED
     assert evidence.physical_paths_verified is True
@@ -814,6 +820,7 @@ def test_standalone_host_accepts_verified_windowsapps_pwsh_explorer_boundary(
     assert evidence.host_launch_boundary_type == host_module.WINDOWS_EXPLORER_LAUNCH_BOUNDARY
     assert evidence.host_launch_boundary_executable == CANONICAL_WINDOWS_EXPLORER
     assert evidence.host_launch_boundary_verified is True
+    assert evidence.failure_code is None
 
 
 def test_standalone_host_accepts_classic_powershell_explorer_boundary(
@@ -978,7 +985,10 @@ def test_standalone_host_rejects_explorer_parent_identity_mismatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable_windows_explorer_boundary(monkeypatch)
-    current, venv, shell, explorer = _external_powershell_explorer_chain()
+    current, venv, shell, explorer = _external_powershell_explorer_chain(
+        explorer_parent_creation_time="explorer-parent-created",
+        explorer_parent_executable=r"C:\WINDOWS\System32\winlogon.exe",
+    )
     mismatched_parent = _process_observation(
         2204,
         r"C:\WINDOWS\System32\winlogon.exe",
@@ -1004,7 +1014,10 @@ def test_standalone_host_rejects_explorer_parent_pid_reuse(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable_windows_explorer_boundary(monkeypatch)
-    current, venv, shell, explorer = _external_powershell_explorer_chain()
+    current, venv, shell, explorer = _external_powershell_explorer_chain(
+        explorer_parent_creation_time="explorer-parent-created",
+        explorer_parent_executable=r"C:\WINDOWS\System32\winlogon.exe",
+    )
     reused = _process_observation(
         2204,
         r"C:\WINDOWS\System32\notepad.exe",
@@ -1023,21 +1036,51 @@ def test_standalone_host_rejects_explorer_parent_pid_reuse(
     assert evidence.host_launch_boundary_verified is False
 
 
-def test_standalone_host_rejects_incomplete_explorer_identity(
+def test_canonical_explorer_with_live_matching_parent_continues_ancestry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable_windows_explorer_boundary(monkeypatch)
     current, venv, shell, explorer = _external_powershell_explorer_chain(
-        explorer_parent_creation_time="unknown",
+        explorer_parent_creation_time="winlogon-created",
+        explorer_parent_executable=r"C:\WINDOWS\System32\winlogon.exe",
+    )
+    live_parent = _process_observation(
+        2204,
+        r"C:\WINDOWS\System32\winlogon.exe",
+        creation_time="winlogon-created",
+        parent_pid=1,
+        parent_creation_time="system-created",
+        parent_executable=r"C:\WINDOWS\System32\smss.exe",
     )
 
-    evidence = _host_for_process_snapshot(tmp_path, current, venv, shell, explorer).preflight()
+    evidence = _host_for_process_snapshot(
+        tmp_path, current, venv, shell, explorer, live_parent
+    ).preflight()
 
     assert evidence.identity is not None
-    assert evidence.identity.ownership == SupervisorHostOwnership.UNKNOWN
+    assert evidence.identity.ownership == SupervisorHostOwnership.SUPERVISOR_HOST_MANAGED
     assert evidence.host_launch_boundary_verified is False
-    assert evidence.host_ready is False
+    assert evidence.host_launch_boundary_type is None
+    assert evidence.host_ready is True
+
+
+def test_incomplete_explorer_self_identity_is_not_a_trusted_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_windows_explorer_boundary(monkeypatch)
+    explorer = _process_observation(
+        15996,
+        CANONICAL_WINDOWS_EXPLORER,
+        creation_time="unknown",
+        parent_pid=2204,
+        parent_creation_time=None,
+        parent_executable=None,
+    )
+    snapshot = ProcessSnapshotIndex.from_observations([explorer])
+
+    assert host_module._explorer_observation_complete(explorer) is False
+    assert host_module._is_trusted_windows_shell_boundary(explorer, snapshot) is False
 
 
 def test_standalone_host_package_identity_does_not_hide_desktop_with_explorer_present(

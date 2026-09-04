@@ -863,6 +863,9 @@ def _is_canonical_windows_explorer(value: str | None) -> bool:
 
 
 def _explorer_observation_complete(observation: ProcessObservation) -> bool:
+    # Explorer self-identity only. Production Windows snapshots leave
+    # parent_creation_time/parent_executable as None when the historical
+    # parent is already gone; the trusted-boundary helper decides that case.
     return bool(
         observation.pid > 0
         and observation.creation_time
@@ -871,9 +874,6 @@ def _explorer_observation_complete(observation: ProcessObservation) -> bool:
         and observation.parent_pid is not None
         and observation.parent_pid > 1
         and observation.parent_pid != observation.pid
-        and observation.parent_creation_time
-        and observation.parent_creation_time != "unknown"
-        and observation.parent_executable
     )
 
 

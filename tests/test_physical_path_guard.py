@@ -16,10 +16,12 @@ from codex_supervisor_bridge.bootstrap import (
     PhysicalPathGuard,
     PhysicalPathVerificationError,
     ProcessObservation,
+    ProcessSnapshotIndex,
     StandaloneSupervisorHost,
     SupervisorHostOwnership,
     WindowsPhysicalPathInspector,
 )
+from codex_supervisor_bridge.bootstrap import host as host_module
 from codex_supervisor_bridge.bootstrap import paths as paths_module
 
 
@@ -706,6 +708,528 @@ def test_standalone_host_keeps_path_safe_but_ancestry_unknown_fail_closed(tmp_pa
     assert evidence.identity is not None
     assert evidence.identity.ownership == SupervisorHostOwnership.UNKNOWN
 
+
+CANONICAL_WINDOWS_EXPLORER = r"C:\WINDOWS\Explorer.EXE"
+FAKE_WINDOWS_EXPLORER = r"C:\Temp\explorer.exe"
+WINDOWSAPPS_PWSH = (
+    r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.5.0_x64__8wekyb3d8bbwe"
+    r"\pwsh.exe"
+)
+CLASSIC_POWERSHELL = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+VENV_PYTHON = r"E:\project\codex-supervisor-bridge\.venv-p66-312\Scripts\python.exe"
+BASE_PYTHON = r"C:\Users\Windows\AppData\Local\Programs\Python\Python312\python.exe"
+
+
+def _enable_windows_explorer_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(host_module, "_is_windows_platform", lambda: True)
+    monkeypatch.setenv("WINDIR", r"C:\WINDOWS")
+    monkeypatch.setenv("SystemRoot", r"C:\WINDOWS")
+
+
+def _disable_windows_explorer_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(host_module, "_is_windows_platform", lambda: False)
+    monkeypatch.setenv("WINDIR", r"C:\WINDOWS")
+    monkeypatch.setenv("SystemRoot", r"C:\WINDOWS")
+
+
+def _external_powershell_explorer_chain(
+    *,
+    explorer_executable: str = CANONICAL_WINDOWS_EXPLORER,
+    shell_executable: str = WINDOWSAPPS_PWSH,
+    explorer_parent_pid: int = 2204,
+    explorer_creation_time: str = "explorer-created",
+    explorer_parent_creation_time: str = "explorer-parent-created",
+    explorer_parent_executable: str = r"C:\WINDOWS\System32\winlogon.exe",
+) -> tuple[ProcessObservation, ProcessObservation, ProcessObservation, ProcessObservation]:
+    explorer = _process_observation(
+        300,
+        explorer_executable,
+        creation_time=explorer_creation_time,
+        parent_pid=explorer_parent_pid,
+        parent_creation_time=explorer_parent_creation_time,
+        parent_executable=explorer_parent_executable,
+    )
+    shell = _process_observation(
+        201,
+        shell_executable,
+        creation_time="pwsh-created",
+        parent_pid=explorer.pid,
+        parent_creation_time=explorer.creation_time,
+        parent_executable=explorer.executable,
+    )
+    venv = _process_observation(
+        200,
+        VENV_PYTHON,
+        creation_time="venv-created",
+        parent_pid=shell.pid,
+        parent_creation_time=shell.creation_time,
+        parent_executable=shell.executable,
+    )
+    current = _process_observation(
+        os.getpid(),
+        BASE_PYTHON,
+        creation_time="host-created",
+        parent_pid=venv.pid,
+        parent_creation_time=venv.creation_time,
+        parent_executable=venv.executable,
+    )
+    return current, venv, shell, explorer
+
+
+def test_canonical_explorer_is_not_accepted_by_filename_or_temp_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_windows_explorer_boundary(monkeypatch)
+
+    assert host_module._is_canonical_windows_explorer(CANONICAL_WINDOWS_EXPLORER) is True
+    assert host_module._is_canonical_windows_explorer(r"C:\Windows\explorer.exe") is True
+    assert host_module._is_canonical_windows_explorer("explorer.exe") is False
+    assert host_module._is_canonical_windows_explorer(FAKE_WINDOWS_EXPLORER) is False
+    assert host_module._is_canonical_windows_explorer(r"E:\fake\explorer.exe") is False
+    assert (
+        host_module._is_canonical_windows_explorer(r"C:\WINDOWS\System32\explorer.exe")
+        is False
+    )
+
+    monkeypatch.setenv("WINDIR", r"C:\Temp")
+    monkeypatch.setenv("SystemRoot", r"C:\Temp")
+    assert host_module._is_canonical_windows_explorer(FAKE_WINDOWS_EXPLORER) is False
+
+
+def test_standalone_host_accepts_verified_windowsapps_pwsh_explorer_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_windows_explorer_boundary(monkeypatch)
+    current, venv, shell, explorer = _external_powershell_explorer_chain()
+
+    evidence = _host_for_process_snapshot(tmp_path, current, venv, shell, explorer).preflight()
+
+    assert evidence.identity is not None
+    assert evidence.identity.ownership == SupervisorHostOwnership.SUPERVISOR_HOST_MANAGED
+    assert evidence.physical_paths_verified is True
+    assert evidence.host_execution_context_verified is True
+    assert evidence.host_ready is True
+    assert evidence.physical_root_verified is True
+    assert evidence.host_launch_boundary_type == host_module.WINDOWS_EXPLORER_LAUNCH_BOUNDARY
+    assert evidence.host_launch_boundary_executable == CANONICAL_WINDOWS_EXPLORER
+    assert evidence.host_launch_boundary_verified is True
+
+
+def test_standalone_host_accepts_classic_powershell_explorer_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_windows_explorer_boundary(monkeypatch)
+    current, venv, shell, explorer = _external_powershell_explorer_chain(
+        shell_executable=CLASSIC_POWERSHELL,
+    )
+
+    evidence = _host_for_process_snapshot(tmp_path, current, venv, shell, explorer).preflight()
+
+    assert evidence.identity is not None
+    assert evidence.identity.ownership == SupervisorHostOwnership.SUPERVISOR_HOST_MANAGED
+    assert evidence.host_launch_boundary_type == host_module.WINDOWS_EXPLORER_LAUNCH_BOUNDARY
+    assert evidence.host_launch_boundary_verified is True
+    assert evidence.host_ready is True
+
+
+def test_standalone_host_rejects_fake_explorer_as_launch_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_windows_explorer_boundary(monkeypatch)
+    current, venv, shell, explorer = _external_powershell_explorer_chain(
+        explorer_executable=FAKE_WINDOWS_EXPLORER,
+    )
+
+    evidence = _host_for_process_snapshot(tmp_path, current, venv, shell, explorer).preflight()
+
+    assert evidence.identity is not None
+    assert evidence.identity.ownership == SupervisorHostOwnership.UNKNOWN
+    assert evidence.physical_paths_verified is True
+    assert evidence.host_execution_context_verified is False
+    assert evidence.host_ready is False
+    assert evidence.physical_root_verified is False
+    assert evidence.host_launch_boundary_verified is False
+    assert evidence.failure_code == SUPERVISOR_HOST_EXECUTION_CONTEXT_UNSAFE
+
+
+def test_standalone_host_keeps_desktop_priority_over_explorer_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_windows_explorer_boundary(monkeypatch)
+    current = _process_observation(
+        os.getpid(),
+        BASE_PYTHON,
+        creation_time="host-created",
+        parent_pid=210,
+        parent_creation_time="pwsh-created",
+        parent_executable=WINDOWSAPPS_PWSH,
+    )
+    pwsh = _process_observation(
+        210,
+        WINDOWSAPPS_PWSH,
+        creation_time="pwsh-created",
+        parent_pid=211,
+        parent_creation_time="chatgpt-created",
+        parent_executable="ChatGPT.exe",
+    )
+    chatgpt = _process_observation(211, "ChatGPT.exe", creation_time="chatgpt-created")
+    explorer = _process_observation(
+        300,
+        CANONICAL_WINDOWS_EXPLORER,
+        creation_time="explorer-created",
+        parent_pid=2204,
+        parent_creation_time="explorer-parent-created",
+        parent_executable=r"C:\WINDOWS\System32\winlogon.exe",
+    )
+
+    evidence = _host_for_process_snapshot(
+        tmp_path, current, pwsh, chatgpt, explorer
+    ).preflight()
+
+    assert evidence.identity is not None
+    assert evidence.identity.ownership == SupervisorHostOwnership.DESKTOP_EXTERNAL
+    assert evidence.host_launch_boundary_verified is False
+    assert evidence.host_ready is False
+    assert evidence.failure_code == SUPERVISOR_HOST_EXECUTION_CONTEXT_UNSAFE
+
+
+def test_standalone_host_detects_openai_codex_cmd_pwsh_desktop_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_windows_explorer_boundary(monkeypatch)
+    chatgpt = _process_observation(
+        253,
+        r"C:\Program Files\WindowsApps\OpenAI.Codex_2.2.1.0_x64__2p2nqsd0c76g0\ChatGPT.exe",
+        creation_time="chatgpt-created",
+        parent_pid=2204,
+        parent_creation_time="explorer-parent-created",
+        parent_executable=CANONICAL_WINDOWS_EXPLORER,
+    )
+    cmd = _process_observation(
+        252,
+        r"C:\Windows\System32\cmd.exe",
+        creation_time="cmd-created",
+        parent_pid=chatgpt.pid,
+        parent_creation_time=chatgpt.creation_time,
+        parent_executable=chatgpt.executable,
+    )
+    pwsh = _process_observation(
+        251,
+        WINDOWSAPPS_PWSH,
+        creation_time="pwsh-created",
+        parent_pid=cmd.pid,
+        parent_creation_time=cmd.creation_time,
+        parent_executable=cmd.executable,
+    )
+    current = _process_observation(
+        os.getpid(),
+        BASE_PYTHON,
+        creation_time="host-created",
+        parent_pid=pwsh.pid,
+        parent_creation_time=pwsh.creation_time,
+        parent_executable=pwsh.executable,
+    )
+
+    evidence = _host_for_process_snapshot(tmp_path, current, pwsh, cmd, chatgpt).preflight()
+
+    assert evidence.identity is not None
+    assert evidence.identity.ownership == SupervisorHostOwnership.DESKTOP_EXTERNAL
+    assert evidence.host_ready is False
+    assert evidence.failure_code == SUPERVISOR_HOST_EXECUTION_CONTEXT_UNSAFE
+
+
+def test_standalone_host_missing_parent_before_explorer_is_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_windows_explorer_boundary(monkeypatch)
+    explorer = _process_observation(
+        300,
+        CANONICAL_WINDOWS_EXPLORER,
+        creation_time="explorer-created",
+        parent_pid=2204,
+        parent_creation_time="explorer-parent-created",
+        parent_executable=r"C:\WINDOWS\System32\winlogon.exe",
+    )
+    current = _process_observation(
+        os.getpid(),
+        BASE_PYTHON,
+        creation_time="host-created",
+        parent_pid=280,
+        parent_creation_time="missing-created",
+        parent_executable=VENV_PYTHON,
+    )
+
+    evidence = _host_for_process_snapshot(tmp_path, current, explorer).preflight()
+
+    assert evidence.identity is not None
+    assert evidence.identity.ownership == SupervisorHostOwnership.UNKNOWN
+    assert evidence.host_launch_boundary_verified is False
+    assert evidence.host_ready is False
+
+
+def test_standalone_host_rejects_explorer_parent_identity_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_windows_explorer_boundary(monkeypatch)
+    current, venv, shell, explorer = _external_powershell_explorer_chain()
+    mismatched_parent = _process_observation(
+        2204,
+        r"C:\WINDOWS\System32\winlogon.exe",
+        creation_time="reused-created",
+        parent_pid=4,
+        parent_creation_time="system-created",
+        parent_executable=r"C:\WINDOWS\System32\smss.exe",
+    )
+
+    evidence = _host_for_process_snapshot(
+        tmp_path, current, venv, shell, explorer, mismatched_parent
+    ).preflight()
+
+    assert evidence.identity is not None
+    assert evidence.identity.ownership == SupervisorHostOwnership.UNKNOWN
+    assert evidence.host_launch_boundary_verified is False
+    assert evidence.host_ready is False
+    assert evidence.failure_code == SUPERVISOR_HOST_EXECUTION_CONTEXT_UNSAFE
+
+
+def test_standalone_host_rejects_explorer_parent_pid_reuse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_windows_explorer_boundary(monkeypatch)
+    current, venv, shell, explorer = _external_powershell_explorer_chain()
+    reused = _process_observation(
+        2204,
+        r"C:\WINDOWS\System32\notepad.exe",
+        creation_time="explorer-parent-created",
+        parent_pid=4,
+        parent_creation_time="system-created",
+        parent_executable=r"C:\WINDOWS\System32\smss.exe",
+    )
+
+    evidence = _host_for_process_snapshot(
+        tmp_path, current, venv, shell, explorer, reused
+    ).preflight()
+
+    assert evidence.identity is not None
+    assert evidence.identity.ownership == SupervisorHostOwnership.UNKNOWN
+    assert evidence.host_launch_boundary_verified is False
+
+
+def test_standalone_host_rejects_incomplete_explorer_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_windows_explorer_boundary(monkeypatch)
+    current, venv, shell, explorer = _external_powershell_explorer_chain(
+        explorer_parent_creation_time="unknown",
+    )
+
+    evidence = _host_for_process_snapshot(tmp_path, current, venv, shell, explorer).preflight()
+
+    assert evidence.identity is not None
+    assert evidence.identity.ownership == SupervisorHostOwnership.UNKNOWN
+    assert evidence.host_launch_boundary_verified is False
+    assert evidence.host_ready is False
+
+
+def test_standalone_host_package_identity_does_not_hide_desktop_with_explorer_present(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_windows_explorer_boundary(monkeypatch)
+    monkeypatch.setattr(host_module, "current_package_identity", lambda: "NO_PACKAGE_IDENTITY")
+    current = _process_observation(
+        os.getpid(),
+        BASE_PYTHON,
+        creation_time="host-created",
+        parent_pid=260,
+        parent_creation_time="chatgpt-created",
+        parent_executable="ChatGPT.exe",
+    )
+    chatgpt = _process_observation(260, "ChatGPT.exe", creation_time="chatgpt-created")
+    explorer = _process_observation(
+        300,
+        CANONICAL_WINDOWS_EXPLORER,
+        creation_time="explorer-created",
+        parent_pid=2204,
+        parent_creation_time="explorer-parent-created",
+        parent_executable=r"C:\WINDOWS\System32\winlogon.exe",
+    )
+
+    evidence = _host_for_process_snapshot(tmp_path, current, chatgpt, explorer).preflight()
+
+    assert evidence.identity is not None
+    assert evidence.identity.package_identity == "NO_PACKAGE_IDENTITY"
+    assert evidence.identity.ownership == SupervisorHostOwnership.DESKTOP_EXTERNAL
+    assert evidence.host_ready is False
+
+
+def test_trusted_explorer_ancestry_does_not_override_redirected_physical_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_windows_explorer_boundary(monkeypatch)
+    current, venv, shell, explorer = _external_powershell_explorer_chain()
+    root = tmp_path / "CodexSupervisorBridge"
+    lcb = root / "components" / "local-codex-bridge" / "2.1.3"
+    for child in (root, lcb, root / "runtime"):
+        child.mkdir(parents=True, exist_ok=True)
+    paths = AppDataPaths.from_environment(
+        environ={"CODEX_SUPERVISOR_DATA_DIR": str(root)},
+        system="Windows",
+    )
+    redirected_root = (
+        r"C:\Users\Windows\AppData\Local\Packages\OpenAI.Codex_2p2nqsd0c76g0"
+        r"\LocalCache\Local\CodexSupervisorBridge"
+    )
+    path_evidence = {
+        str(root): _existing(root, physical=redirected_root),
+        str(root / "components"): _existing(
+            root / "components",
+            physical=redirected_root + r"\components",
+        ),
+        str(root / "runtime"): _existing(
+            root / "runtime",
+            physical=redirected_root + r"\runtime",
+        ),
+        str(lcb): _existing(lcb, physical=redirected_root + r"\components\local-codex-bridge\2.1.3"),
+    }
+    host = StandaloneSupervisorHost(
+        paths=paths,
+        physical_guard=PhysicalPathGuard(_MappingInspector(path_evidence)),
+        process_inspector=_ProcessMapInspector(current, venv, shell, explorer),
+    )
+
+    evidence = host.preflight()
+
+    assert evidence.identity is not None
+    assert evidence.identity.ownership == SupervisorHostOwnership.SUPERVISOR_HOST_MANAGED
+    assert evidence.host_launch_boundary_verified is True
+    assert evidence.physical_paths_verified is False
+    assert evidence.host_execution_context_verified is True
+    assert evidence.host_ready is False
+    assert evidence.physical_root_verified is False
+    assert evidence.failure_code == SUPERVISOR_HOST_PATH_VIRTUALIZED
+
+
+def test_trusted_explorer_boundary_uses_one_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_windows_explorer_boundary(monkeypatch)
+    current, venv, shell, explorer = _external_powershell_explorer_chain()
+
+    class _FlappingInspector:
+        def __init__(self) -> None:
+            self.snapshot_call_count = 0
+
+        def snapshot(self) -> list[ProcessObservation]:
+            self.snapshot_call_count += 1
+            if self.snapshot_call_count == 1:
+                return [current, venv, shell, explorer]
+            return [current, venv, shell]
+
+        def identity(self, _pid: int) -> ProcessObservation:
+            raise AssertionError("Host verdict must not perform a second live identity read")
+
+    inspector = _FlappingInspector()
+    evidence = _host_for_process_snapshot(tmp_path, process_inspector=inspector).preflight()
+
+    assert inspector.snapshot_call_count == 1
+    assert evidence.identity is not None
+    assert evidence.identity.ownership == SupervisorHostOwnership.SUPERVISOR_HOST_MANAGED
+    assert evidence.host_launch_boundary_verified is True
+    assert evidence.host_ready is True
+
+
+def test_pwsh_cmd_and_conhost_are_not_trusted_windows_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_windows_explorer_boundary(monkeypatch)
+    for executable in (
+        WINDOWSAPPS_PWSH,
+        CLASSIC_POWERSHELL,
+        r"C:\Windows\System32\cmd.exe",
+        r"C:\Windows\System32\conhost.exe",
+        r"C:\Users\Windows\AppData\Local\Programs\Python\Python312\python.exe",
+        r"C:\Program Files\nodejs\node.exe",
+    ):
+        launcher = _process_observation(
+            290,
+            executable,
+            creation_time="launcher-created",
+            parent_pid=2204,
+            parent_creation_time="missing-created",
+            parent_executable="unknown-parent.exe",
+        )
+        current = _process_observation(
+            os.getpid(),
+            BASE_PYTHON,
+            creation_time="host-created",
+            parent_pid=launcher.pid,
+            parent_creation_time=launcher.creation_time,
+            parent_executable=launcher.executable,
+        )
+        snapshot = ProcessSnapshotIndex.from_observations([current, launcher])
+        verdict = host_module._ownership_verdict(current, snapshot)
+        assert verdict.ownership == SupervisorHostOwnership.UNKNOWN
+        assert verdict.launch_boundary_verified is False
+        assert host_module._is_trusted_windows_shell_boundary(launcher, snapshot) is False
+
+
+def test_linux_does_not_treat_canonical_explorer_as_trusted_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disable_windows_explorer_boundary(monkeypatch)
+    current, venv, shell, explorer = _external_powershell_explorer_chain()
+
+    evidence = _host_for_process_snapshot(tmp_path, current, venv, shell, explorer).preflight()
+
+    assert evidence.identity is not None
+    assert evidence.identity.ownership == SupervisorHostOwnership.UNKNOWN
+    assert evidence.host_launch_boundary_verified is False
+    assert evidence.host_ready is False
+
+
+def test_trusted_explorer_boundary_helper_requires_missing_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_windows_explorer_boundary(monkeypatch)
+    current, venv, shell, explorer = _external_powershell_explorer_chain()
+    snapshot = ProcessSnapshotIndex.from_observations([current, venv, shell, explorer])
+
+    assert host_module._is_trusted_windows_shell_boundary(explorer, snapshot) is True
+    assert host_module._is_trusted_windows_shell_boundary(shell, snapshot) is False
+
+    fake = _process_observation(
+        300,
+        FAKE_WINDOWS_EXPLORER,
+        creation_time="explorer-created",
+        parent_pid=2204,
+        parent_creation_time="explorer-parent-created",
+        parent_executable=r"C:\WINDOWS\System32\winlogon.exe",
+    )
+    assert (
+        host_module._is_trusted_windows_shell_boundary(
+            fake,
+            ProcessSnapshotIndex.from_observations([fake]),
+        )
+        is False
+    )
+
+    verdict = host_module._ownership_verdict(current, snapshot)
+    assert verdict.ownership == SupervisorHostOwnership.SUPERVISOR_HOST_MANAGED
+    assert verdict.launch_boundary_type == host_module.WINDOWS_EXPLORER_LAUNCH_BOUNDARY
+    assert verdict.launch_boundary_verified is True
 
 def _write_persisted_host_authority(
     path: Path,

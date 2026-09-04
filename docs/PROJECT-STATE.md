@@ -4,7 +4,7 @@
 >
 > This document records the current product intent and the architecture decisions that supersede earlier fixed-backend assumptions. It is deliberately more durable than a browser conversation.
 
-Last updated: 2026-08-31
+Last updated: 2026-09-04
 
 ## Product goal
 
@@ -373,8 +373,28 @@ authoritative.
 The follow-up code fix makes one Host inspection verdict snapshot-consistent:
 current identity, complete ancestry classification, inherited authority, and
 persisted PID checks use one snapshot-scoped process index. Parent creation-time
-or executable mismatches remain `UNKNOWN` and fail closed. This is code and
+or executable mismatches remain `UNKNOWN` and fail closed.
+`PROCESS_ANCESTRY_TOCTOU` is **FIXED** at the code/test layer. This is code and
 fake-test evidence only; no real Gate was rerun.
+
+#### 2026-09-04 trusted Windows shell launch boundary
+
+A later Start Menu PowerShell 7.6.5 Host preflight still saw canonical physical
+roots under `C:\Users\Windows\AppData\Local\CodexSupervisorBridge`. The
+observed chain was Host -> venv Python -> PowerShell -> canonical
+`Explorer.exe`. Explorer's historical parent was absent from the current
+snapshot, so the verdict remained `host_ownership=UNKNOWN` /
+`SUPERVISOR_HOST_EXECUTION_CONTEXT_UNSAFE`. `GATE_0=FAILED` and
+`GATE_1=NOT_STARTED`. Do not treat Gate 0 as passed.
+
+The remaining code-level root cause is
+`WINDOWS_TRUSTED_LAUNCH_BOUNDARY_MISSING`. Classification now accepts a
+verified canonical `%WINDIR%\Explorer.exe` Windows shell boundary when the
+downstream hops already matched and Explorer's parent is missing from the same
+snapshot. Fake explorer paths, Desktop/ChatGPT/Codex ancestry, parent identity
+mismatch, PID reuse, and missing non-Explorer parents stay fail-closed. Linux
+`/proc` behavior is unchanged. One inspect verdict still uses one snapshot.
+This is code and fake-test evidence only; no real Gate 0 was rerun.
 
 Read-only investigation of the pinned Local-Codex-Bridge 2.1.3 source at
 commit `4ffed814f615316ade8967189a2e1772488d33c2` confirmed that LCB starts its

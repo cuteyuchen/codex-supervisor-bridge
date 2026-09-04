@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import sys
 import uuid
 from dataclasses import dataclass, replace
@@ -23,7 +24,11 @@ from .physical import (
     PhysicalPathEvidence,
     PhysicalPathGuard,
     PhysicalPathVerificationError,
+    _same_path,
     current_package_identity,
+)
+from .physical import (
+    _path_key as _windows_path_key,
 )
 from .process import ProcessManager
 
@@ -35,6 +40,7 @@ SUPERVISOR_HOST_AUTHORITY_VALUE = "standalone-v1"
 SUPERVISOR_HOST_IDENTITY_PATH_ENV = "CODEX_SUPERVISOR_HOST_IDENTITY_PATH"
 HOST_IDENTITY_SCHEMA_VERSION = 1
 HOST_IDENTITY_FILENAME = "host-identity.json"
+WINDOWS_EXPLORER_LAUNCH_BOUNDARY = "WINDOWS_EXPLORER"
 
 
 class SupervisorHostOwnership(str, Enum):
@@ -91,6 +97,12 @@ class SupervisorHostEvidence:
     physical_root_verified: bool
     failure_code: str | None = None
     technical_detail: str | None = None
+    physical_paths_verified: bool = False
+    host_execution_context_verified: bool = False
+    host_ready: bool = False
+    host_launch_boundary_type: str | None = None
+    host_launch_boundary_executable: str | None = None
+    host_launch_boundary_verified: bool = False
 
     def as_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -105,6 +117,12 @@ class SupervisorHostEvidence:
             "host_identity_path": self.host_identity_path,
             "host_identity_persisted": self.host_identity_persisted,
             "physical_root_verified": self.physical_root_verified,
+            "physical_paths_verified": self.physical_paths_verified,
+            "host_execution_context_verified": self.host_execution_context_verified,
+            "host_ready": self.host_ready,
+            "host_launch_boundary_type": self.host_launch_boundary_type,
+            "host_launch_boundary_executable": self.host_launch_boundary_executable,
+            "host_launch_boundary_verified": self.host_launch_boundary_verified,
             "failure_code": self.failure_code,
             "technical_detail": self.technical_detail,
             "path_evidence": {
@@ -190,6 +208,11 @@ class SupervisorHostEnvironmentGuard:
 
         process_snapshot = self._capture_process_snapshot()
         observation = process_snapshot.get(os.getpid())
+        ownership_verdict = (
+            _ownership_verdict(observation, process_snapshot)
+            if observation is not None
+            else None
+        )
         identity = self._identity(
             observation=observation,
             process_snapshot=process_snapshot,
@@ -294,6 +317,17 @@ class SupervisorHostEnvironmentGuard:
         )
 
         first_failure = failures[0] if failures else None
+        physical_paths_verified = all(item.verified for item in evidence.values())
+        host_execution_context_verified = bool(
+            identity is not None
+            and _complete_host_identity(identity)
+            and identity.ownership == SupervisorHostOwnership.SUPERVISOR_HOST_MANAGED
+        )
+        host_ready = (
+            physical_paths_verified
+            and host_execution_context_verified
+            and not failures
+        )
         return SupervisorHostEvidence(
             identity=identity,
             requested_app_data_root=str(requested_app_data),
@@ -310,10 +344,21 @@ class SupervisorHostEnvironmentGuard:
             components=evidence["components"],
             runtime=evidence["runtime"],
             lcb=evidence["lcb"],
-            physical_root_verified=not failures
-            and all(item.verified for item in evidence.values()),
+            physical_root_verified=not failures and physical_paths_verified,
             failure_code=first_failure.code if first_failure else None,
             technical_detail=str(first_failure) if first_failure else None,
+            physical_paths_verified=physical_paths_verified,
+            host_execution_context_verified=host_execution_context_verified,
+            host_ready=host_ready,
+            host_launch_boundary_type=(
+                ownership_verdict.launch_boundary_type if ownership_verdict else None
+            ),
+            host_launch_boundary_executable=(
+                ownership_verdict.launch_boundary_executable if ownership_verdict else None
+            ),
+            host_launch_boundary_verified=bool(
+                ownership_verdict.launch_boundary_verified if ownership_verdict else False
+            ),
         )
 
     def assert_ready(self) -> SupervisorHostEvidence:
@@ -512,18 +557,7 @@ class SupervisorHostEnvironmentGuard:
         process_snapshot: ProcessSnapshotIndex | None = None,
     ) -> SupervisorHostOwnership:
         process_snapshot = process_snapshot or self._capture_process_snapshot()
-        current = observation
-        for _ in range(32):
-            parent_pid = current.parent_pid
-            if parent_pid is None or parent_pid == current.pid or parent_pid <= 1:
-                return SupervisorHostOwnership.SUPERVISOR_HOST_MANAGED
-            parent = process_snapshot.get(parent_pid)
-            if parent is None or not _parent_observation_matches(current, parent):
-                return SupervisorHostOwnership.UNKNOWN
-            if _is_desktop_process(parent.executable):
-                return SupervisorHostOwnership.DESKTOP_EXTERNAL
-            current = parent
-        return SupervisorHostOwnership.UNKNOWN
+        return _ownership_verdict(observation, process_snapshot).ownership
 
 
 class StandaloneSupervisorHost:
@@ -741,6 +775,12 @@ def main(argv: list[str] | None = None) -> None:
             else "STANDALONE SUPERVISOR HOST INCOMPLETE"
         )
         print(f"physical_root_verified={evidence.physical_root_verified}")
+        print(f"physical_paths_verified={evidence.physical_paths_verified}")
+        print(f"host_execution_context_verified={evidence.host_execution_context_verified}")
+        print(f"host_ready={evidence.host_ready}")
+        print(f"host_launch_boundary_type={evidence.host_launch_boundary_type}")
+        print(f"host_launch_boundary_executable={evidence.host_launch_boundary_executable}")
+        print(f"host_launch_boundary_verified={evidence.host_launch_boundary_verified}")
         if evidence.failure_code:
             print(f"failure_code={evidence.failure_code}")
 
@@ -786,6 +826,100 @@ def _parent_observation_matches(
         and parent.creation_time != "unknown"
         and _same_executable(child.parent_executable, parent.executable)
     )
+
+
+@dataclass(frozen=True)
+class _HostOwnershipVerdict:
+    ownership: SupervisorHostOwnership
+    launch_boundary_type: str | None = None
+    launch_boundary_executable: str | None = None
+    launch_boundary_verified: bool = False
+
+
+def _is_windows_platform() -> bool:
+    return platform.system() == "Windows"
+
+
+def _canonical_windows_explorer_executable() -> str | None:
+    windir = (os.environ.get("WINDIR") or os.environ.get("SystemRoot") or "").strip()
+    if not windir:
+        return None
+    return windir.rstrip("\\/") + "\\Explorer.exe"
+
+
+def _is_canonical_windows_explorer(value: str | None) -> bool:
+    if not value:
+        return False
+    parts = [part for part in _windows_path_key(value).split("\\") if part]
+    if len(parts) != 3:
+        return False
+    drive, folder, name = parts
+    if len(drive) != 2 or drive[1] != ":" or not drive[0].isalpha():
+        return False
+    if folder != "windows" or name != "explorer.exe":
+        return False
+    canonical = _canonical_windows_explorer_executable()
+    return canonical is not None and _same_path(value, canonical)
+
+
+def _explorer_observation_complete(observation: ProcessObservation) -> bool:
+    return bool(
+        observation.pid > 0
+        and observation.creation_time
+        and observation.creation_time != "unknown"
+        and observation.executable
+        and observation.parent_pid is not None
+        and observation.parent_pid > 1
+        and observation.parent_pid != observation.pid
+        and observation.parent_creation_time
+        and observation.parent_creation_time != "unknown"
+        and observation.parent_executable
+    )
+
+
+def _is_trusted_windows_shell_boundary(
+    current: ProcessObservation,
+    process_snapshot: ProcessSnapshotIndex,
+) -> bool:
+    if not _is_windows_platform():
+        return False
+    if _is_desktop_process(current.executable):
+        return False
+    if not _is_canonical_windows_explorer(current.executable):
+        return False
+    if not _explorer_observation_complete(current):
+        return False
+    parent_pid = current.parent_pid
+    if parent_pid is None or parent_pid <= 1 or parent_pid == current.pid:
+        return False
+    return process_snapshot.get(parent_pid) is None
+
+
+def _ownership_verdict(
+    observation: ProcessObservation,
+    process_snapshot: ProcessSnapshotIndex,
+) -> _HostOwnershipVerdict:
+    current = observation
+    for _ in range(32):
+        parent_pid = current.parent_pid
+        if parent_pid is None or parent_pid == current.pid or parent_pid <= 1:
+            return _HostOwnershipVerdict(SupervisorHostOwnership.SUPERVISOR_HOST_MANAGED)
+        parent = process_snapshot.get(parent_pid)
+        if parent is None:
+            if _is_trusted_windows_shell_boundary(current, process_snapshot):
+                return _HostOwnershipVerdict(
+                    SupervisorHostOwnership.SUPERVISOR_HOST_MANAGED,
+                    launch_boundary_type=WINDOWS_EXPLORER_LAUNCH_BOUNDARY,
+                    launch_boundary_executable=current.executable,
+                    launch_boundary_verified=True,
+                )
+            return _HostOwnershipVerdict(SupervisorHostOwnership.UNKNOWN)
+        if not _parent_observation_matches(current, parent):
+            return _HostOwnershipVerdict(SupervisorHostOwnership.UNKNOWN)
+        if _is_desktop_process(parent.executable):
+            return _HostOwnershipVerdict(SupervisorHostOwnership.DESKTOP_EXTERNAL)
+        current = parent
+    return _HostOwnershipVerdict(SupervisorHostOwnership.UNKNOWN)
 
 
 def _matches_persisted_identity(

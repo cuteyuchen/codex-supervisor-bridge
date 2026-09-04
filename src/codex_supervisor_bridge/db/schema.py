@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
 
 SCHEMA_SQL = r"""
 PRAGMA foreign_keys = ON;
@@ -434,6 +434,72 @@ CREATE TABLE IF NOT EXISTS task_agent_safety (
 
 CREATE INDEX IF NOT EXISTS idx_task_agent_safety_state
 ON task_agent_safety(state, updated_at DESC);
+"""
+
+BACKEND_BINDING_MIGRATION_SQL = r"""
+CREATE TABLE IF NOT EXISTS task_backend_binding (
+    task_id TEXT PRIMARY KEY REFERENCES supervised_tasks(task_id) ON DELETE CASCADE,
+    workspace_backend TEXT NOT NULL,
+    agent_backend TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    bound_revision INTEGER NOT NULL CHECK (bound_revision >= 0),
+    bound_epoch INTEGER NOT NULL DEFAULT 1 CHECK (bound_epoch >= 1),
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_backend_binding_backends
+ON task_backend_binding(workspace_backend, agent_backend);
+"""
+
+CODEX_RUNTIME_ISOLATION_MIGRATION_SQL = r"""
+ALTER TABLE supervised_tasks
+ADD COLUMN agent_runtime_instance_id TEXT;
+
+ALTER TABLE supervised_tasks
+ADD COLUMN agent_runtime_epoch INTEGER NOT NULL DEFAULT 0
+CHECK (agent_runtime_epoch >= 0);
+
+ALTER TABLE codex_runtime_state
+ADD COLUMN runtime_instance_id TEXT;
+
+ALTER TABLE codex_runtime_state
+ADD COLUMN runtime_epoch INTEGER NOT NULL DEFAULT 0
+CHECK (runtime_epoch >= 0);
+
+ALTER TABLE codex_runtime_state
+ADD COLUMN runtime_ownership TEXT NOT NULL DEFAULT 'UNKNOWN'
+CHECK (runtime_ownership IN ('DESKTOP_EXTERNAL', 'SUPERVISOR_MANAGED', 'UNKNOWN'));
+
+ALTER TABLE codex_runtime_state
+ADD COLUMN isolation_verified INTEGER NOT NULL DEFAULT 0
+CHECK (isolation_verified IN (0, 1));
+
+ALTER TABLE codex_runtime_state
+ADD COLUMN circuit_state TEXT NOT NULL DEFAULT 'CLOSED'
+CHECK (circuit_state IN ('CLOSED', 'OPEN', 'RECOVERY_REQUIRED'));
+
+ALTER TABLE codex_runtime_state
+ADD COLUMN circuit_reason TEXT;
+
+ALTER TABLE codex_runtime_state
+ADD COLUMN interrupt_attempted INTEGER NOT NULL DEFAULT 0
+CHECK (interrupt_attempted IN (0, 1));
+
+ALTER TABLE codex_runtime_state
+ADD COLUMN last_meaningful_event_at TEXT;
+
+ALTER TABLE codex_runtime_state
+ADD COLUMN last_status_transition_at TEXT;
+
+ALTER TABLE codex_runtime_state
+ADD COLUMN last_semantic_fingerprint TEXT;
+
+ALTER TABLE codex_runtime_state
+ADD COLUMN last_observed_event_count INTEGER NOT NULL DEFAULT 0
+CHECK (last_observed_event_count >= 0);
+
+CREATE INDEX IF NOT EXISTS idx_codex_runtime_instance
+ON codex_runtime_state(runtime_instance_id, runtime_epoch);
 """
 
 OPTIONAL_FTS_SQL = r"""

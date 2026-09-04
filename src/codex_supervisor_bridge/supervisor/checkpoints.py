@@ -412,10 +412,15 @@ class CheckpointService:
         if runtime is not None and self.agent_backend is not None:
             snapshot = await self.agent_backend.observe(
                 PlanHandle(
+                    task_id=runtime.task_id,
                     operation_id=runtime.operation_id,
                     workflow_id=runtime.workflow_id,
                     thread_id=runtime.thread_id,
                     turn_id=runtime.turn_id,
+                    runtime_instance_id=runtime.runtime_instance_id,
+                    runtime_epoch=runtime.runtime_epoch,
+                    runtime_ownership=runtime.runtime_ownership,
+                    isolation_verified=runtime.isolation_verified,
                     status=runtime.remote_status or "unknown",
                 )
             )

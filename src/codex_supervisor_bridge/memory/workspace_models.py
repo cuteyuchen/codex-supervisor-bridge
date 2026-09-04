@@ -22,6 +22,13 @@ class DirectOperationStatus(str, Enum):
     RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"
 
 
+class DirectCommandSessionStatus(str, Enum):
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    INTERRUPTED = "INTERRUPTED"
+    UNKNOWN = "UNKNOWN"
+
+
 class WorkspaceBinding(BaseModel):
     task_id: str
     backend_name: str
@@ -68,3 +75,14 @@ class DirectOperationCompleteResult(BaseModel):
     workspace: WorkspaceBinding
     operation: DirectWorkspaceOperation
     reconciliation_required: bool = False
+
+
+class DirectCommandSession(BaseModel):
+    task_id: str
+    command_id: str
+    writer_epoch: int = Field(ge=1)
+    status: DirectCommandSessionStatus
+    started_revision: int = Field(ge=0)
+    completed_revision: int | None = Field(default=None, ge=0)
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)

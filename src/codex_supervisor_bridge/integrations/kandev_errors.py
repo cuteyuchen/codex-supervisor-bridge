@@ -21,3 +21,11 @@ class KandevCapabilityError(KandevError):
         message = "Kandev external MCP is missing required tools: " + ", ".join(missing_tools)
         super().__init__(message)
         self.missing_tools = missing_tools
+
+
+class KandevWorkspaceUnavailableError(KandevError):
+    """No Kandev workspace can be selected for the requested repository."""
+
+
+class KandevWorkspaceUnsupportedError(KandevError):
+    """Kandev does not expose the requested direct workspace operation."""

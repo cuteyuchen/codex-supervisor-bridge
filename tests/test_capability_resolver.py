@@ -16,6 +16,9 @@ def health(
         user_message=f"{capability} probe",
         repairable=repairable,
         technical_detail=f"technical:{capability}",
+        capabilities={"supports_isolated_runtime": True}
+        if capability in {"local-codex", "local_codex_bridge"}
+        else {},
     )
 
 
@@ -81,3 +84,21 @@ def test_unavailable_capabilities_offer_compact_repair_actions() -> None:
         "repair_codex",
         "reconnect_github",
     }
+
+
+def test_codex_capability_comes_from_codex_readiness_not_agent_health() -> None:
+    resolved = CapabilityResolver(
+        {
+            "devspace": health("devspace", BackendHealthStatus.READY),
+            "local_codex_bridge": health(
+                "local-codex",
+                BackendHealthStatus.READY,
+            ),
+            "codex": health("codex", BackendHealthStatus.DEGRADED, repairable=True),
+            "github": health("github", BackendHealthStatus.READY),
+        }
+    ).resolve()
+    codex = next(item for item in resolved.capabilities if item.label == "Codex")
+    assert codex.status == BackendHealthStatus.DEGRADED
+    assert codex.repairable is True
+    assert codex.repair_action == "repair_codex"

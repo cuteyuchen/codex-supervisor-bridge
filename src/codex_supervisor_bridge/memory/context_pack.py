@@ -7,6 +7,7 @@ from math import ceil
 from .agent_safety import AgentSafetyState, get_agent_safety
 from .checkpoint_reviews import get_checkpoint_review
 from .checkpoint_store import latest_checkpoint
+from .codex_runtime import get_codex_runtime
 from .execution import get_execution_state
 from .execution_models import ExecutionState
 from .models import (
@@ -60,6 +61,7 @@ class ContextPackBuilder:
         workspace = get_workspace_binding(self.store, task_id)
         prepared_operation = get_prepared_direct_operation(self.store, task_id)
         agent_safety = get_agent_safety(self.store, task_id)
+        codex_runtime = get_codex_runtime(self.store, task_id)
         constraints = self.store.active_constraints(task_id)
         decisions = self.store.active_decisions(task_id)
         approved_plan = self.store.approved_plan(task_id)
@@ -78,6 +80,7 @@ class ContextPackBuilder:
             )
         )
         mandatory.append(("AGENT SAFETY", self._agent_safety(agent_safety)))
+        mandatory.append(("CODEX RUNTIME", self._codex_runtime(codex_runtime)))
         mandatory.append(("USER GOAL", task.current_goal or "No explicit goal recorded."))
 
         hard_constraints = [
@@ -345,6 +348,22 @@ class ContextPackBuilder:
                 )
             )
         return "\n".join(rows)
+
+    @staticmethod
+    def _codex_runtime(runtime: object | None) -> str:
+        if runtime is None:
+            return "No Codex runtime is bound to this task."
+        return "\n".join(
+            [
+                f"Ownership: {runtime.runtime_ownership}",
+                f"Instance ID: {runtime.runtime_instance_id or '-'}",
+                f"Runtime Epoch: {runtime.runtime_epoch}",
+                f"Status: {runtime.remote_status or '-'}",
+                f"Isolation Verified: {runtime.isolation_verified}",
+                f"Circuit: {runtime.circuit_state}",
+                f"Next Action: {runtime.next_action or '-'}",
+            ]
+        )
 
     @classmethod
     def _events(cls, events: list[TaskEvent], *, empty: str) -> str:

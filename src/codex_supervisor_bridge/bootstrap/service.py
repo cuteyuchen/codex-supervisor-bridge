@@ -1,0 +1,627 @@
+from __future__ import annotations
+
+import os
+import re
+import shlex
+import shutil
+import sys
+from pathlib import Path
+
+from codex_supervisor_bridge.backends.models import BackendHealth, BackendHealthStatus
+from codex_supervisor_bridge.capabilities import CapabilityResolver
+
+from .codex_isolation import SUPERVISOR_HOST_INSTANCE_ENV
+from .configuration import AppConfig, CommandPolicy, ConfigStore, DevelopmentStyle
+from .devspace import DevSpaceBootstrap
+from .doctor import Doctor, DoctorOptions
+from .host import (
+    SUPERVISOR_HOST_AUTHORITY_ENV,
+    SUPERVISOR_HOST_AUTHORITY_VALUE,
+    SUPERVISOR_HOST_IDENTITY_PATH_ENV,
+    SUPERVISOR_HOST_IDENTITY_UNKNOWN,
+    StandaloneSupervisorHost,
+)
+from .local_codex import LocalCodexBridgeBootstrap
+from .models import BootstrapStatus, DoctorStatus, HealthStatus, RepairAction
+from .paths import AppDataPaths
+from .physical import PhysicalPathGuard, PhysicalPathVerificationError
+from .process import ManagedProcessSpec, ProcessManager
+from .remote import (
+    OpenAISecureMcpTunnelConfig,
+    OpenAISecureMcpTunnelController,
+    RemoteAccessMode,
+)
+from .repair import RepairService
+from .secrets import MemorySecretStore, SecretStore, WindowsDpapiSecretStore
+
+SUPERVISOR_STARTUP_TIMEOUT_FLOOR_SECONDS = 60.0
+
+
+class BootstrapService:
+    def __init__(
+        self,
+        *,
+        paths: AppDataPaths | None = None,
+        config_store: ConfigStore | None = None,
+        doctor: Doctor | None = None,
+        repair: RepairService | None = None,
+        process_manager: ProcessManager | None = None,
+        auto_install: bool = False,
+        host: StandaloneSupervisorHost | None = None,
+    ) -> None:
+        self.host = host or StandaloneSupervisorHost(paths=paths)
+        self.paths = self.host.paths
+        self.path_guard = self.host.path_guard
+        self.config_store = config_store or ConfigStore(
+            paths=self.paths,
+            path_guard=self.path_guard,
+        )
+        self.process_manager = process_manager or self.host.process_manager()
+        self.doctor = doctor or Doctor(
+            paths=self.paths,
+            config_store=self.config_store,
+            process_manager=self.process_manager,
+            path_guard=self.path_guard,
+        )
+        self.repair = repair or RepairService(
+            paths=self.paths,
+            config_store=self.config_store,
+            doctor=self.doctor,
+            process_manager=self.process_manager,
+            auto_install=auto_install,
+            path_guard=self.path_guard,
+        )
+
+    def status(self, *, project_directory: Path | None = None) -> BootstrapStatus:
+        doctor = self.doctor.run(DoctorOptions(project_directory=project_directory))
+        config = self.config_store.load().config
+        project = project_directory or config.basic.project_directory
+        status = (
+            HealthStatus.UNAVAILABLE
+            if self.paths.root_report.split_brain
+            else doctor.status
+        )
+        return BootstrapStatus(
+            status=status,
+            summary=_summary(status),
+            project_directory=str(project) if project else None,
+            selected_profile=_profile(config, doctor),
+            doctor=doctor,
+        )
+
+    def configure(
+        self,
+        *,
+        project_directory: Path | None = None,
+        development_style: DevelopmentStyle | None = None,
+        local_command_policy: CommandPolicy | None = None,
+        allow_chatgpt_codex_delegation: bool | None = None,
+        automatic_git_commit: bool | None = None,
+        automatic_pull_request: bool | None = None,
+        local_codex_repository: Path | None = None,
+        node_executable: str | None = None,
+    ) -> BootstrapStatus:
+        self.host.assert_ready()
+        config = self.config_store.load().config
+        if project_directory is not None:
+            config.basic.project_directory = project_directory.expanduser().resolve()
+        if development_style is not None:
+            config.basic.development_style = development_style
+        if local_command_policy is not None:
+            config.basic.local_command_policy = local_command_policy
+        if allow_chatgpt_codex_delegation is not None:
+            config.basic.allow_chatgpt_codex_delegation = allow_chatgpt_codex_delegation
+        if automatic_git_commit is not None:
+            config.basic.automatic_git_commit = automatic_git_commit
+        if automatic_pull_request is not None:
+            config.basic.automatic_pull_request = automatic_pull_request
+        if local_codex_repository is not None:
+            config.advanced.local_codex_repository = self.paths.canonicalize_path(
+                local_codex_repository
+            )
+        if node_executable is not None:
+            config.advanced.executable_paths["node"] = node_executable
+        self.config_store.save(config)
+        return self.status(project_directory=project_directory or config.basic.project_directory)
+
+    def configure_remote_access(
+        self,
+        *,
+        tunnel_id: str,
+        runtime_key: str,
+        local_mcp_url: str | None = None,
+        health_listener: str = "127.0.0.1:0",
+        runtime_secret_ref: str = "openai-tunnel-runtime",
+    ) -> BootstrapStatus:
+        """Store OpenAI tunnel metadata and the runtime key in SecretStore."""
+
+        self.host.assert_ready()
+        if not runtime_key or "\n" in runtime_key or "\r" in runtime_key:
+            raise ValueError("runtime key must be provided through hidden input")
+        config = self.config_store.load().config
+        remote = OpenAISecureMcpTunnelConfig(
+            provider=RemoteAccessMode.OPENAI_SECURE_MCP_TUNNEL,
+            tunnel_id=tunnel_id,
+            runtime_secret_ref=runtime_secret_ref,
+            local_mcp_url=local_mcp_url
+            or f"http://127.0.0.1:{config.advanced.ports.get('supervisor', 8765)}/mcp",
+            health_listener=health_listener,
+            client_version="0.0.13",
+        )
+        self._default_secret_store().set(runtime_secret_ref, runtime_key)
+        config.advanced.remote_access = remote
+        self.config_store.save(config)
+        return self.status(project_directory=config.basic.project_directory)
+
+    def repair_and_status(self, *, project_directory: Path | None = None) -> BootstrapStatus:
+        self.host.assert_ready()
+        before = self.doctor.run(DoctorOptions(project_directory=project_directory))
+        repairs = self.repair.repair(before, project_directory=project_directory)
+        after = self.status(project_directory=project_directory)
+        after.repairs = repairs
+        return after
+
+    def reconcile_app_data_plan(
+        self,
+        *,
+        selected_authority: str = "canonical",
+        legacy_root: Path | None = None,
+    ):
+        """Create an explicit two-phase AppData reconciliation plan."""
+
+        from .reconciliation import ReconciliationService
+
+        return ReconciliationService(
+            paths=self.paths,
+            path_guard=self.path_guard,
+        ).plan(
+            selected_authority=selected_authority,
+            legacy_root=legacy_root,
+        )
+
+    def reconcile_app_data_apply(
+        self,
+        *,
+        plan_id: str,
+        selected_authority: str | None = None,
+        legacy_root: Path | None = None,
+    ):
+        """Apply a previously confirmed AppData reconciliation plan."""
+
+        from .reconciliation import ReconciliationService
+
+        self.host.assert_ready()
+        return ReconciliationService(paths=self.paths, path_guard=self.path_guard).apply(
+            plan_id=plan_id,
+            selected_authority=selected_authority,
+            legacy_root=legacy_root,
+        )
+
+    def start(self, *, project_directory: Path | None = None) -> BootstrapStatus:
+        host_identity = self.host.ensure_identity()
+        if not host_identity.host_instance_id:
+            raise PhysicalPathVerificationError(
+                SUPERVISOR_HOST_IDENTITY_UNKNOWN,
+                "Supervisor Host authority identity is unavailable",
+            )
+        result = self.repair_and_status(project_directory=project_directory)
+        config = self.config_store.load().config
+        if self.paths.root_report.split_brain:
+            result.status = HealthStatus.UNAVAILABLE
+            result.summary = _summary(HealthStatus.UNAVAILABLE)
+            return result
+        if result.status == HealthStatus.UNAVAILABLE:
+            return result
+        devspace_executable = config.advanced.executable_paths.get("devspace", "devspace")
+        devspace_entrypoint = config.advanced.executable_paths.get("devspace_entrypoint")
+        workspace_health = result.doctor.component("Local workspace")
+        workspace_ready = (
+            workspace_health is not None
+            and workspace_health.status == HealthStatus.READY
+        )
+        if not workspace_ready:
+            result.repairs.append(
+                RepairAction(
+                    action="start_process:devspace",
+                    status=(
+                        workspace_health.status
+                        if workspace_health is not None
+                        else HealthStatus.DEGRADED
+                    ),
+                    message=(
+                        workspace_health.user_message
+                        if workspace_health is not None
+                        else "Local workspace needs setup."
+                    ),
+                    requires_user_action=True,
+                    advanced={
+                        **(
+                            workspace_health.advanced
+                            if workspace_health is not None
+                            else {}
+                        ),
+                        "executable": devspace_executable,
+                    },
+                )
+            )
+        elif _find_executable(devspace_executable):
+            devspace = DevSpaceBootstrap.from_app_data(
+                self.paths,
+                port=config.advanced.ports.get("devspace", 39000),
+                project_directory=project_directory or config.basic.project_directory,
+                executable=devspace_executable,
+                entrypoint=devspace_entrypoint,
+                path_guard=self.path_guard,
+            )
+            try:
+                component = self.process_manager.start(
+                    devspace.process_spec(
+                        startup_timeout=config.advanced.startup_timeout_seconds,
+                        shutdown_timeout=config.advanced.shutdown_timeout_seconds,
+                    )
+                )
+                result.repairs.append(
+                    RepairAction(
+                        action="start_process:devspace",
+                        status=(
+                            HealthStatus.READY
+                            if component.status == "RUNNING"
+                            else HealthStatus.UNAVAILABLE
+                        ),
+                        message=(
+                            "Local workspace started."
+                            if component.status == "RUNNING"
+                            else "Local workspace could not start."
+                        ),
+                        advanced=component.as_dict(),
+                    )
+                )
+            except (OSError, ValueError) as exc:
+                result.repairs.append(
+                    RepairAction(
+                        action="start_process:devspace",
+                        status=HealthStatus.UNAVAILABLE,
+                        message="Local workspace could not start.",
+                        advanced={"technical_detail": str(exc)},
+                    )
+                )
+        port = config.advanced.ports.get("supervisor")
+        devspace_port = config.advanced.ports.get("devspace")
+        if port is None or devspace_port is None:
+            return result
+        supervisor_log = self.paths.logs / "supervisor.log"
+        readiness_offset = _file_size(supervisor_log, path_guard=self.path_guard)
+        spec = ManagedProcessSpec(
+            name="supervisor",
+            command=[
+                sys.executable,
+                "-m",
+                "codex_supervisor_bridge.bootstrap.host",
+                "--database",
+                str(config.advanced.sqlite_path or self.paths.database),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--devspace-mcp-url",
+                f"http://127.0.0.1:{devspace_port}/mcp",
+            ],
+            startup_timeout=max(
+                config.advanced.startup_timeout_seconds,
+                SUPERVISOR_STARTUP_TIMEOUT_FLOOR_SECONDS,
+            ),
+            shutdown_timeout=config.advanced.shutdown_timeout_seconds,
+            env={
+                **os.environ,
+                "CODEX_SUPERVISOR_DATA_DIR": str(self.paths.filesystem_root),
+                SUPERVISOR_HOST_AUTHORITY_ENV: SUPERVISOR_HOST_AUTHORITY_VALUE,
+                SUPERVISOR_HOST_INSTANCE_ENV: host_identity.host_instance_id,
+                SUPERVISOR_HOST_IDENTITY_PATH_ENV: str(self.host.host_identity_path),
+            },
+            readiness_probe=lambda: _read_readiness_marker(
+                supervisor_log,
+                start_offset=readiness_offset,
+                path_guard=self.path_guard,
+            )
+            is not None,
+        )
+        try:
+            state = self.process_manager.start(spec)
+        except (OSError, ValueError) as exc:
+            result.repairs.append(
+                RepairAction(
+                    action="start_supervisor",
+                    status=HealthStatus.UNAVAILABLE,
+                    message="Local development environment could not start.",
+                    requires_user_action=False,
+                    advanced={"technical_detail": str(exc)},
+                )
+            )
+            return result
+        readiness = _read_readiness_marker(state.log_path, path_guard=self.path_guard)
+        start_status = (
+            HealthStatus.READY
+            if state.status == "RUNNING" and (readiness is None or readiness == HealthStatus.READY)
+            else HealthStatus.DEGRADED
+            if state.status == "RUNNING"
+            else HealthStatus.UNAVAILABLE
+        )
+        start_action = RepairAction(
+            action="start_supervisor",
+            status=start_status,
+            message=(
+                "Local development environment started."
+                if state.status == "RUNNING" and readiness == HealthStatus.READY
+                else "Local development environment started with a repair needed."
+                if state.status == "RUNNING"
+                else "Local development environment could not start."
+            ),
+            advanced={**state.as_dict(), "readiness": readiness.value if readiness else None},
+        )
+        result.repairs.append(start_action)
+        control_health = result.doctor.component("Codex control")
+        lcb_command = config.advanced.process_commands.get("local_codex_bridge")
+        launch: list[str] | None = None
+        if lcb_command and lcb_command.strip():
+            launch = shlex.split(lcb_command, posix=False)
+        elif config.advanced.local_codex_repository:
+            try:
+                launch = LocalCodexBridgeBootstrap.from_repository(
+                    config.advanced.local_codex_repository,
+                    node_executable=config.advanced.executable_paths.get("node", "node"),
+                ).config.launch_command
+            except FileNotFoundError as exc:
+                launch = None
+                result.repairs.append(
+                    RepairAction(
+                        action="agent_session:local_codex_bridge",
+                        status=HealthStatus.UNAVAILABLE,
+                        message="Codex control needs an update or build.",
+                        requires_user_action=True,
+                        advanced={"technical_detail": str(exc)},
+                    )
+                )
+        if launch:
+            if control_health is not None and control_health.status != HealthStatus.READY:
+                result.repairs.append(
+                    RepairAction(
+                        action="agent_session:local_codex_bridge",
+                        status=control_health.status,
+                        message=control_health.user_message,
+                        requires_user_action=True,
+                        advanced={**dict(control_health.advanced), "launch_command": launch},
+                    )
+                )
+            else:
+                result.repairs.append(
+                    RepairAction(
+                        action="agent_session:local_codex_bridge",
+                        status=HealthStatus.READY,
+                        message="Codex control is ready.",
+                        requires_user_action=False,
+                        advanced={
+                            "managed_by": "agent_session_manager",
+                            "daemon": False,
+                            "launch_command": launch,
+                        },
+                    )
+                )
+        for name, command in config.advanced.process_commands.items():
+            if name == "local_codex_bridge":
+                continue
+            if name == "supervisor" or not command.strip():
+                continue
+            try:
+                argv = shlex.split(command, posix=False)
+                component = self.process_manager.start(
+                    ManagedProcessSpec(
+                        name=name,
+                        command=argv,
+                        startup_timeout=config.advanced.startup_timeout_seconds,
+                        shutdown_timeout=config.advanced.shutdown_timeout_seconds,
+                    )
+                )
+            except (OSError, ValueError) as exc:
+                result.repairs.append(
+                    RepairAction(
+                        action=f"start_process:{name}",
+                        status=HealthStatus.UNAVAILABLE,
+                        message="A local development component could not start.",
+                        requires_user_action=False,
+                        advanced={"technical_detail": str(exc)},
+                    )
+                )
+                continue
+            result.repairs.append(
+                RepairAction(
+                    action=f"start_process:{name}",
+                    status=HealthStatus.READY if component.status == "RUNNING" else HealthStatus.UNAVAILABLE,
+                    message="Local development component started." if component.status == "RUNNING" else "Local development component could not start.",
+                    advanced=component.as_dict(),
+                )
+            )
+        remote = config.advanced.remote_access
+        if remote is not None and remote.provider == RemoteAccessMode.OPENAI_SECURE_MCP_TUNNEL:
+            executable = config.advanced.executable_paths.get("tunnel_client")
+            remote_path_error: PhysicalPathVerificationError | None = None
+            if executable is None:
+                managed = self.paths.components / "openai-tunnel-client" / "current.json"
+                try:
+                    import json
+
+                    self.path_guard.verify_subpath(
+                        managed,
+                        managed.parent,
+                        role="components",
+                    )
+                    pointer = json.loads(managed.read_text(encoding="utf-8"))
+                    managed_root = self.paths.canonicalize_path(str(pointer["path"]))
+                    self.path_guard.verify_subpath(
+                        managed_root,
+                        self.paths.components,
+                        role="components",
+                        require_directory=True,
+                    )
+                    executable_path = managed_root / "tunnel-client.exe"
+                    self.path_guard.verify_subpath(
+                        executable_path,
+                        managed_root,
+                        role="components",
+                    )
+                    executable = str(executable_path)
+                except PhysicalPathVerificationError as exc:
+                    remote_path_error = exc
+                except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                    executable = "tunnel-client"
+            if remote_path_error is not None:
+                result.repairs.append(
+                    RepairAction(
+                        action="start_remote_access",
+                        status=HealthStatus.DEGRADED,
+                        message="ChatGPT connection needs a verified Supervisor component path.",
+                        requires_user_action=True,
+                        advanced={
+                            "failure_code": remote_path_error.code,
+                            "technical_detail": str(remote_path_error),
+                        },
+                    )
+                )
+            else:
+                controller = OpenAISecureMcpTunnelController(
+                    process_manager=self.process_manager,
+                    secret_store=self._default_secret_store(),
+                    executable=executable,
+                    runtime_dir=self.paths.runtime,
+                    path_guard=self.path_guard,
+                )
+                supervisor_state = self.process_manager.health("supervisor")
+                remote_health = controller.start(
+                    remote,
+                    supervisor_ready=supervisor_state.status == "RUNNING" and readiness == HealthStatus.READY,
+                )
+                result.repairs.append(
+                    RepairAction(
+                        action="start_remote_access",
+                        status=(
+                            HealthStatus.READY
+                            if remote_health.ready and remote_health.healthy
+                            else HealthStatus.DEGRADED
+                        ),
+                        message=(
+                            "ChatGPT connection is ready."
+                            if remote_health.ready and remote_health.healthy
+                            else "ChatGPT connection is not ready."
+                        ),
+                        requires_user_action=remote_health.state
+                        in {"TUNNEL_NOT_CONFIGURED", "TUNNEL_RUNTIME_KEY_MISSING"},
+                        advanced=remote_health.model_dump(mode="json"),
+                    )
+                )
+        final = self.status(project_directory=project_directory)
+        if readiness is not None and readiness != HealthStatus.READY:
+            final.status = readiness
+            final.summary = _summary(readiness)
+        final.repairs = [*result.repairs]
+        return final
+
+    def _default_secret_store(self) -> SecretStore:
+        if sys.platform == "win32":
+            return WindowsDpapiSecretStore(
+                self.paths.config / "secrets",
+                path_guard=self.path_guard,
+            )
+        return MemorySecretStore()
+
+
+def _summary(status: HealthStatus) -> str:
+    return {
+        HealthStatus.READY: "开发环境已就绪。",
+        HealthStatus.DEGRADED: "开发环境可以使用，但有项目需要修复或一次性设置。",
+        HealthStatus.UNAVAILABLE: "开发环境暂时不可用。",
+        HealthStatus.REPAIRING: "正在修复开发环境。",
+    }[status]
+
+
+def _profile(config: AppConfig, doctor: DoctorStatus) -> str:
+    style = config.basic.development_style.value
+    if style == "web_first":
+        return "direct"
+    if style == "codex_first":
+        return "codex_supervised"
+    health: dict[str, BackendHealth] = {}
+    aliases = {
+        "devspace": "Local workspace",
+        "local_codex_bridge": "Codex control",
+        "kandev": "Fallback workspace",
+        "control_plane": "Fallback control",
+        "codex": "Codex",
+        "github": "GitHub",
+    }
+    for name, label in aliases.items():
+        item = doctor.component(label)
+        if item is None:
+            continue
+        mapped = {
+            HealthStatus.READY: BackendHealthStatus.READY,
+            HealthStatus.DEGRADED: BackendHealthStatus.DEGRADED,
+            HealthStatus.UNAVAILABLE: BackendHealthStatus.UNAVAILABLE,
+            HealthStatus.REPAIRING: BackendHealthStatus.DEGRADED,
+        }[item.status]
+        health[name] = BackendHealth(
+            capability=name,
+            status=mapped,
+            user_message=item.user_message,
+            repairable=item.repairable,
+            technical_detail=str(item.advanced.get("technical_detail", "")),
+        )
+    return CapabilityResolver(health).resolve().profile
+
+
+def _find_executable(value: str) -> str | None:
+    return value if Path(value).is_file() else shutil.which(value)
+
+
+def _read_readiness_marker(
+    log_path: Path | None,
+    *,
+    start_offset: int = 0,
+    path_guard: PhysicalPathGuard | None = None,
+) -> HealthStatus | None:
+    if log_path is None:
+        return None
+    try:
+        guard = path_guard or PhysicalPathGuard()
+        evidence = guard.verify_root(log_path, role="runtime")
+        if not evidence.exists:
+            return None
+        with log_path.open("rb") as handle:
+            handle.seek(start_offset)
+            text = handle.read().decode("utf-8", errors="replace")
+    except (OSError, PhysicalPathVerificationError):
+        return None
+    for line in reversed(text.splitlines()):
+        if "SUPERVISOR_READY" not in line:
+            continue
+        match = re.search(r"status=([A-Z_]+)", line)
+        if match is None:
+            return None
+        try:
+            return HealthStatus(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _readiness_marker_present(log_path: Path | None) -> bool:
+    return _read_readiness_marker(log_path) is not None
+
+
+def _file_size(path: Path, *, path_guard: PhysicalPathGuard | None = None) -> int:
+    try:
+        guard = path_guard or PhysicalPathGuard()
+        evidence = guard.verify_root(path, role="runtime")
+        if not evidence.exists:
+            return 0
+        return path.stat().st_size
+    except (OSError, PhysicalPathVerificationError):
+        return 0

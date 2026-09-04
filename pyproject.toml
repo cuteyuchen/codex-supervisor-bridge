@@ -16,6 +16,8 @@ dev = [
 
 [project.scripts]
 codex-supervisor-bridge = "codex_supervisor_bridge.mcp.server:main"
+codex-supervisor = "codex_supervisor_bridge.mcp.server:main"
+codex-supervisor-host = "codex_supervisor_bridge.bootstrap.host:main"
 
 [build-system]
 requires = ["hatchling"]

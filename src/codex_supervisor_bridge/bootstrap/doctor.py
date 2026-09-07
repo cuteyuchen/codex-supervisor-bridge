@@ -775,6 +775,7 @@ class Doctor:
                 live_failure = runtime_process_chain_failure(
                     metadata,
                     self._codex_process_inspector.snapshot(),
+                    path_guard=self._path_guard,
                 )
         advanced["live_identity_verified"] = live_failure is None
         if live_failure is not None:

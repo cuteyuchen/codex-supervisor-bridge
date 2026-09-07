@@ -15,6 +15,8 @@ from .codex_isolation import (
     ProcessInspector,
     ProcessObservation,
     ProcessSnapshotIndex,
+    ProxyLaunchMode,
+    ProxyLaunchProvenance,
     RuntimeOwnershipError,
     SupervisorCodexRuntimeManager,
 )
@@ -228,6 +230,8 @@ __all__ = [
     "ProcessInspector",
     "ProcessObservation",
     "ProcessSnapshotIndex",
+    "ProxyLaunchMode",
+    "ProxyLaunchProvenance",
     "ProcessState",
     "RepairAction",
     "RepairService",

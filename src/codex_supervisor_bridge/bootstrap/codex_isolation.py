@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import ntpath
 import os
 import platform
 import re
@@ -14,6 +15,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -28,7 +30,7 @@ from .process import CodexProcessOwnership
 
 logger = logging.getLogger(__name__)
 
-RUNTIME_METADATA_VERSION = 2
+RUNTIME_METADATA_VERSION = 3
 INSTANCE_PREFIX = "csb-codex-"
 SUPERVISOR_RUNTIME_ENV = "CODEX_SUPERVISOR_RUNTIME_INSTANCE_ID"
 SUPERVISOR_EPOCH_ENV = "CODEX_SUPERVISOR_RUNTIME_EPOCH"
@@ -50,6 +52,11 @@ class LcbRuntimeIsolationUnsupportedError(CodexRuntimeIsolationError):
 
 class RuntimeOwnershipError(CodexRuntimeIsolationError):
     """A destructive lifecycle action lacks verified ownership."""
+
+
+class ProxyLaunchMode(StrEnum):
+    DIRECT = "DIRECT"
+    WINDOWS_VENV_TRAMPOLINE = "WINDOWS_VENV_TRAMPOLINE"
 
 
 class ProcessObservation(BaseModel):
@@ -80,6 +87,21 @@ class ProcessSnapshotIndex:
         return self.by_pid.get(pid)
 
 
+@dataclass(frozen=True, slots=True)
+class ProxyLaunchProvenance:
+    verified: bool
+    mode: ProxyLaunchMode | None = None
+    proxy_process: ProcessObservation | None = None
+    launcher_process: ProcessObservation | None = None
+    failure_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _WindowsVenvLaunchSpec:
+    launcher_executable: str
+    base_executable: str
+
+
 class CodexRuntimeMetadata(BaseModel):
     schema_version: int = RUNTIME_METADATA_VERSION
     instance_id: str
@@ -97,6 +119,8 @@ class CodexRuntimeMetadata(BaseModel):
     supervisor_parent_pid: int
     supervisor_host_instance_id: str | None = None
     supervisor_parent_process: ProcessObservation | None = None
+    proxy_launch_mode: ProxyLaunchMode | None = None
+    proxy_launcher_process: ProcessObservation | None = None
     proxy_process: ProcessObservation | None = None
     lcb_process: ProcessObservation | None = None
     app_server_process: ProcessObservation | None = None
@@ -137,6 +161,12 @@ class CodexRuntimeMetadata(BaseModel):
             else None,
             "runtime_contract": self.lcb_runtime_contract,
             "hardening_revision": self.lcb_hardening_revision,
+            "proxy_launch_mode": self.proxy_launch_mode.value
+            if self.proxy_launch_mode
+            else None,
+            "proxy_launcher_process": self.proxy_launcher_process.model_dump(mode="json")
+            if self.proxy_launcher_process
+            else None,
             "proxy_process": self.proxy_process.model_dump(mode="json")
             if self.proxy_process
             else None,
@@ -484,6 +514,17 @@ class SupervisorCodexRuntimeManager:
             )
         if self.metadata is None:
             raise CodexRuntimeIsolationError("Supervisor Codex runtime is not prepared")
+        spec, failure = _windows_venv_launch_spec()
+        if failure is not None and _windows_venv_active():
+            raise LcbRuntimeIsolationUnsupportedError(
+                "LCB_RUNTIME_ISOLATION_UNSUPPORTED: " + failure
+            )
+        if spec is not None:
+            path_failure = _proxy_launch_path_failure(spec, self.path_guard)
+            if path_failure is not None:
+                raise LcbRuntimeIsolationUnsupportedError(
+                    "LCB_RUNTIME_ISOLATION_UNSUPPORTED: " + path_failure
+                )
         return [
             sys.executable,
             "-m",
@@ -494,7 +535,7 @@ class SupervisorCodexRuntimeManager:
             *[str(item) for item in launch_command],
         ]
 
-    def refresh(self) -> CodexRuntimeMetadata:
+    def refresh(self, *, verify_live: bool = True) -> CodexRuntimeMetadata:
         if self.metadata is None:
             raise CodexRuntimeIsolationError("Supervisor Codex runtime is not prepared")
         metadata_path = self.metadata_path
@@ -528,8 +569,9 @@ class SupervisorCodexRuntimeManager:
             )
         except (OSError, ValueError, TypeError) as exc:
             return self._fail("CODEX_RUNTIME_OWNERSHIP_UNKNOWN", type(exc).__name__)
-        if (
-            observed.instance_id != self.metadata.instance_id
+        immutable_identity_changed = (
+            observed.schema_version != self.metadata.schema_version
+            or observed.instance_id != self.metadata.instance_id
             or observed.runtime_epoch != self.metadata.runtime_epoch
             or observed.lcb_runtime_contract != self.metadata.lcb_runtime_contract
             or observed.lcb_hardening_revision != self.metadata.lcb_hardening_revision
@@ -543,12 +585,34 @@ class SupervisorCodexRuntimeManager:
             or observed.supervisor_host_instance_id
             != self.metadata.supervisor_host_instance_id
             or observed.supervisor_parent_process != self.metadata.supervisor_parent_process
-        ):
+        )
+        trusted_chain_changed = bool(
+            self.metadata.proxy_process is not None
+            and (
+                observed.proxy_launch_mode != self.metadata.proxy_launch_mode
+                or observed.proxy_launcher_process != self.metadata.proxy_launcher_process
+                or observed.proxy_process != self.metadata.proxy_process
+                or observed.lcb_process != self.metadata.lcb_process
+                or observed.app_server_process != self.metadata.app_server_process
+            )
+        )
+        if immutable_identity_changed or trusted_chain_changed:
             return self._fail(
                 "CODEX_RUNTIME_OWNERSHIP_UNKNOWN",
                 "runtime metadata identity/token mismatch",
             )
         self.metadata = observed
+        if verify_live and observed.isolation_verified:
+            live_failure = runtime_process_chain_failure(
+                observed,
+                self._inspector.snapshot(),
+                path_guard=self.path_guard,
+            )
+            if live_failure is not None:
+                return self._fail(
+                    "CODEX_RUNTIME_OWNERSHIP_UNKNOWN",
+                    live_failure,
+                )
         return observed
 
     def wait_until_verified(self, timeout: float = 15.0) -> CodexRuntimeMetadata:
@@ -579,7 +643,7 @@ class SupervisorCodexRuntimeManager:
     def verify_metadata(self, metadata: CodexRuntimeMetadata) -> CodexRuntimeMetadata:
         """Validate fake or live metadata without performing a lifecycle action."""
 
-        reason = runtime_verification_failure(metadata)
+        reason = runtime_verification_failure(metadata, path_guard=self.path_guard)
         runtime_directory = Path(metadata.runtime_directory)
         if reason is None and runtime_directory.parent != self.runtime_root:
             reason = "Supervisor runtime directory is outside the canonical runtime root"
@@ -605,45 +669,29 @@ class SupervisorCodexRuntimeManager:
 
     def assert_destructive_lifecycle_allowed(self) -> None:
         self.path_guard.verify_root(self.runtime_root, role="runtime", require_directory=True)
-        metadata = self.refresh()
+        metadata = self.refresh(verify_live=False)
         if metadata.ownership != CodexProcessOwnership.SUPERVISOR_MANAGED:
             raise RuntimeOwnershipError(
-                "CODEX_RUNTIME_OWNERSHIP_UNKNOWN: destructive lifecycle refused"
+                "CODEX_RUNTIME_OWNERSHIP_UNKNOWN: "
+                + (metadata.technical_detail or "destructive lifecycle refused")
             )
         if self._token is None or _fingerprint(self._token) != metadata.ownership_token_hash:
             raise RuntimeOwnershipError(
                 "CODEX_RUNTIME_OWNERSHIP_UNKNOWN: ownership token mismatch"
             )
-        if runtime_verification_failure(metadata) is not None:
+        if runtime_verification_failure(metadata, path_guard=self.path_guard) is not None:
             raise RuntimeOwnershipError(
                 "CODEX_RUNTIME_OWNERSHIP_UNKNOWN: persisted process chain is not verified"
             )
-        processes = {item.pid: item for item in self._inspector.snapshot()}
-        if self.metadata.supervisor_parent_process is not None:
-            current_parent = processes.get(self.metadata.supervisor_parent_process.pid)
-            if current_parent is None or not _same_observation_identity(
-                self.metadata.supervisor_parent_process,
-                current_parent,
-            ):
-                raise RuntimeOwnershipError(
-                    "CODEX_RUNTIME_OWNERSHIP_UNKNOWN: Supervisor parent identity changed"
-                )
-        for expected in (
-            metadata.proxy_process,
-            metadata.lcb_process,
-            metadata.app_server_process,
-        ):
-            if expected is None:
-                continue
-            current = processes.get(expected.pid)
-            if current is None:
-                raise RuntimeOwnershipError(
-                    "CODEX_RUNTIME_OWNERSHIP_UNKNOWN: managed process is not running"
-                )
-            if not _same_observation_identity(expected, current):
-                raise RuntimeOwnershipError(
-                    "CODEX_RUNTIME_OWNERSHIP_UNKNOWN: process identity changed"
-                )
+        live_failure = runtime_process_chain_failure(
+            metadata,
+            self._inspector.snapshot(),
+            path_guard=self.path_guard,
+        )
+        if live_failure is not None:
+            raise RuntimeOwnershipError(
+                f"CODEX_RUNTIME_OWNERSHIP_UNKNOWN: {live_failure}"
+            )
 
     def mark_degraded(self, code: str, detail: str) -> CodexRuntimeMetadata:
         return self._fail(code, detail)
@@ -790,7 +838,146 @@ def _source_codex_home(environment: Mapping[str, str]) -> Path:
     return Path(configured).expanduser() if configured else Path.home() / ".codex"
 
 
-def runtime_verification_failure(metadata: CodexRuntimeMetadata) -> str | None:
+def proxy_launch_provenance(
+    persisted_host: ProcessObservation,
+    proxy_pid: int,
+    process_snapshot: ProcessSnapshotIndex,
+    *,
+    expected_proxy: ProcessObservation | None = None,
+    expected_mode: ProxyLaunchMode | None = None,
+    expected_launcher: ProcessObservation | None = None,
+    path_guard: PhysicalPathGuard | None = None,
+) -> ProxyLaunchProvenance:
+    """Verify Host -> [one exact Windows venv launcher] -> proxy ownership."""
+
+    def failed(
+        reason: str,
+        *,
+        proxy: ProcessObservation | None = None,
+        launcher: ProcessObservation | None = None,
+    ) -> ProxyLaunchProvenance:
+        return ProxyLaunchProvenance(
+            verified=False,
+            proxy_process=proxy,
+            launcher_process=launcher,
+            failure_reason=reason,
+        )
+
+    if not _observation_identity_complete(persisted_host):
+        return failed("persisted Supervisor Host process identity is incomplete")
+    current_host = process_snapshot.get(persisted_host.pid)
+    if current_host is None:
+        return failed("persisted Supervisor Host process is not present in the process snapshot")
+    if not process_observation_matches(persisted_host, current_host):
+        return failed("persisted Supervisor Host process identity changed")
+
+    proxy = process_snapshot.get(proxy_pid)
+    if proxy is None:
+        return failed("runtime proxy process is not present in the process snapshot")
+    if not _observation_identity_complete(proxy):
+        return failed("runtime proxy process identity is incomplete", proxy=proxy)
+    if expected_proxy is not None and not process_observation_matches(expected_proxy, proxy):
+        return failed("runtime proxy process identity changed", proxy=proxy)
+
+    if process_parent_matches(proxy, current_host):
+        if expected_mode not in {None, ProxyLaunchMode.DIRECT}:
+            return failed(
+                "runtime proxy launch mode changed from the persisted provenance",
+                proxy=proxy,
+            )
+        if expected_launcher is not None:
+            return failed(
+                "direct runtime proxy provenance unexpectedly contains a launcher process",
+                proxy=proxy,
+            )
+        return ProxyLaunchProvenance(
+            verified=True,
+            mode=ProxyLaunchMode.DIRECT,
+            proxy_process=proxy,
+        )
+
+    if expected_mode == ProxyLaunchMode.DIRECT:
+        return failed("runtime proxy is not a direct child of the Supervisor Host", proxy=proxy)
+
+    spec, spec_failure = _windows_venv_launch_spec()
+    if spec_failure is not None or spec is None:
+        return failed(
+            spec_failure or "Windows venv launch specification is unavailable",
+            proxy=proxy,
+        )
+    if expected_mode not in {None, ProxyLaunchMode.WINDOWS_VENV_TRAMPOLINE}:
+        return failed(
+            "runtime proxy launch mode is not a verified Windows venv trampoline",
+            proxy=proxy,
+        )
+    if expected_mode == ProxyLaunchMode.WINDOWS_VENV_TRAMPOLINE and expected_launcher is None:
+        return failed("persisted Windows venv launcher process identity is missing", proxy=proxy)
+
+    launcher = process_snapshot.get(proxy.parent_pid or -1)
+    if launcher is None:
+        return failed(
+            "runtime proxy parent is not present as the verified Windows venv launcher",
+            proxy=proxy,
+        )
+    if not _observation_identity_complete(launcher):
+        return failed(
+            "Windows venv launcher process identity is incomplete",
+            proxy=proxy,
+            launcher=launcher,
+        )
+    if expected_launcher is not None and not process_observation_matches(
+        expected_launcher,
+        launcher,
+    ):
+        return failed(
+            "Windows venv launcher process identity changed",
+            proxy=proxy,
+            launcher=launcher,
+        )
+    if not _same_executable(
+        launcher.executable,
+        spec.launcher_executable,
+        windows=True,
+    ):
+        return failed(
+            "runtime proxy parent is not the exact current venv Python launcher",
+            proxy=proxy,
+            launcher=launcher,
+        )
+    if not _same_executable(proxy.executable, spec.base_executable, windows=True):
+        return failed(
+            "runtime proxy executable is not sys._base_executable",
+            proxy=proxy,
+            launcher=launcher,
+        )
+    path_failure = _proxy_launch_path_failure(spec, path_guard)
+    if path_failure is not None:
+        return failed(path_failure, proxy=proxy, launcher=launcher)
+    if not process_parent_matches(proxy, launcher, windows=True):
+        return failed(
+            "runtime proxy parent metadata does not match the venv launcher observation",
+            proxy=proxy,
+            launcher=launcher,
+        )
+    if not process_parent_matches(launcher, current_host, windows=True):
+        return failed(
+            "Windows venv launcher parent identity does not match the Supervisor Host",
+            proxy=proxy,
+            launcher=launcher,
+        )
+    return ProxyLaunchProvenance(
+        verified=True,
+        mode=ProxyLaunchMode.WINDOWS_VENV_TRAMPOLINE,
+        proxy_process=proxy,
+        launcher_process=launcher,
+    )
+
+
+def runtime_verification_failure(
+    metadata: CodexRuntimeMetadata,
+    *,
+    path_guard: PhysicalPathGuard | None = None,
+) -> str | None:
     desktop_pids = {item.pid for item in metadata.desktop_processes}
     proxy = metadata.proxy_process
     lcb = metadata.lcb_process
@@ -819,7 +1006,12 @@ def runtime_verification_failure(metadata: CodexRuntimeMetadata) -> str | None:
         return "runtime ownership is not SUPERVISOR_MANAGED"
     if proxy is None or lcb is None or app_server is None:
         return "process chain metadata is incomplete"
-    if len({proxy.pid, lcb.pid, app_server.pid}) != 3:
+    if metadata.proxy_launch_mode is None:
+        return "runtime proxy launch mode is missing"
+    process_chain = [metadata.supervisor_parent_process, proxy, lcb, app_server]
+    if metadata.proxy_launcher_process is not None:
+        process_chain.append(metadata.proxy_launcher_process)
+    if len({process.pid for process in process_chain}) != len(process_chain):
         return "Supervisor runtime process identities are not distinct"
     for label, process in (
         ("proxy", proxy),
@@ -828,24 +1020,31 @@ def runtime_verification_failure(metadata: CodexRuntimeMetadata) -> str | None:
     ):
         if not _observation_identity_complete(process):
             return f"{label} process identity is incomplete"
-    if proxy.parent_pid != metadata.supervisor_parent_pid:
-        return "runtime proxy is not a child of the Supervisor process"
-    if not _same_observation_identity(
+    provenance_snapshot = ProcessSnapshotIndex.from_observations(
+        [
+            metadata.supervisor_parent_process,
+            proxy,
+            *(
+                [metadata.proxy_launcher_process]
+                if metadata.proxy_launcher_process is not None
+                else []
+            ),
+        ]
+    )
+    provenance = proxy_launch_provenance(
         metadata.supervisor_parent_process,
-        ProcessObservation(
-            pid=proxy.parent_pid,
-            creation_time=proxy.parent_creation_time or "",
-            executable=proxy.parent_executable or "",
-            command_line_fingerprint=metadata.supervisor_parent_process.command_line_fingerprint,
-            parent_pid=metadata.supervisor_parent_process.parent_pid,
-            parent_creation_time=metadata.supervisor_parent_process.parent_creation_time,
-            parent_executable=metadata.supervisor_parent_process.parent_executable,
-        ),
-    ):
-        return "runtime proxy parent identity does not match the Supervisor Host"
-    if not _parent_identity_matches(lcb, proxy):
+        proxy.pid,
+        provenance_snapshot,
+        expected_proxy=proxy,
+        expected_mode=metadata.proxy_launch_mode,
+        expected_launcher=metadata.proxy_launcher_process,
+        path_guard=path_guard,
+    )
+    if not provenance.verified:
+        return provenance.failure_reason or "runtime proxy launch provenance is not verified"
+    if not process_parent_matches(lcb, proxy):
         return "LCB parent identity does not match the Supervisor runtime proxy"
-    if not _parent_identity_matches(app_server, lcb):
+    if not process_parent_matches(app_server, lcb):
         return "Codex app-server parent identity does not match the owned LCB process"
     if not app_server.app_server_stdio:
         return "Codex child is not an app-server stdio instance"
@@ -861,22 +1060,36 @@ def runtime_verification_failure(metadata: CodexRuntimeMetadata) -> str | None:
 def runtime_process_chain_failure(
     metadata: CodexRuntimeMetadata,
     processes: Sequence[ProcessObservation],
+    *,
+    path_guard: PhysicalPathGuard | None = None,
 ) -> str | None:
-    reason = runtime_verification_failure(metadata)
+    reason = runtime_verification_failure(metadata, path_guard=path_guard)
     if reason is not None:
         return reason
-    current_by_pid = {item.pid: item for item in processes}
+    if metadata.supervisor_parent_process is None or metadata.proxy_process is None:
+        return "runtime proxy launch provenance metadata is incomplete"
+    process_snapshot = ProcessSnapshotIndex.from_observations(processes)
+    provenance = proxy_launch_provenance(
+        metadata.supervisor_parent_process,
+        metadata.proxy_process.pid,
+        process_snapshot,
+        expected_proxy=metadata.proxy_process,
+        expected_mode=metadata.proxy_launch_mode,
+        expected_launcher=metadata.proxy_launcher_process,
+        path_guard=path_guard,
+    )
+    if not provenance.verified:
+        return provenance.failure_reason or "runtime proxy launch provenance changed"
     for label, expected in (
-        ("runtime proxy", metadata.proxy_process),
         ("LCB", metadata.lcb_process),
         ("Codex app-server", metadata.app_server_process),
     ):
         if expected is None:
             return f"{label} process identity is missing"
-        current = current_by_pid.get(expected.pid)
+        current = process_snapshot.get(expected.pid)
         if current is None:
             return f"{label} process is not running"
-        if not _same_observation_identity(expected, current):
+        if not process_observation_matches(expected, current):
             return f"{label} process identity changed"
     return None
 
@@ -895,36 +1108,113 @@ def _observation_identity_complete(process: ProcessObservation) -> bool:
     )
 
 
-def _parent_identity_matches(
+def process_parent_matches(
     child: ProcessObservation,
     parent: ProcessObservation,
+    *,
+    windows: bool | None = None,
 ) -> bool:
     return bool(
         child.parent_pid == parent.pid
         and child.parent_creation_time == parent.creation_time
-        and _same_executable(child.parent_executable, parent.executable)
+        and _same_executable(
+            child.parent_executable,
+            parent.executable,
+            windows=windows,
+        )
     )
 
 
-def _same_observation_identity(
+def process_observation_matches(
     expected: ProcessObservation,
     current: ProcessObservation,
+    *,
+    windows: bool | None = None,
 ) -> bool:
     return bool(
         expected.pid == current.pid
         and expected.creation_time == current.creation_time
-        and _same_executable(expected.executable, current.executable)
+        and _same_executable(expected.executable, current.executable, windows=windows)
         and expected.command_line_fingerprint == current.command_line_fingerprint
         and expected.parent_pid == current.parent_pid
         and expected.parent_creation_time == current.parent_creation_time
-        and _same_executable(expected.parent_executable, current.parent_executable)
+        and _same_executable(
+            expected.parent_executable,
+            current.parent_executable,
+            windows=windows,
+        )
+        and expected.app_server_stdio == current.app_server_stdio
     )
 
 
-def _same_executable(left: str | None, right: str | None) -> bool:
+def _same_executable(
+    left: str | None,
+    right: str | None,
+    *,
+    windows: bool | None = None,
+) -> bool:
     if not left or not right:
         return False
-    return os.path.normcase(left) == os.path.normcase(right)
+    use_windows = platform.system() == "Windows" if windows is None else windows
+    if use_windows:
+        return _windows_path_key(left) == _windows_path_key(right)
+    return os.path.normcase(os.path.normpath(left)) == os.path.normcase(
+        os.path.normpath(right)
+    )
+
+
+def _windows_venv_active() -> bool:
+    prefix = str(getattr(sys, "prefix", "") or "")
+    base_prefix = str(getattr(sys, "base_prefix", "") or "")
+    return bool(
+        platform.system() == "Windows"
+        and prefix
+        and base_prefix
+        and _windows_path_key(prefix) != _windows_path_key(base_prefix)
+    )
+
+
+def _windows_venv_launch_spec() -> tuple[_WindowsVenvLaunchSpec | None, str | None]:
+    if platform.system() != "Windows":
+        return None, "runtime proxy has an intermediate parent on a non-Windows platform"
+    if not _windows_venv_active():
+        return None, "runtime proxy has an intermediate parent outside a CPython venv"
+    prefix = str(sys.prefix)
+    launcher = str(getattr(sys, "executable", "") or "")
+    base_executable = str(getattr(sys, "_base_executable", "") or "")
+    expected_launcher = ntpath.join(prefix, "Scripts", "python.exe")
+    if not ntpath.isabs(prefix) or not ntpath.isabs(launcher):
+        return None, "current Windows venv launcher path is not absolute"
+    if not _same_executable(launcher, expected_launcher, windows=True):
+        return None, "sys.executable is not the exact current venv Scripts\\python.exe launcher"
+    if not base_executable or not ntpath.isabs(base_executable):
+        return None, "sys._base_executable is unavailable or not absolute"
+    if _same_executable(launcher, base_executable, windows=True):
+        return None, "Windows venv launcher and base Python executable are not distinct"
+    return _WindowsVenvLaunchSpec(launcher, base_executable), None
+
+
+def _proxy_launch_path_failure(
+    spec: _WindowsVenvLaunchSpec,
+    path_guard: PhysicalPathGuard | None,
+) -> str | None:
+    if path_guard is None:
+        return None
+    try:
+        path_guard.verify_root(Path(spec.launcher_executable), role="process")
+        path_guard.verify_root(Path(spec.base_executable), role="process")
+    except PhysicalPathVerificationError as exc:
+        return f"Windows venv proxy launch path verification failed: {exc.code}"
+    return None
+
+
+def _windows_path_key(value: str | Path) -> str:
+    normalized = str(value).replace("/", "\\")
+    if normalized.casefold().startswith("\\\\?\\unc\\"):
+        normalized = "\\\\" + normalized[8:]
+    elif normalized.casefold().startswith("\\\\?\\"):
+        normalized = normalized[4:]
+    return ntpath.normcase(ntpath.normpath(normalized))
 
 
 def _render_safe_codex_config_file(source: Path) -> str:
@@ -1117,8 +1407,13 @@ __all__ = [
     "ProcessInspector",
     "ProcessObservation",
     "ProcessSnapshotIndex",
+    "ProxyLaunchMode",
+    "ProxyLaunchProvenance",
     "RuntimeOwnershipError",
     "SupervisorCodexRuntimeManager",
+    "process_observation_matches",
+    "process_parent_matches",
+    "proxy_launch_provenance",
     "runtime_process_chain_failure",
     "runtime_verification_failure",
 ]

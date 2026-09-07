@@ -12,6 +12,7 @@ from uuid import UUID
 
 import pytest
 
+import codex_supervisor_bridge.bootstrap.codex_isolation as codex_isolation
 import codex_supervisor_bridge.bootstrap.lcb_runtime_proxy as lcb_runtime_proxy
 from codex_supervisor_bridge.backends.models import (
     AgentSnapshot,
@@ -26,9 +27,13 @@ from codex_supervisor_bridge.bootstrap.codex_isolation import (
     CodexRuntimeMetadata,
     LcbRuntimeIsolationUnsupportedError,
     ProcessObservation,
+    ProcessSnapshotIndex,
+    ProxyLaunchMode,
     RuntimeOwnershipError,
     SupervisorCodexRuntimeManager,
+    proxy_launch_provenance,
     runtime_process_chain_failure,
+    runtime_verification_failure,
 )
 from codex_supervisor_bridge.bootstrap.codex_runtime import CodexExecutableResolver
 from codex_supervisor_bridge.bootstrap.lcb_hardening import (
@@ -84,6 +89,101 @@ def _observation(
     )
 
 
+WINDOWS_HOST_EXE = (
+    r"C:\Users\Windows\AppData\Local\Programs\Python\Python312\python.exe"
+)
+WINDOWS_VENV_PREFIX = r"E:\project\codex-supervisor-bridge.venv-p66-312"
+WINDOWS_VENV_LAUNCHER = WINDOWS_VENV_PREFIX + r"\Scripts\python.exe"
+WINDOWS_BASE_PREFIX = r"C:\Users\Windows\AppData\Local\Programs\Python\Python312"
+
+
+def _set_windows_venv_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    prefix: str = WINDOWS_VENV_PREFIX,
+    base_prefix: str = WINDOWS_BASE_PREFIX,
+    executable: str = WINDOWS_VENV_LAUNCHER,
+    base_executable: str = WINDOWS_HOST_EXE,
+) -> None:
+    monkeypatch.setattr(codex_isolation.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(codex_isolation.sys, "prefix", prefix)
+    monkeypatch.setattr(codex_isolation.sys, "base_prefix", base_prefix)
+    monkeypatch.setattr(codex_isolation.sys, "executable", executable)
+    monkeypatch.setattr(codex_isolation.sys, "_base_executable", base_executable)
+
+
+def _windows_venv_metadata(
+    root: Path,
+) -> tuple[CodexRuntimeMetadata, list[ProcessObservation]]:
+    host = _observation(
+        50488,
+        parent_pid=40000,
+        executable=WINDOWS_HOST_EXE,
+        parent_executable=r"C:\Program Files\PowerShell\7\pwsh.exe",
+    )
+    launcher = _observation(
+        54592,
+        parent_pid=host.pid,
+        executable=WINDOWS_VENV_LAUNCHER,
+        parent_executable=host.executable,
+    )
+    proxy = _observation(
+        55952,
+        parent_pid=launcher.pid,
+        executable=WINDOWS_HOST_EXE,
+        parent_executable=launcher.executable,
+    )
+    lcb = _observation(
+        56000,
+        parent_pid=proxy.pid,
+        executable=r"C:\Program Files\nodejs\node.exe",
+        parent_executable=proxy.executable,
+    )
+    codex_executable = str(root / "codex.exe")
+    app_server = _observation(
+        56001,
+        parent_pid=lcb.pid,
+        executable=codex_executable,
+        parent_executable=lcb.executable,
+        app_server=True,
+    )
+    runtime = root / "runtime" / "codex" / "csb-codex-windows-venv"
+    metadata = CodexRuntimeMetadata(
+        instance_id="csb-codex-windows-venv",
+        runtime_epoch=1,
+        lcb_runtime_contract=LCB_RUNTIME_CONTRACT,
+        lcb_hardening_revision=LCB_HARDENING_REVISION,
+        ownership=CodexProcessOwnership.SUPERVISOR_MANAGED,
+        ownership_token_hash=hashlib.sha256(b"owned-token").hexdigest(),
+        status="READY",
+        runtime_directory=str(runtime),
+        codex_home=str(runtime / "home"),
+        codex_executable=codex_executable,
+        started_at="2026-09-07T00:00:00+00:00",
+        supervisor_parent_pid=host.pid,
+        supervisor_host_instance_id="host-fixture",
+        supervisor_parent_process=host,
+        proxy_launch_mode=ProxyLaunchMode.WINDOWS_VENV_TRAMPOLINE,
+        proxy_launcher_process=launcher,
+        proxy_process=proxy,
+        lcb_process=lcb,
+        app_server_process=app_server,
+        isolation_verified=True,
+    )
+    return metadata, [host, launcher, proxy, lcb, app_server]
+
+
+class _AllowFixturePythonPathGuard(PhysicalPathGuard):
+    def verify_root(self, path: str | Path, **kwargs: Any) -> Any:
+        normalized = str(path).replace("/", "\\").casefold()
+        if normalized in {
+            WINDOWS_VENV_LAUNCHER.casefold(),
+            WINDOWS_HOST_EXE.casefold(),
+        }:
+            return None
+        return super().verify_root(path, **kwargs)
+
+
 def _verified_metadata(
     root: Path,
     *,
@@ -113,6 +213,7 @@ def _verified_metadata(
             parent_pid=1,
             executable="python.exe",
         ),
+        proxy_launch_mode=ProxyLaunchMode.DIRECT,
         proxy_process=_observation(100, parent_pid=99, executable="python.exe"),
         lcb_process=_observation(101, parent_pid=100, executable="node.exe"),
         app_server_process=_observation(
@@ -587,6 +688,601 @@ def test_runtime_verification_rejects_wrong_lcb_hardening_contract(tmp_path: Pat
     assert wrong_revision.failure_code == "CODEX_RUNTIME_OWNERSHIP_UNKNOWN"
 
 
+def test_direct_host_to_proxy_provenance_remains_supported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(codex_isolation.platform, "system", lambda: "Linux")
+    metadata = _verified_metadata(tmp_path)
+    processes = [
+        metadata.supervisor_parent_process,
+        metadata.proxy_process,
+        metadata.lcb_process,
+        metadata.app_server_process,
+    ]
+
+    provenance = proxy_launch_provenance(
+        metadata.supervisor_parent_process,  # type: ignore[arg-type]
+        metadata.proxy_process.pid,  # type: ignore[union-attr]
+        ProcessSnapshotIndex.from_observations(processes),  # type: ignore[arg-type]
+        expected_proxy=metadata.proxy_process,
+        expected_mode=metadata.proxy_launch_mode,
+        expected_launcher=metadata.proxy_launcher_process,
+    )
+
+    assert provenance.verified is True
+    assert provenance.mode == ProxyLaunchMode.DIRECT
+    assert provenance.launcher_process is None
+    assert runtime_process_chain_failure(metadata, processes) is None  # type: ignore[arg-type]
+
+
+def test_real_style_windows_venv_proxy_trampoline_is_verified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_windows_venv_runtime(monkeypatch)
+    metadata, processes = _windows_venv_metadata(tmp_path)
+
+    provenance = proxy_launch_provenance(
+        metadata.supervisor_parent_process,  # type: ignore[arg-type]
+        metadata.proxy_process.pid,  # type: ignore[union-attr]
+        ProcessSnapshotIndex.from_observations(processes),
+        expected_proxy=metadata.proxy_process,
+        expected_mode=metadata.proxy_launch_mode,
+        expected_launcher=metadata.proxy_launcher_process,
+    )
+
+    assert provenance.verified is True
+    assert provenance.mode == ProxyLaunchMode.WINDOWS_VENV_TRAMPOLINE
+    assert provenance.launcher_process == metadata.proxy_launcher_process
+    assert provenance.proxy_process is not None
+    assert provenance.proxy_process.pid == 55952
+    assert runtime_verification_failure(metadata) is None
+    assert runtime_process_chain_failure(metadata, processes) is None
+
+
+def test_windows_venv_trampoline_accepts_exactly_one_launcher_hop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_windows_venv_runtime(monkeypatch)
+    metadata, processes = _windows_venv_metadata(tmp_path)
+    host, launcher, proxy = processes[:3]
+
+    assert launcher.parent_pid == host.pid
+    assert proxy.parent_pid == launcher.pid
+    assert runtime_process_chain_failure(metadata, processes) is None
+
+
+def test_windows_venv_fake_python_basename_at_wrong_path_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_windows_venv_runtime(monkeypatch)
+    metadata, processes = _windows_venv_metadata(tmp_path)
+    host, launcher, proxy = processes[:3]
+    fake_launcher = launcher.model_copy(
+        update={"executable": r"E:\project\fake-venv\Scripts\python.exe"}
+    )
+    current_proxy = proxy.model_copy(
+        update={"parent_executable": fake_launcher.executable}
+    )
+
+    provenance = proxy_launch_provenance(
+        metadata.supervisor_parent_process,  # type: ignore[arg-type]
+        current_proxy.pid,
+        ProcessSnapshotIndex.from_observations([host, fake_launcher, current_proxy]),
+    )
+
+    assert provenance.verified is False
+    assert "exact current venv" in (provenance.failure_reason or "")
+
+
+def test_windows_venv_launcher_outside_sys_prefix_scripts_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_windows_venv_runtime(monkeypatch)
+    metadata, processes = _windows_venv_metadata(tmp_path)
+    host, launcher, proxy = processes[:3]
+    outside = launcher.model_copy(update={"executable": r"C:\Temp\python.exe"})
+    current_proxy = proxy.model_copy(update={"parent_executable": outside.executable})
+
+    provenance = proxy_launch_provenance(
+        metadata.supervisor_parent_process,  # type: ignore[arg-type]
+        current_proxy.pid,
+        ProcessSnapshotIndex.from_observations([host, outside, current_proxy]),
+    )
+
+    assert provenance.verified is False
+    assert "exact current venv" in (provenance.failure_reason or "")
+
+
+def test_windows_venv_proxy_must_run_as_base_python(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_windows_venv_runtime(monkeypatch)
+    metadata, processes = _windows_venv_metadata(tmp_path)
+    host, launcher, proxy = processes[:3]
+    wrong_proxy = proxy.model_copy(update={"executable": r"C:\OtherPython\python.exe"})
+
+    provenance = proxy_launch_provenance(
+        metadata.supervisor_parent_process,  # type: ignore[arg-type]
+        wrong_proxy.pid,
+        ProcessSnapshotIndex.from_observations([host, launcher, wrong_proxy]),
+    )
+
+    assert provenance.verified is False
+    assert "sys._base_executable" in (provenance.failure_reason or "")
+
+
+def test_extra_python_parent_without_active_venv_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_windows_venv_runtime(monkeypatch, base_prefix=WINDOWS_VENV_PREFIX)
+    metadata, processes = _windows_venv_metadata(tmp_path)
+
+    provenance = proxy_launch_provenance(
+        metadata.supervisor_parent_process,  # type: ignore[arg-type]
+        metadata.proxy_process.pid,  # type: ignore[union-attr]
+        ProcessSnapshotIndex.from_observations(processes[:3]),
+    )
+
+    assert provenance.verified is False
+    assert "outside a CPython venv" in (provenance.failure_reason or "")
+
+
+def test_windows_venv_launcher_pid_reuse_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_windows_venv_runtime(monkeypatch)
+    metadata, processes = _windows_venv_metadata(tmp_path)
+    host, launcher, proxy = processes[:3]
+    reused = launcher.model_copy(
+        update={
+            "creation_time": "pid-reused",
+            "command_line_fingerprint": "reused-command",
+        }
+    )
+    current_proxy = proxy.model_copy(update={"parent_creation_time": reused.creation_time})
+
+    provenance = proxy_launch_provenance(
+        metadata.supervisor_parent_process,  # type: ignore[arg-type]
+        current_proxy.pid,
+        ProcessSnapshotIndex.from_observations([host, reused, current_proxy]),
+        expected_mode=ProxyLaunchMode.WINDOWS_VENV_TRAMPOLINE,
+        expected_launcher=launcher,
+    )
+
+    assert provenance.verified is False
+    assert "launcher process identity changed" in (provenance.failure_reason or "")
+
+
+def test_windows_venv_launcher_creation_time_mismatch_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_windows_venv_runtime(monkeypatch)
+    metadata, processes = _windows_venv_metadata(tmp_path)
+    host, launcher, proxy = processes[:3]
+    mismatched_proxy = proxy.model_copy(update={"parent_creation_time": "wrong-created"})
+
+    provenance = proxy_launch_provenance(
+        metadata.supervisor_parent_process,  # type: ignore[arg-type]
+        mismatched_proxy.pid,
+        ProcessSnapshotIndex.from_observations([host, launcher, mismatched_proxy]),
+    )
+
+    assert provenance.verified is False
+    assert "parent metadata" in (provenance.failure_reason or "")
+
+
+def test_windows_venv_launcher_executable_mismatch_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_windows_venv_runtime(monkeypatch)
+    metadata, processes = _windows_venv_metadata(tmp_path)
+    host, launcher, proxy = processes[:3]
+    changed = launcher.model_copy(update={"executable": r"C:\Temp\python.exe"})
+    current_proxy = proxy.model_copy(update={"parent_executable": changed.executable})
+
+    provenance = proxy_launch_provenance(
+        metadata.supervisor_parent_process,  # type: ignore[arg-type]
+        current_proxy.pid,
+        ProcessSnapshotIndex.from_observations([host, changed, current_proxy]),
+        expected_mode=ProxyLaunchMode.WINDOWS_VENV_TRAMPOLINE,
+        expected_launcher=launcher,
+    )
+
+    assert provenance.verified is False
+    assert "launcher process identity changed" in (provenance.failure_reason or "")
+
+
+def test_windows_venv_host_creation_time_mismatch_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_windows_venv_runtime(monkeypatch)
+    metadata, processes = _windows_venv_metadata(tmp_path)
+    host, launcher, proxy = processes[:3]
+    current_host = host.model_copy(update={"creation_time": "different-host-creation"})
+    current_launcher = launcher.model_copy(
+        update={"parent_creation_time": current_host.creation_time}
+    )
+
+    provenance = proxy_launch_provenance(
+        metadata.supervisor_parent_process,  # type: ignore[arg-type]
+        proxy.pid,
+        ProcessSnapshotIndex.from_observations([current_host, current_launcher, proxy]),
+    )
+
+    assert provenance.verified is False
+    assert "Host process identity changed" in (provenance.failure_reason or "")
+
+
+def test_windows_venv_host_pid_reuse_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_windows_venv_runtime(monkeypatch)
+    metadata, processes = _windows_venv_metadata(tmp_path)
+    host, launcher, proxy = processes[:3]
+    reused_host = host.model_copy(
+        update={
+            "creation_time": "host-pid-reused",
+            "command_line_fingerprint": "different-host-command",
+        }
+    )
+    current_launcher = launcher.model_copy(
+        update={"parent_creation_time": reused_host.creation_time}
+    )
+
+    provenance = proxy_launch_provenance(
+        metadata.supervisor_parent_process,  # type: ignore[arg-type]
+        proxy.pid,
+        ProcessSnapshotIndex.from_observations([reused_host, current_launcher, proxy]),
+    )
+
+    assert provenance.verified is False
+    assert "Host process identity changed" in (provenance.failure_reason or "")
+
+
+def test_windows_venv_current_host_missing_from_snapshot_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_windows_venv_runtime(monkeypatch)
+    metadata, processes = _windows_venv_metadata(tmp_path)
+
+    provenance = proxy_launch_provenance(
+        metadata.supervisor_parent_process,  # type: ignore[arg-type]
+        metadata.proxy_process.pid,  # type: ignore[union-attr]
+        ProcessSnapshotIndex.from_observations(processes[1:3]),
+    )
+
+    assert provenance.verified is False
+    assert "Host process is not present" in (provenance.failure_reason or "")
+
+
+def test_windows_venv_proxy_parent_metadata_must_match_launcher_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_windows_venv_runtime(monkeypatch)
+    metadata, processes = _windows_venv_metadata(tmp_path)
+    host, launcher, proxy = processes[:3]
+    mismatched_proxy = proxy.model_copy(
+        update={"parent_executable": r"C:\Temp\python.exe"}
+    )
+
+    provenance = proxy_launch_provenance(
+        metadata.supervisor_parent_process,  # type: ignore[arg-type]
+        mismatched_proxy.pid,
+        ProcessSnapshotIndex.from_observations([host, launcher, mismatched_proxy]),
+    )
+
+    assert provenance.verified is False
+    assert "parent metadata" in (provenance.failure_reason or "")
+
+
+def test_windows_venv_two_trampoline_hops_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_windows_venv_runtime(monkeypatch)
+    metadata, processes = _windows_venv_metadata(tmp_path)
+    host, launcher, proxy = processes[:3]
+    extra = _observation(
+        54591,
+        parent_pid=host.pid,
+        executable=r"E:\project\outer-venv\Scripts\python.exe",
+        parent_executable=host.executable,
+    )
+    current_launcher = launcher.model_copy(
+        update={
+            "parent_pid": extra.pid,
+            "parent_creation_time": extra.creation_time,
+            "parent_executable": extra.executable,
+        }
+    )
+
+    provenance = proxy_launch_provenance(
+        metadata.supervisor_parent_process,  # type: ignore[arg-type]
+        proxy.pid,
+        ProcessSnapshotIndex.from_observations(
+            [host, extra, current_launcher, proxy]
+        ),
+    )
+
+    assert provenance.verified is False
+    assert "launcher parent identity" in (provenance.failure_reason or "")
+
+
+@pytest.mark.parametrize(
+    "middle_executable",
+    [
+        r"C:\Temp\unknown.exe",
+        r"C:\Windows\System32\cmd.exe",
+        r"C:\Program Files\nodejs\node.exe",
+        r"C:\Program Files\WindowsApps\OpenAI.ChatGPT\ChatGPT.exe",
+    ],
+    ids=["unknown", "cmd", "node", "desktop-chatgpt"],
+)
+def test_untrusted_middle_process_cannot_become_proxy_trampoline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    middle_executable: str,
+) -> None:
+    _set_windows_venv_runtime(monkeypatch)
+    metadata, processes = _windows_venv_metadata(tmp_path)
+    host, launcher, proxy = processes[:3]
+    middle = launcher.model_copy(update={"executable": middle_executable})
+    current_proxy = proxy.model_copy(update={"parent_executable": middle.executable})
+
+    provenance = proxy_launch_provenance(
+        metadata.supervisor_parent_process,  # type: ignore[arg-type]
+        current_proxy.pid,
+        ProcessSnapshotIndex.from_observations([host, middle, current_proxy]),
+    )
+
+    assert provenance.verified is False
+    assert "exact current venv" in (provenance.failure_reason or "")
+
+
+def test_windows_venv_launcher_loss_requires_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_windows_venv_runtime(monkeypatch)
+    metadata, processes = _windows_venv_metadata(tmp_path)
+
+    failure = runtime_process_chain_failure(
+        metadata,
+        [processes[0], *processes[2:]],
+    )
+
+    assert failure is not None
+    assert "venv launcher" in failure
+
+
+def test_windows_venv_launcher_reuse_requires_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_windows_venv_runtime(monkeypatch)
+    metadata, processes = _windows_venv_metadata(tmp_path)
+    host, launcher, proxy, lcb, app_server = processes
+    reused = launcher.model_copy(update={"creation_time": "launcher-reused"})
+    current_proxy = proxy.model_copy(update={"parent_creation_time": reused.creation_time})
+
+    failure = runtime_process_chain_failure(
+        metadata,
+        [host, reused, current_proxy, lcb, app_server],
+    )
+
+    assert failure is not None
+    assert "process identity changed" in failure
+
+
+def test_tampered_proxy_launcher_metadata_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_windows_venv_runtime(monkeypatch)
+    metadata, _processes = _windows_venv_metadata(tmp_path)
+    tampered = metadata.model_copy(
+        update={
+            "proxy_launcher_process": metadata.proxy_launcher_process.model_copy(  # type: ignore[union-attr]
+                update={"creation_time": "tampered-launcher"}
+            )
+        }
+    )
+
+    failure = runtime_verification_failure(tampered)
+
+    assert failure is not None
+    assert "parent metadata" in failure or "launcher process identity" in failure
+
+
+def test_runtime_metadata_v2_is_not_silently_trusted(tmp_path: Path) -> None:
+    metadata = _verified_metadata(tmp_path).model_copy(update={"schema_version": 2})
+
+    assert runtime_verification_failure(metadata) == (
+        "Supervisor runtime metadata schema is unsupported"
+    )
+
+
+def test_windows_venv_physical_path_guard_failure_rejects_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_windows_venv_runtime(monkeypatch)
+    metadata, processes = _windows_venv_metadata(tmp_path)
+
+    class _RejectLauncherPath:
+        def verify_root(self, path: str | Path, **_kwargs: object) -> None:
+            raise PhysicalPathVerificationError(
+                "SUPERVISOR_HOST_PATH_VIRTUALIZED",
+                f"rejected {path}",
+            )
+
+    provenance = proxy_launch_provenance(
+        metadata.supervisor_parent_process,  # type: ignore[arg-type]
+        metadata.proxy_process.pid,  # type: ignore[union-attr]
+        ProcessSnapshotIndex.from_observations(processes),
+        path_guard=_RejectLauncherPath(),  # type: ignore[arg-type]
+    )
+
+    assert provenance.verified is False
+    assert "SUPERVISOR_HOST_PATH_VIRTUALIZED" in (provenance.failure_reason or "")
+
+
+def test_runtime_refresh_rejects_tampered_launcher_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata, processes = _windows_venv_metadata(tmp_path)
+    runtime_directory = Path(metadata.runtime_directory)
+    (runtime_directory / "home").mkdir(parents=True)
+    Path(metadata.codex_executable or "").write_bytes(b"fake codex executable")
+    tampered = metadata.model_copy(
+        update={
+            "proxy_launcher_process": metadata.proxy_launcher_process.model_copy(  # type: ignore[union-attr]
+                update={"creation_time": "tampered-launcher"}
+            )
+        }
+    )
+    (runtime_directory / "runtime.json").write_text(
+        json.dumps(tampered.model_dump(mode="json")),
+        encoding="utf-8",
+    )
+
+    class _Inspector:
+        def snapshot(self) -> list[ProcessObservation]:
+            return processes
+
+    manager = SupervisorCodexRuntimeManager(
+        tmp_path,
+        inspector=_Inspector(),  # type: ignore[arg-type]
+        path_guard=_AllowFixturePythonPathGuard(),
+    )
+    manager.metadata = metadata
+    manager._token = "owned-token"
+    _set_windows_venv_runtime(monkeypatch)
+
+    refreshed = manager.refresh()
+
+    assert refreshed.ownership == CodexProcessOwnership.UNKNOWN
+    assert refreshed.failure_code == "CODEX_RUNTIME_OWNERSHIP_UNKNOWN"
+    assert refreshed.isolation_verified is False
+
+
+def test_destructive_lifecycle_refuses_broken_launcher_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata, processes = _windows_venv_metadata(tmp_path)
+    runtime_directory = Path(metadata.runtime_directory)
+    (runtime_directory / "home").mkdir(parents=True)
+    Path(metadata.codex_executable or "").write_bytes(b"fake codex executable")
+    (runtime_directory / "runtime.json").write_text(
+        json.dumps(metadata.model_dump(mode="json")),
+        encoding="utf-8",
+    )
+
+    class _MissingLauncherInspector:
+        def snapshot(self) -> list[ProcessObservation]:
+            return [processes[0], *processes[2:]]
+
+    manager = SupervisorCodexRuntimeManager(
+        tmp_path,
+        inspector=_MissingLauncherInspector(),  # type: ignore[arg-type]
+        path_guard=_AllowFixturePythonPathGuard(),
+    )
+    manager.metadata = metadata
+    manager._token = "owned-token"
+    _set_windows_venv_runtime(monkeypatch)
+
+    with pytest.raises(RuntimeOwnershipError, match="venv launcher"):
+        manager.assert_destructive_lifecycle_allowed()
+
+
+def test_destructive_lifecycle_accepts_verified_trampoline_with_one_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata, processes = _windows_venv_metadata(tmp_path)
+    runtime_directory = Path(metadata.runtime_directory)
+    (runtime_directory / "home").mkdir(parents=True)
+    Path(metadata.codex_executable or "").write_bytes(b"fake codex executable")
+    (runtime_directory / "runtime.json").write_text(
+        json.dumps(metadata.model_dump(mode="json")),
+        encoding="utf-8",
+    )
+
+    class _CountingInspector:
+        def __init__(self) -> None:
+            self.snapshot_calls = 0
+
+        def snapshot(self) -> list[ProcessObservation]:
+            self.snapshot_calls += 1
+            return processes
+
+    inspector = _CountingInspector()
+    manager = SupervisorCodexRuntimeManager(
+        tmp_path,
+        inspector=inspector,  # type: ignore[arg-type]
+        path_guard=_AllowFixturePythonPathGuard(),
+    )
+    manager.metadata = metadata
+    manager._token = "owned-token"
+    _set_windows_venv_runtime(monkeypatch)
+
+    manager.assert_destructive_lifecycle_allowed()
+
+    assert inspector.snapshot_calls == 1
+
+
+def test_ready_refresh_uses_one_process_snapshot_for_provenance(tmp_path: Path) -> None:
+    metadata = _verified_metadata(tmp_path)
+    runtime_directory = Path(metadata.runtime_directory)
+    (runtime_directory / "home").mkdir(parents=True)
+    (runtime_directory / "runtime.json").write_text(
+        json.dumps(metadata.model_dump(mode="json")),
+        encoding="utf-8",
+    )
+    processes = [
+        metadata.supervisor_parent_process,
+        metadata.proxy_process,
+        metadata.lcb_process,
+        metadata.app_server_process,
+    ]
+
+    class _CountingInspector:
+        def __init__(self) -> None:
+            self.snapshot_calls = 0
+
+        def snapshot(self) -> list[ProcessObservation]:
+            self.snapshot_calls += 1
+            return processes  # type: ignore[return-value]
+
+    inspector = _CountingInspector()
+    manager = SupervisorCodexRuntimeManager(
+        tmp_path,
+        inspector=inspector,  # type: ignore[arg-type]
+    )
+    manager.metadata = metadata
+
+    refreshed = manager.refresh()
+
+    assert refreshed.isolation_verified is True
+    assert inspector.snapshot_calls == 1
+
+
 class _DummyProcess:
     def __init__(self, pid: int) -> None:
         self.pid = pid
@@ -642,6 +1338,143 @@ class _ProxyChild:
         return self.returncode
 
 
+class _ProxyRuntimePathGuard:
+    def verify_root(self, _path: str | Path, **_kwargs: object) -> None:
+        return None
+
+    def before_spawn(
+        self,
+        _command: list[str] | tuple[str, ...],
+        **_kwargs: object,
+    ) -> None:
+        return None
+
+    def write_text(
+        self,
+        path: str | Path,
+        content: str,
+        **_kwargs: object,
+    ) -> None:
+        Path(path).write_text(content, encoding="utf-8")
+
+
+def _run_windows_venv_proxy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    launcher_survives_ready: bool,
+) -> tuple[int, _ProxyChild, CodexRuntimeMetadata]:
+    token = "owned-token"
+    metadata, processes = _windows_venv_metadata(tmp_path)
+    host, launcher, proxy, lcb, app_server = processes
+    initial = metadata.model_copy(
+        update={
+            "status": "CREATED",
+            "proxy_launch_mode": None,
+            "proxy_launcher_process": None,
+            "proxy_process": None,
+            "lcb_process": None,
+            "app_server_process": None,
+            "isolation_verified": False,
+        }
+    )
+    runtime_directory = Path(initial.runtime_directory)
+    (runtime_directory / "home").mkdir(parents=True)
+    Path(initial.codex_executable or "").write_bytes(b"fake codex executable")
+    metadata_path = runtime_directory / "runtime.json"
+    metadata_path.write_text(
+        json.dumps(initial.model_dump(mode="json")),
+        encoding="utf-8",
+    )
+    child = _ProxyChild(lcb.pid)
+
+    class _Inspector:
+        def __init__(self) -> None:
+            self.snapshot_calls = 0
+
+        def snapshot(self) -> list[ProcessObservation]:
+            self.snapshot_calls += 1
+            if self.snapshot_calls == 1:
+                return [host, launcher, proxy]
+            if self.snapshot_calls == 2:
+                return processes
+            if launcher_survives_ready:
+                child.returncode = 0
+                return processes
+            return [host, proxy, lcb, app_server]
+
+    inspector = _Inspector()
+    _set_windows_venv_runtime(monkeypatch)
+    monkeypatch.setattr(lcb_runtime_proxy, "ProcessInspector", lambda: inspector)
+    monkeypatch.setattr(
+        lcb_runtime_proxy,
+        "PhysicalPathGuard",
+        _ProxyRuntimePathGuard,
+    )
+    monkeypatch.setattr(lcb_runtime_proxy.os, "getpid", lambda: proxy.pid)
+    monkeypatch.setattr(
+        lcb_runtime_proxy.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: child,
+    )
+    monkeypatch.setattr(lcb_runtime_proxy.signal, "signal", lambda *_args: None)
+    ticks = iter([0.0, 1.0])
+    monkeypatch.setattr(lcb_runtime_proxy.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(lcb_runtime_proxy.time, "sleep", lambda *_args: None)
+    monkeypatch.setenv(lcb_runtime_proxy.SUPERVISOR_METADATA_ENV, str(metadata_path))
+    monkeypatch.setenv(lcb_runtime_proxy.SUPERVISOR_CONTRACT_ENV, LCB_RUNTIME_CONTRACT)
+    monkeypatch.setenv(lcb_runtime_proxy.SUPERVISOR_RUNTIME_ENV, initial.instance_id)
+    monkeypatch.setenv(lcb_runtime_proxy.SUPERVISOR_EPOCH_ENV, str(initial.runtime_epoch))
+    monkeypatch.setenv(lcb_runtime_proxy.SUPERVISOR_TOKEN_ENV, token)
+    monkeypatch.setenv(
+        lcb_runtime_proxy.SUPERVISOR_HOST_INSTANCE_ENV,
+        initial.supervisor_host_instance_id or "",
+    )
+    monkeypatch.setenv("CODEX_EXE", initial.codex_executable or "")
+
+    result = lcb_runtime_proxy.run(metadata_path, ["node", "bridge.js"])
+    stored = CodexRuntimeMetadata.model_validate_json(
+        metadata_path.read_text(encoding="utf-8")
+    )
+    return result, child, stored
+
+
+def test_lcb_proxy_persists_verified_windows_venv_launcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, child, stored = _run_windows_venv_proxy(
+        tmp_path,
+        monkeypatch,
+        launcher_survives_ready=True,
+    )
+
+    assert result == 0
+    assert child.terminated is False
+    assert stored.proxy_launch_mode == ProxyLaunchMode.WINDOWS_VENV_TRAMPOLINE
+    assert stored.proxy_launcher_process is not None
+    assert stored.proxy_launcher_process.pid == 54592
+    assert stored.proxy_process is not None
+    assert stored.proxy_process.pid == 55952
+
+
+def test_lcb_proxy_refuses_termination_after_verified_launcher_disappears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, child, stored = _run_windows_venv_proxy(
+        tmp_path,
+        monkeypatch,
+        launcher_survives_ready=False,
+    )
+
+    assert result == 8
+    assert child.terminated is False
+    assert stored.ownership == CodexProcessOwnership.UNKNOWN
+    assert stored.failure_code == "CODEX_RUNTIME_OWNERSHIP_UNKNOWN"
+    assert stored.isolation_verified is False
+
+
 def _run_proxy_startup_timeout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -656,6 +1489,11 @@ def _run_proxy_startup_timeout(
     proxy = _observation(
         proxy_pid,
         parent_pid=99,
+        executable="python.exe",
+    )
+    host = _observation(
+        99,
+        parent_pid=1,
         executable="python.exe",
     )
     child_identity = _observation(
@@ -680,11 +1518,7 @@ def _run_proxy_startup_timeout(
         started_at="2026-08-30T00:00:00+00:00",
         supervisor_parent_pid=99,
         supervisor_host_instance_id="host-fixture",
-        supervisor_parent_process=_observation(
-            99,
-            parent_pid=1,
-            executable="python.exe",
-        ),
+        supervisor_parent_process=host,
     )
     metadata_path = tmp_path / "runtime.json"
     metadata_path.write_text(
@@ -694,6 +1528,8 @@ def _run_proxy_startup_timeout(
     child = _ProxyChild(child_pid)
 
     class _Inspector:
+        snapshot_calls = 0
+
         def identity(self, pid: int) -> ProcessObservation | None:
             if pid == proxy_pid:
                 return proxy
@@ -702,7 +1538,16 @@ def _run_proxy_startup_timeout(
             return None
 
         def snapshot(self) -> list[ProcessObservation]:
-            return [proxy, child_identity]
+            self.snapshot_calls += 1
+            if self.snapshot_calls == 1:
+                return [host, proxy]
+            if self.snapshot_calls == 2:
+                return [host, proxy, child_identity]
+            return [
+                host,
+                proxy,
+                replacement_identity if replace_child_identity else child_identity,
+            ]
 
     ticks = iter([0.0, 1.0, 16.0])
     monkeypatch.setattr(lcb_runtime_proxy, "ProcessInspector", _Inspector)
@@ -1170,6 +2015,7 @@ def test_process_identity_requires_creation_command_and_parent_identity(tmp_path
         runtime_process_chain_failure(
             metadata,
             [
+                metadata.supervisor_parent_process,  # type: ignore[list-item]
                 metadata.proxy_process,  # type: ignore[list-item]
                 metadata.lcb_process,  # type: ignore[list-item]
             ],

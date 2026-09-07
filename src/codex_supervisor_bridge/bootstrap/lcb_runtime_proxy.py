@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .codex_isolation import (
+    RUNTIME_METADATA_VERSION,
     SUPERVISOR_CONTRACT_ENV,
     SUPERVISOR_EPOCH_ENV,
     SUPERVISOR_HOST_INSTANCE_ENV,
@@ -20,7 +21,11 @@ from .codex_isolation import (
     CodexRuntimeMetadata,
     ProcessInspector,
     ProcessObservation,
-    runtime_verification_failure,
+    ProcessSnapshotIndex,
+    process_observation_matches,
+    process_parent_matches,
+    proxy_launch_provenance,
+    runtime_process_chain_failure,
 )
 from .physical import PhysicalPathGuard, PhysicalPathVerificationError
 from .process import CodexProcessOwnership
@@ -78,34 +83,11 @@ def _owned_app_server(
     return candidates[0] if len(candidates) == 1 else None
 
 
-def _same_parent_identity(
-    proxy: ProcessObservation,
-    processes: Sequence[ProcessObservation],
-) -> bool:
-    if proxy.parent_pid is None or proxy.parent_creation_time is None:
-        return False
-    parent = next((item for item in processes if item.pid == proxy.parent_pid), None)
-    return bool(
-        parent
-        and parent.creation_time == proxy.parent_creation_time
-        and parent.executable == proxy.parent_executable
-    )
-
-
 def _same_process_identity(
     expected: ProcessObservation,
     current: ProcessObservation,
 ) -> bool:
-    return bool(
-        expected.pid == current.pid
-        and expected.creation_time == current.creation_time
-        and os.path.normcase(expected.executable) == os.path.normcase(current.executable)
-        and expected.command_line_fingerprint == current.command_line_fingerprint
-        and expected.parent_pid == current.parent_pid
-        and expected.parent_creation_time == current.parent_creation_time
-        and os.path.normcase(expected.parent_executable or "")
-        == os.path.normcase(current.parent_executable or "")
-    )
+    return process_observation_matches(expected, current)
 
 
 def _fail(
@@ -143,7 +125,8 @@ def run(metadata_path: Path, command: Sequence[str]) -> int:
     except (OSError, ValueError, PhysicalPathVerificationError):
         return 3
     if (
-        metadata_path != Path(os.environ.get(SUPERVISOR_METADATA_ENV, metadata_path))
+        metadata.schema_version != RUNTIME_METADATA_VERSION
+        or metadata_path != Path(os.environ.get(SUPERVISOR_METADATA_ENV, metadata_path))
         or metadata.lcb_runtime_contract != os.environ.get(SUPERVISOR_CONTRACT_ENV)
         or metadata.instance_id != os.environ.get(SUPERVISOR_RUNTIME_ENV)
         or str(metadata.runtime_epoch) != os.environ.get(SUPERVISOR_EPOCH_ENV)
@@ -184,23 +167,23 @@ def run(metadata_path: Path, command: Sequence[str]) -> int:
             "Supervisor parent process identity is missing",
         )
         return 5
-    proxy_identity = inspector.identity(os.getpid())
-    if proxy_identity is None:
+    initial_snapshot = ProcessSnapshotIndex.from_observations(inspector.snapshot())
+    launch_provenance = proxy_launch_provenance(
+        metadata.supervisor_parent_process,
+        os.getpid(),
+        initial_snapshot,
+        path_guard=path_guard,
+    )
+    if not launch_provenance.verified or launch_provenance.proxy_process is None:
         _fail(
             metadata_path,
             metadata,
             "CODEX_RUNTIME_OWNERSHIP_UNKNOWN",
-            "runtime proxy process identity is unavailable",
+            launch_provenance.failure_reason
+            or "runtime proxy launch provenance could not be verified",
         )
         return 5
-    if not _proxy_parent_matches(proxy_identity, metadata.supervisor_parent_process):
-        _fail(
-            metadata_path,
-            metadata,
-            "CODEX_RUNTIME_OWNERSHIP_UNKNOWN",
-            "runtime proxy parent is not the persisted Supervisor Host process",
-        )
-        return 5
+    proxy_identity = launch_provenance.proxy_process
 
     try:
         path_guard.before_spawn(list(command), role="runtime")
@@ -227,64 +210,127 @@ def run(metadata_path: Path, command: Sequence[str]) -> int:
     expected_lcb_identity: ProcessObservation | None = None
     termination_requested = False
     termination_sent = False
+    startup_failure_recorded = False
+    ownership_lost = False
 
-    def terminate_child(_signum: int, _frame: object) -> None:
-        nonlocal termination_requested, termination_sent
+    def request_termination(_signum: int, _frame: object) -> None:
+        nonlocal termination_requested
         termination_requested = True
+
+    def terminate_child(
+        processes: Sequence[ProcessObservation] | None = None,
+        *,
+        require_full_chain: bool,
+    ) -> bool:
+        nonlocal termination_sent
         if termination_sent or child.poll() is not None:
-            return
-        current = inspector.identity(child.pid)
-        if (
-            expected_lcb_identity is None
-            or current is None
-            or not _same_process_identity(expected_lcb_identity, current)
-        ):
+            return termination_sent
+        current_processes = list(processes) if processes is not None else inspector.snapshot()
+        if require_full_chain:
+            failure = runtime_process_chain_failure(
+                ready_metadata,
+                current_processes,
+                path_guard=path_guard,
+            )
+        else:
+            process_snapshot = ProcessSnapshotIndex.from_observations(current_processes)
+            current_provenance = proxy_launch_provenance(
+                metadata.supervisor_parent_process,  # type: ignore[arg-type]
+                proxy_identity.pid,
+                process_snapshot,
+                expected_proxy=proxy_identity,
+                expected_mode=launch_provenance.mode,
+                expected_launcher=launch_provenance.launcher_process,
+                path_guard=path_guard,
+            )
+            current = process_snapshot.get(child.pid)
+            failure = None
+            if not current_provenance.verified:
+                failure = current_provenance.failure_reason
+            elif expected_lcb_identity is None or current is None:
+                failure = "LCB process identity is unavailable"
+            elif not _same_process_identity(expected_lcb_identity, current):
+                failure = "LCB process identity changed"
+            elif not process_parent_matches(current, proxy_identity):
+                failure = "LCB parent identity no longer matches the runtime proxy"
+        if failure is not None:
             _fail(
                 metadata_path,
                 ready_metadata,
                 "CODEX_RUNTIME_OWNERSHIP_UNKNOWN",
-                "LCB termination refused after process identity changed",
+                f"LCB termination refused: {failure}",
             )
-            return
+            return False
         termination_sent = True
         child.terminate()
+        return True
 
     for signal_name in ("SIGINT", "SIGTERM"):
         if hasattr(signal, signal_name):
-            signal.signal(getattr(signal, signal_name), terminate_child)
+            signal.signal(getattr(signal, signal_name), request_termination)
 
     deadline = time.monotonic() + 15.0
     verified = False
     while time.monotonic() < deadline and child.poll() is None:
         processes = inspector.snapshot()
-        lcb_identity = next((item for item in processes if item.pid == child.pid), None)
+        process_snapshot = ProcessSnapshotIndex.from_observations(processes)
+        current_provenance = proxy_launch_provenance(
+            metadata.supervisor_parent_process,
+            proxy_identity.pid,
+            process_snapshot,
+            expected_proxy=proxy_identity,
+            expected_mode=launch_provenance.mode,
+            expected_launcher=launch_provenance.launcher_process,
+            path_guard=path_guard,
+        )
+        if not current_provenance.verified:
+            _fail(
+                metadata_path,
+                metadata,
+                "CODEX_RUNTIME_OWNERSHIP_UNKNOWN",
+                current_provenance.failure_reason
+                or "runtime proxy launch provenance changed before READY",
+            )
+            startup_failure_recorded = True
+            ownership_lost = True
+            break
+        lcb_identity = process_snapshot.get(child.pid)
         if (
             expected_lcb_identity is None
             and lcb_identity is not None
-            and lcb_identity.parent_pid == proxy_identity.pid
-            and lcb_identity.parent_creation_time == proxy_identity.creation_time
-            and os.path.normcase(lcb_identity.parent_executable or "")
-            == os.path.normcase(proxy_identity.executable)
+            and process_parent_matches(lcb_identity, proxy_identity)
         ):
             expected_lcb_identity = lcb_identity
         if termination_requested:
-            terminate_child(0, None)
-            if termination_sent:
-                break
+            if terminate_child(processes, require_full_chain=False):
+                _fail(
+                    metadata_path,
+                    metadata,
+                    "SUPERVISOR_CODEX_RUNTIME_FAILED",
+                    "runtime proxy termination was requested before READY",
+                )
+            startup_failure_recorded = True
+            break
         app_server = _owned_app_server(processes, child.pid)
         desktops = _desktop_processes(processes)
         if not termination_requested and lcb_identity is not None and app_server is not None:
             candidate = metadata.model_copy(
                 update={
                     "ownership": CodexProcessOwnership.SUPERVISOR_MANAGED,
-                    "proxy_process": proxy_identity,
+                    "proxy_launch_mode": current_provenance.mode,
+                    "proxy_launcher_process": current_provenance.launcher_process,
+                    "proxy_process": current_provenance.proxy_process,
                     "lcb_process": lcb_identity,
                     "app_server_process": app_server,
                     "desktop_processes": desktops,
                     "desktop_runtime_present": bool(desktops),
                 }
             )
-            reason = runtime_verification_failure(candidate)
+            reason = runtime_process_chain_failure(
+                candidate,
+                processes,
+                path_guard=path_guard,
+            )
             if reason is None:
                 ready_metadata = candidate.model_copy(
                     update={
@@ -298,8 +344,9 @@ def run(metadata_path: Path, command: Sequence[str]) -> int:
                 verified = True
                 break
         time.sleep(0.05)
-    else:
-        if not verified:
+
+    if not verified:
+        if not startup_failure_recorded:
             _fail(
                 metadata_path,
                 metadata,
@@ -310,12 +357,9 @@ def run(metadata_path: Path, command: Sequence[str]) -> int:
                     else "LCB child exited before runtime ownership was verified"
                 ),
             )
-            if child.poll() is None:
-                terminate_child(0, None)
-
-    if not verified:
+        if child.poll() is None and not ownership_lost and not termination_sent:
+            terminate_child(require_full_chain=False)
         if child.poll() is None:
-            terminate_child(0, None)
             try:
                 child.wait(timeout=5)
             except subprocess.TimeoutExpired:
@@ -323,39 +367,23 @@ def run(metadata_path: Path, command: Sequence[str]) -> int:
         return 7
 
     while verified and child.poll() is None:
-        if termination_requested:
-            terminate_child(0, None)
-            break
         processes = inspector.snapshot()
-        if not _same_parent_identity(proxy_identity, processes):
-            _fail(
-                metadata_path,
-                ready_metadata,
-                "CODEX_RUNTIME_RECONCILIATION_REQUIRED",
-                "Supervisor parent process identity disappeared or changed",
-            )
-            terminate_child(0, None)
-            break
-        current_lcb = next((item for item in processes if item.pid == child.pid), None)
-        current_app_server = _owned_app_server(processes, child.pid)
-        if (
-            current_lcb is None
-            or ready_metadata.lcb_process is None
-            or not _same_process_identity(ready_metadata.lcb_process, current_lcb)
-            or current_app_server is None
-            or ready_metadata.app_server_process is None
-            or not _same_process_identity(
-                ready_metadata.app_server_process,
-                current_app_server,
-            )
-        ):
+        live_failure = runtime_process_chain_failure(
+            ready_metadata,
+            processes,
+            path_guard=path_guard,
+        )
+        if live_failure is not None:
             _fail(
                 metadata_path,
                 ready_metadata,
                 "CODEX_RUNTIME_OWNERSHIP_UNKNOWN",
-                "owned LCB/app-server process identity changed",
+                live_failure,
             )
-            terminate_child(0, None)
+            ownership_lost = True
+            break
+        if termination_requested:
+            terminate_child(processes, require_full_chain=True)
             break
         time.sleep(0.5)
 
@@ -366,8 +394,12 @@ def run(metadata_path: Path, command: Sequence[str]) -> int:
             _fail(
                 metadata_path,
                 ready_metadata,
-                "CODEX_RUNTIME_RECONCILIATION_REQUIRED",
-                "owned LCB process did not stop within the bounded shutdown timeout",
+                "CODEX_RUNTIME_OWNERSHIP_UNKNOWN"
+                if ownership_lost
+                else "CODEX_RUNTIME_RECONCILIATION_REQUIRED",
+                "owned LCB process remains live after provenance verification failed"
+                if ownership_lost
+                else "owned LCB process did not stop within the bounded shutdown timeout",
             )
             return 8
     return_code = child.wait()
@@ -386,18 +418,6 @@ def run(metadata_path: Path, command: Sequence[str]) -> int:
     except (OSError, ValueError):
         pass
     return int(return_code)
-
-
-def _proxy_parent_matches(
-    proxy: ProcessObservation,
-    expected_parent: ProcessObservation,
-) -> bool:
-    return bool(
-        proxy.parent_pid == expected_parent.pid
-        and proxy.parent_creation_time == expected_parent.creation_time
-        and os.path.normcase(proxy.parent_executable or "")
-        == os.path.normcase(expected_parent.executable)
-    )
 
 
 def main() -> None:

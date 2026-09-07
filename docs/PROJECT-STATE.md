@@ -4,7 +4,7 @@
 >
 > This document records the current product intent and the architecture decisions that supersede earlier fixed-backend assumptions. It is deliberately more durable than a browser conversation.
 
-Last updated: 2026-09-04
+Last updated: 2026-09-07
 
 ## Product goal
 
@@ -402,6 +402,51 @@ reuse, and missing non-Explorer parents stay fail-closed. Linux `/proc`
 behavior is unchanged. This is code and fake-test evidence only; no real
 Gate 0 was rerun. `GATE_1=NOT_STARTED`.
 
+#### 2026-09-07 Gate 0 pass and Gate 1 proxy-launch failure
+
+External Gate 0 was later rerun from an independent Start Menu PowerShell
+7.6.5 session against candidate
+`3c0cfb7004349b9dc0a576a57d81aedfba4b17bf`. It passed with canonical physical
+paths, `host_ownership=SUPERVISOR_HOST_MANAGED`, a verified canonical
+`C:\WINDOWS\Explorer.EXE` launch boundary, and `package_identity=NO_PACKAGE_IDENTITY`.
+`OLD_CANDIDATE_GATE_0=PASSED` is authoritative only for that exact SHA.
+
+The first real Gate 1 attempt on that candidate is **FAILED / INCOMPLETE**. It
+created a Supervisor runtime namespace but failed before Local-Codex-Bridge or
+a Supervisor Codex app-server was proven started. Runtime metadata reported
+`CODEX_RUNTIME_OWNERSHIP_UNKNOWN` because the proxy's direct parent did not
+match the persisted Host. `LIVE_APP_SERVER_STDIO_COUNT=0`; LCB startup was not
+proven and no Supervisor app-server was observed.
+
+The real process diagnosis confirmed the cause as
+`WINDOWS_VENV_PYTHON_LAUNCHER_TRAMPOLINE`: on Windows CPython venvs,
+`sys.executable` is the venv launcher, while the running Host and proxy OS
+images are `sys._base_executable`. The observed chain was Host base Python ->
+exact venv `Scripts\python.exe` launcher -> proxy base Python. The previous
+direct-parent-only proof therefore failed closed before LCB startup.
+
+The code fix explicitly models either direct Host -> proxy provenance or one
+Windows-only, exact CPython venv launcher hop. One process snapshot must prove
+the persisted Host identity, launcher identity and canonical path, base Python
+proxy executable, and all parent metadata. The launcher observation is stored
+in runtime metadata schema v3 and is revalidated for READY refresh,
+steady-state reconciliation, process-chain diagnostics, and destructive
+lifecycle authorization. Extra, missing, reused, non-venv, Desktop, cmd, node,
+or otherwise untrusted intermediary processes remain fail closed. Linux direct
+behavior is unchanged, and old schema metadata cannot authorize destructive
+lifecycle actions.
+
+The failed Gate 1 attempt did not break the existing Codex Desktop session: the
+human Desktop reply check returned `DESKTOP_CONCURRENCY_OK`.
+`DESKTOP_SURVIVAL_DURING_GATE1_ATTEMPT=PASSED` and
+`HUMAN_DESKTOP_REPLY_CHECK=PASSED`, but Gate 1 remains failed/incomplete.
+
+`CODE FIX COMPLETE`; `REAL GATE NOT RERUN`. Any commit containing this fix is a
+new candidate and cannot inherit the Gate 0 result from `3c0cfb7`. The next
+authorized real step is External Gate 0 on the new SHA, followed by passive
+process inventory and separate explicit Gate 1 authorization. It is not valid
+to claim Gate 1 passed, runtime isolation proven, or Profile B production safe.
+
 Read-only investigation of the pinned Local-Codex-Bridge 2.1.3 source at
 commit `4ffed814f615316ade8967189a2e1772488d33c2` confirmed that LCB starts its
 own `codex app-server --listen stdio://` child and uses protocol-level
@@ -447,9 +492,9 @@ The code-level blocker work on this branch now establishes:
   `runtime/codex/<instance-id>` with an isolated `CODEX_HOME`, LCB checkpoint
   directory, ownership-token hash, process-chain metadata, and private stdio
   endpoint category;
-- a Supervisor-owned runtime proxy that verifies the
-  Supervisor -> proxy -> LCB -> Codex app-server parent/child chain before
-  Profile B can report READY;
+- a Supervisor-owned runtime proxy that verifies the Supervisor -> optional
+  exact Windows venv launcher -> proxy -> LCB -> Codex app-server process chain
+  before Profile B can report READY;
 - a trusted managed LCB source hardening contract (`supervisor-runtime-v1`,
   revision `csb-lcb-runtime-1`) applied before the pinned source is built;
   the marker binds both the patched TypeScript source and the built

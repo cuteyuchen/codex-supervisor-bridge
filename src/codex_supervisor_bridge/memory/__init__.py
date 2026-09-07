@@ -10,6 +10,12 @@ from .agent_safety import (
     record_agent_compensation_required,
     record_agent_compensation_succeeded,
 )
+from .backend_binding import (
+    TaskBackendBinding,
+    assert_task_backend_binding,
+    bind_task_backend,
+    get_task_backend_binding,
+)
 from .context_pack import BuiltContextPack, ContextPackBuilder
 from .errors import (
     ConflictError,
@@ -76,6 +82,10 @@ __all__ = [
     "TaskNotFoundError",
     "TaskPhase",
     "TaskSummary",
+    "TaskBackendBinding",
+    "assert_task_backend_binding",
+    "bind_task_backend",
+    "get_task_backend_binding",
     "record_agent_compensation_required",
     "record_agent_compensation_succeeded",
     "reconcile_agent_safety",

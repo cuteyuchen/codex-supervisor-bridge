@@ -103,6 +103,7 @@ class EventType(str, Enum):
     WRITER_RELEASED = "WRITER_RELEASED"
     EXECUTION_HANDOFF = "EXECUTION_HANDOFF"
     EXECUTION_HANDBACK = "EXECUTION_HANDBACK"
+    DIRECT_COMMAND_RECORDED = "DIRECT_COMMAND_RECORDED"
     STATE_RECONCILED = "STATE_RECONCILED"
     AGENT_COMPENSATION_SUCCEEDED = "AGENT_COMPENSATION_SUCCEEDED"
     AGENT_COMPENSATION_REQUIRED = "AGENT_COMPENSATION_REQUIRED"
@@ -177,6 +178,8 @@ class TaskMemory(BaseModel):
     current_state: str | None = None
     codex_thread_id: str | None = None
     codex_turn_id: str | None = None
+    agent_runtime_instance_id: str | None = None
+    agent_runtime_epoch: int = Field(default=0, ge=0)
     git_branch: str | None = None
     git_head: str | None = None
     pr_number: int | None = None

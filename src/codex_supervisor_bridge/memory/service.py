@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .context_pack import BuiltContextPack, ContextPackBuilder
 from .errors import StaleRevisionError
@@ -19,6 +20,9 @@ from .models import (
 )
 from .store import MemoryStore
 
+if TYPE_CHECKING:
+    from codex_supervisor_bridge.bootstrap.physical import PhysicalPathGuard
+
 
 class MemoryService:
     """Application-facing facade for persistent supervisor memory."""
@@ -29,8 +33,9 @@ class MemoryService:
         *,
         target_context_chars: int = 48_000,
         hard_max_context_chars: int = 64_000,
+        path_guard: PhysicalPathGuard | None = None,
     ) -> None:
-        self.store = MemoryStore(database)
+        self.store = MemoryStore(database, path_guard=path_guard)
         self.context_builder = ContextPackBuilder(
             self.store,
             target_chars=target_context_chars,

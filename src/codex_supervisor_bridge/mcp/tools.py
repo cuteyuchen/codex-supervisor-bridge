@@ -14,9 +14,11 @@ from .models import (
     EventResponse,
     PlanResponse,
     SearchResponse,
+    TaskListResponse,
     TaskResponse,
     TimelineResponse,
 )
+from .task_discovery import list_task_summaries
 
 READ_ONLY = ToolAnnotations(
     read_only_hint=True,
@@ -69,6 +71,30 @@ def register_memory_tools(server: MCPServer, service: MemoryService) -> None:
     def get_supervised_task(task_id: str) -> TaskResponse:
         """Read canonical lightweight task state and current version counters."""
         return TaskResponse(task=service.get_task(task_id))
+
+    @server.tool(annotations=READ_ONLY)
+    @expose_memory_errors
+    def list_supervised_tasks(
+        active_only: bool = True,
+        repository: str | None = None,
+        limit: int = 20,
+    ) -> TaskListResponse:
+        """Discover recent tasks from canonical Supervisor memory.
+
+        Use this before task-scoped tools when the user refers to the current or
+        active task without supplying a task_id. Results are bounded semantic
+        summaries and intentionally omit raw Codex/Local-Codex-Bridge thread ids.
+        """
+        if not 1 <= limit <= 100:
+            raise tool_argument_error("limit must be between 1 and 100")
+        return TaskListResponse(
+            tasks=list_task_summaries(
+                service,
+                active_only=active_only,
+                repository=repository,
+                limit=limit,
+            )
+        )
 
     @server.tool(annotations=READ_ONLY)
     @expose_memory_errors

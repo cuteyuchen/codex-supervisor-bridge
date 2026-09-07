@@ -1,0 +1,207 @@
+from __future__ import annotations
+
+import json
+import os
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+from .paths import AppDataPaths
+from .physical import PhysicalPathGuard, PhysicalPathVerificationError
+from .remote import OpenAISecureMcpTunnelConfig, RemoteAccessConfig, RemoteAccessMode
+
+CONFIG_VERSION = 1
+
+
+class DevelopmentStyle(str, Enum):
+    AUTOMATIC = "automatic"
+    WEB_FIRST = "web_first"
+    CODEX_FIRST = "codex_first"
+
+
+class CommandPolicy(str, Enum):
+    ASK = "ASK"
+    ALLOW = "ALLOW"
+    DENY = "DENY"
+
+
+class BasicSettings(BaseModel):
+    development_style: DevelopmentStyle = DevelopmentStyle.AUTOMATIC
+    allow_chatgpt_codex_delegation: bool = False
+    local_command_policy: CommandPolicy = CommandPolicy.ASK
+    automatic_git_commit: bool = False
+    automatic_pull_request: bool = False
+    project_directory: Path | None = None
+    github_connected: bool = False
+    codex_enabled: bool = True
+
+
+class AdvancedSettings(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    executable_paths: dict[str, str] = Field(default_factory=dict)
+    process_commands: dict[str, str] = Field(default_factory=dict)
+    local_codex_repository: Path | None = None
+    backend_detail: dict[str, str] = Field(default_factory=dict)
+    ports: dict[str, int] = Field(default_factory=dict)
+    sqlite_path: Path | None = None
+    oauth_detail: dict[str, str] = Field(default_factory=dict)
+    tunnel_detail: dict[str, str] = Field(default_factory=dict)
+    remote_access: RemoteAccessConfig | None = None
+    heartbeat_seconds: int = Field(default=30, ge=1, le=3600)
+    startup_timeout_seconds: int = Field(default=15, ge=1, le=300)
+    shutdown_timeout_seconds: int = Field(default=10, ge=1, le=300)
+    log_level: str = "INFO"
+
+    @field_validator("process_commands", "oauth_detail", "tunnel_detail")
+    @classmethod
+    def reject_credentials(cls, value: dict[str, str]) -> dict[str, str]:
+        sensitive = ("token", "secret", "password", "bearer", "credential")
+        for key, item in value.items():
+            if any(marker in key.lower() for marker in sensitive) or any(
+                marker in item.lower() for marker in ("bearer ", "access_token=", "refresh_token=", "password=")
+            ):
+                raise ValueError("credentials must be stored through SecretStore")
+        return value
+
+    @field_validator("remote_access", mode="before")
+    @classmethod
+    def parse_remote_access(cls, value: Any) -> Any:
+        if isinstance(value, dict) and value.get("provider") in {
+            RemoteAccessMode.OPENAI_SECURE_MCP_TUNNEL.value,
+            RemoteAccessMode.OPENAI_SECURE_MCP_TUNNEL,
+        } and value.get("tunnel_id") and value.get("runtime_secret_ref"):
+            return OpenAISecureMcpTunnelConfig.model_validate(value)
+        return value
+
+
+class AppConfig(BaseModel):
+    config_version: int = CONFIG_VERSION
+    basic: BasicSettings = Field(default_factory=BasicSettings)
+    advanced: AdvancedSettings = Field(default_factory=AdvancedSettings)
+
+    @classmethod
+    def safe_defaults(cls, paths: AppDataPaths | None = None) -> "AppConfig":
+        paths = paths or AppDataPaths.from_environment()
+        return cls(advanced=AdvancedSettings(sqlite_path=paths.database))
+
+    def basic_view(self) -> dict[str, Any]:
+        return self.basic.model_dump(mode="json")
+
+    def advanced_view(self) -> dict[str, Any]:
+        return self.advanced.model_dump(mode="json")
+
+
+class ConfigLoadResult(BaseModel):
+    config: AppConfig
+    status: str = "READY"
+    migrated: bool = False
+    error: str | None = None
+
+
+class ConfigStore:
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        *,
+        paths: AppDataPaths | None = None,
+        path_guard: PhysicalPathGuard | None = None,
+    ) -> None:
+        self.paths = paths or AppDataPaths.from_environment()
+        self.path = Path(path) if path is not None else self.paths.settings
+        self.path_guard = path_guard or PhysicalPathGuard()
+
+    def load(self) -> ConfigLoadResult:
+        try:
+            if not self.path.exists():
+                # Even a missing settings file must not be interpreted through
+                # a redirected parent directory before safe defaults are used.
+                self.path_guard.verify_root(
+                    self.path.parent,
+                    role="path",
+                    require_directory=True,
+                )
+                return ConfigLoadResult(config=AppConfig.safe_defaults(self.paths))
+            self.path_guard.verify_root(self.path, role="path")
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            migrated, changed = self._migrate(raw)
+            config = AppConfig.model_validate(migrated)
+            normalized = self._normalize_app_data_paths(config)
+            changed = changed or normalized
+        except (OSError, json.JSONDecodeError, ValidationError, TypeError, ValueError):
+            return ConfigLoadResult(
+                config=AppConfig.safe_defaults(self.paths),
+                status="DEGRADED",
+                error="Configuration is invalid; safe defaults are active.",
+            )
+        except PhysicalPathVerificationError:
+            return ConfigLoadResult(
+                config=AppConfig.safe_defaults(self.paths),
+                status="DEGRADED",
+                error="Configuration path is not in the verified Supervisor namespace; safe defaults are active.",
+            )
+        if changed and not self.paths.root_report.split_brain:
+            self.save(config)
+        return ConfigLoadResult(config=config, migrated=changed)
+
+    def _normalize_app_data_paths(self, config: AppConfig) -> bool:
+        changed = False
+        advanced = config.advanced
+        if advanced.local_codex_repository is not None:
+            normalized = self.paths.canonicalize_path(advanced.local_codex_repository)
+            if normalized != advanced.local_codex_repository:
+                advanced.local_codex_repository = normalized
+                changed = True
+        if advanced.sqlite_path is not None:
+            normalized = self.paths.canonicalize_path(advanced.sqlite_path)
+            if normalized != advanced.sqlite_path:
+                advanced.sqlite_path = normalized
+                changed = True
+        for key, value in list(advanced.executable_paths.items()):
+            normalized = self.paths.canonicalize_path(value)
+            if normalized != Path(value):
+                advanced.executable_paths[key] = str(normalized)
+                changed = True
+        return changed
+
+    def save(self, config: AppConfig) -> None:
+        self.path_guard.ensure_directory(self.path.parent, role="path")
+        self.path_guard.before_write(self.path, role="path")
+        payload = json.dumps(config.model_dump(mode="json"), indent=2, sort_keys=True) + "\n"
+        fd, temporary = self.path_guard.create_temp_file(
+            self.path.parent,
+            prefix="settings-",
+            suffix=".tmp",
+            role="path",
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self.path_guard.replace(temporary, self.path, role="path")
+        finally:
+            self.path_guard.remove(temporary, role="path")
+
+    @staticmethod
+    def _migrate(raw: Any) -> tuple[dict[str, Any], bool]:
+        if not isinstance(raw, dict):
+            raise ValueError("configuration root must be an object")
+        version = raw.get("config_version", raw.get("version", 0))
+        if not isinstance(version, int) or version < 0 or version > CONFIG_VERSION:
+            raise ValueError("unsupported configuration version")
+        migrated = dict(raw)
+        changed = version != CONFIG_VERSION or "version" in migrated
+        if "version" in migrated:
+            migrated.pop("version", None)
+        if version == 0:
+            basic = dict(migrated.get("basic", {}))
+            if "default_development_style" in migrated:
+                basic.setdefault("development_style", migrated.pop("default_development_style"))
+            if "project_directory" in migrated:
+                basic.setdefault("project_directory", migrated.pop("project_directory"))
+            migrated["basic"] = basic
+        migrated["config_version"] = CONFIG_VERSION
+        return migrated, changed

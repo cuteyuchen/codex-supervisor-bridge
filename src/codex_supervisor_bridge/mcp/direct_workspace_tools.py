@@ -5,6 +5,7 @@ from mcp.types import ToolAnnotations
 
 from codex_supervisor_bridge.backends.models import ChangeReview, GitState
 from codex_supervisor_bridge.supervisor.direct_models import (
+    DirectWorkspaceCommandResult,
     DirectWorkspaceOpenResult,
     DirectWorkspacePatchResult,
     DirectWorkspaceReadResult,
@@ -147,4 +148,59 @@ def register_direct_workspace_tools(
             expected_revision,
             expected_writer_epoch,
             patch,
+        )
+
+    @server.tool(annotations=MUTATION)
+    @expose_integration_errors
+    async def run_direct_workspace_command(
+        task_id: str,
+        expected_revision: int,
+        expected_writer_epoch: int,
+        command: str,
+        approved: bool = False,
+        policy: str = "ASK",
+    ) -> DirectWorkspaceCommandResult:
+        """Run a bounded project command through the authorization gate.
+
+        Commands default to ASK. The command is rejected before provider
+        execution unless the caller supplies explicit approval and the current
+        writer/revision fence is valid.
+        """
+        if not command.strip():
+            raise tool_argument_error("command must not be empty")
+        if expected_writer_epoch < 1:
+            raise tool_argument_error("expected_writer_epoch must be >= 1")
+        try:
+            from codex_supervisor_bridge.bootstrap.command_auth import CommandAuthorizationPolicy
+
+            command_policy = CommandAuthorizationPolicy(policy.upper())
+        except ValueError as exc:
+            raise tool_argument_error("policy must be ALLOW, ASK, or DENY") from exc
+        return await coordinator.run_command(
+            task_id,
+            expected_revision,
+            expected_writer_epoch,
+            command,
+            approved=approved,
+            policy=command_policy,
+        )
+
+    @server.tool(annotations=MUTATION)
+    @expose_integration_errors
+    async def poll_direct_workspace_command(
+        task_id: str,
+        command_id: str,
+        input_text: str | None = None,
+        interrupt: bool = False,
+    ) -> DirectWorkspaceCommandResult:
+        """Continue, provide stdin to, or interrupt an authorized command session."""
+        if not command_id.strip():
+            raise tool_argument_error("command_id must not be empty")
+        if interrupt and input_text is not None:
+            raise tool_argument_error("input_text and interrupt cannot be used together")
+        return await coordinator.poll_command(
+            task_id,
+            command_id,
+            input_text=input_text,
+            interrupt=interrupt,
         )

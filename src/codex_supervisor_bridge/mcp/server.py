@@ -1,11 +1,34 @@
 from __future__ import annotations
 
 import argparse
+import getpass
+import ipaddress
+import json
+import os
+import sys
 from pathlib import Path
 
+import anyio
 from mcp.server import MCPServer
 
 from codex_supervisor_bridge import __version__
+from codex_supervisor_bridge.backends.models import BackendHealth, BackendHealthStatus
+from codex_supervisor_bridge.bootstrap import (
+    SUPERVISOR_HOST_AUTHORITY_ENV,
+    SUPERVISOR_HOST_AUTHORITY_VALUE,
+    BootstrapService,
+    CommandPolicy,
+    DevelopmentStyle,
+    ReconciliationError,
+    ReconciliationService,
+    StandaloneSupervisorHost,
+)
+from codex_supervisor_bridge.bootstrap.codex_isolation import SUPERVISOR_HOST_INSTANCE_ENV
+from codex_supervisor_bridge.bootstrap.configuration import ConfigStore
+from codex_supervisor_bridge.bootstrap.devspace_auth import DevSpaceLocalOAuthDriver
+from codex_supervisor_bridge.bootstrap.doctor import DoctorOptions
+from codex_supervisor_bridge.bootstrap.paths import AppDataPaths
+from codex_supervisor_bridge.bootstrap.secrets import MemorySecretStore, WindowsDpapiSecretStore
 from codex_supervisor_bridge.config import Settings
 from codex_supervisor_bridge.integrations.codex_control_client import CodexControlAdapter
 from codex_supervisor_bridge.integrations.codex_coordinator import CodexCoordinator
@@ -13,9 +36,23 @@ from codex_supervisor_bridge.integrations.control_plane_agent import ControlPlan
 from codex_supervisor_bridge.integrations.devspace_client import DevSpaceWorkspaceAdapter
 from codex_supervisor_bridge.integrations.kandev_client import KandevAdapter
 from codex_supervisor_bridge.integrations.kandev_coordinator import KandevCoordinator
+from codex_supervisor_bridge.memory.backend_binding import (
+    list_runtime_affinity_bindings,
+)
 from codex_supervisor_bridge.memory.service import MemoryService
+from codex_supervisor_bridge.supervisor.agent_facade import (
+    CodexCoordinatorFacade,
+    CodexSemanticFacade,
+)
 from codex_supervisor_bridge.supervisor.checkpoints import CheckpointService
 from codex_supervisor_bridge.supervisor.direct_workspace import DirectWorkspaceCoordinator
+from codex_supervisor_bridge.supervisor.runtime import (
+    ProfileReadiness,
+    RuntimeComposition,
+    lcb_environment,
+    lcb_launch_from_config,
+)
+from codex_supervisor_bridge.supervisor.runtime_resolver import RuntimeResolver
 
 from .checkpoint_tools import register_checkpoint_tools
 from .codex_tools import register_codex_tools
@@ -81,6 +118,11 @@ Supervisor facade after the WorkspaceBackend adapter is available. Do not
 assume arbitrary raw filesystem or system shell access. Existing Kandev and
 Codex Control Plane integrations are backend implementations/fallbacks, not
 permanent Supervisor Core ownership boundaries.
+
+Direct command execution is also constrained by the Supervisor facade. It is
+workspace-bound, revision/writer fenced, bounded in output and duration, and
+defaults to ASK. Dangerous commands fail closed; an UNKNOWN command outcome
+requires reconciliation before another mutation.
 """.strip()
 
 
@@ -89,6 +131,8 @@ def create_mcp_server(
     *,
     kandev: KandevCoordinator | None = None,
     codex: CodexCoordinator | None = None,
+    agent_facade: CodexSemanticFacade | None = None,
+    checkpoints: CheckpointService | None = None,
     direct_workspace: DirectWorkspaceCoordinator | None = None,
 ) -> MCPServer:
     server = MCPServer(
@@ -108,8 +152,15 @@ def create_mcp_server(
     register_direct_workspace_tools(server, direct_workspace)
     if kandev is not None:
         register_kandev_tools(server, kandev)
-    if codex is not None:
-        register_codex_tools(server, codex)
+    if agent_facade is not None:
+        register_codex_tools(server, agent_facade)
+        checkpoint_backend = getattr(agent_facade, "checkpoint_backend", None)
+        if checkpoints is None and checkpoint_backend is not None:
+            checkpoints = CheckpointService(service, agent_backend=checkpoint_backend)
+        if checkpoints is not None:
+            register_checkpoint_tools(server, service, checkpoints)
+    elif codex is not None:
+        register_codex_tools(server, CodexCoordinatorFacade(codex))
         register_checkpoint_tools(
             server,
             service,
@@ -125,6 +176,98 @@ def create_mcp_server(
 def build_parser(settings: Settings | None = None) -> argparse.ArgumentParser:
     settings = settings or Settings.from_env()
     parser = argparse.ArgumentParser(description="Run Codex Supervisor Bridge MCP server")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=(
+            "configure",
+            "doctor",
+            "start",
+            "status",
+            "repair",
+            "reconcile-app-data",
+            "remote",
+        ),
+        help="Bootstrap command; omit to run the MCP server",
+    )
+    parser.add_argument("--json", action="store_true", dest="json_output", help="Render structured output")
+    parser.add_argument("--advanced", action="store_true", help="Include technical diagnostics")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Create a reconciliation plan without applying it",
+    )
+    parser.add_argument(
+        "--keep",
+        choices=("canonical", "legacy"),
+        default=None,
+        help="Explicitly select the authoritative application-data root",
+    )
+    parser.add_argument(
+        "--legacy-root",
+        type=Path,
+        default=None,
+        help="Explicit non-authoritative application-data root for reconciliation",
+    )
+    parser.add_argument(
+        "--confirm",
+        default=None,
+        help="Apply only the exact reconciliation plan identified by this plan id",
+    )
+    parser.add_argument("--project", type=Path, default=None, help="Project directory for bootstrap commands")
+    parser.add_argument(
+        "--style",
+        choices=[item.value for item in DevelopmentStyle],
+        default=None,
+        help="Default development style for configure",
+    )
+    parser.add_argument(
+        "--command-policy",
+        choices=[item.value for item in CommandPolicy],
+        default=None,
+        help="Local command policy for configure",
+    )
+    parser.add_argument(
+        "--allow-codex-delegation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Allow ChatGPT to delegate to Codex automatically",
+    )
+    parser.add_argument(
+        "--auto-commit",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Automatically create Git commits",
+    )
+    parser.add_argument(
+        "--auto-pr",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Automatically create draft pull requests",
+    )
+    parser.add_argument(
+        "--local-codex-repository",
+        type=Path,
+        default=None,
+        help="Local-Codex-Bridge repository path for configure",
+    )
+    parser.add_argument(
+        "--node",
+        default=None,
+        help="Node.js executable path for configure",
+    )
+    parser.add_argument(
+        "remote_action",
+        nargs="?",
+        choices=("configure",),
+        help="Remote access action (use with the remote command)",
+    )
+    parser.add_argument("--tunnel-id", default=None, help="OpenAI Secure MCP Tunnel id")
+    parser.add_argument(
+        "--runtime-secret-ref",
+        default="openai-tunnel-runtime",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--database",
         type=Path,
@@ -172,8 +315,145 @@ def build_parser(settings: Settings | None = None) -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
+    if (
+        args.command is None
+        and os.environ.get(SUPERVISOR_HOST_AUTHORITY_ENV) != SUPERVISOR_HOST_AUTHORITY_VALUE
+    ):
+        from codex_supervisor_bridge.bootstrap.host import main as host_main
+
+        host_main(raw_argv)
+        return
+    if args.command is not None:
+        if args.command == "remote":
+            if args.remote_action != "configure":
+                parser.error("remote requires the configure action")
+            if not args.tunnel_id:
+                parser.error("remote configure requires --tunnel-id")
+            try:
+                runtime_key = getpass.getpass("OpenAI tunnel runtime API key (hidden): ")
+            except (EOFError, KeyboardInterrupt):
+                print("需要在本机隐藏终端输入 runtime key；不要把 key 粘贴到聊天中。")
+                return
+            if not runtime_key:
+                parser.error("runtime key must not be empty")
+            app_paths = AppDataPaths.from_environment()
+            host = StandaloneSupervisorHost(paths=app_paths)
+            host.assert_ready()
+            bootstrap = BootstrapService(
+                paths=app_paths,
+                host=host,
+                auto_install=True,
+            )
+            result = bootstrap.configure_remote_access(
+                tunnel_id=args.tunnel_id,
+                runtime_key=runtime_key,
+                runtime_secret_ref=args.runtime_secret_ref,
+            )
+            payload = result.advanced_view() if args.advanced else result.user_view()
+            if args.json_output:
+                print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+            else:
+                print("ChatGPT 连接：已保存本机配置，等待 tunnel 启动。")
+            return
+        if args.command == "reconcile-app-data":
+            if args.confirm and not args.keep:
+                parser.error("reconcile-app-data apply requires --keep canonical or --keep legacy")
+            if args.confirm and args.dry_run:
+                parser.error("--dry-run cannot be combined with --confirm")
+            paths = AppDataPaths.from_environment()
+            host = StandaloneSupervisorHost(paths=paths)
+            reconciler = ReconciliationService(
+                paths=paths,
+                path_guard=host.path_guard,
+            )
+            try:
+                if args.confirm:
+                    host.assert_ready()
+                    result = reconciler.apply(
+                        plan_id=args.confirm,
+                        selected_authority=args.keep,
+                        legacy_root=args.legacy_root,
+                    )
+                    payload = result.advanced_view() if args.advanced else result.user_view()
+                    if args.json_output:
+                        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+                    else:
+                        print(result.message)
+                        print(f"status={result.status}")
+                        if result.backup_location:
+                            print(f"backup={result.backup_location}")
+                    return
+                plan = reconciler.plan(
+                    selected_authority=args.keep or "canonical",
+                    legacy_root=args.legacy_root,
+                )
+            except ReconciliationError as exc:
+                if args.json_output:
+                    print(
+                        json.dumps(
+                            {
+                                "status": "PLAN_BLOCKED",
+                                "message": str(exc),
+                                "blocking_reasons": ["RECONCILIATION_PLAN_UNAVAILABLE"],
+                            },
+                            ensure_ascii=True,
+                            indent=2,
+                            sort_keys=True,
+                        )
+                    )
+                else:
+                    print(str(exc))
+                return
+            payload = plan.advanced_view() if args.advanced else plan.user_view()
+            if args.json_output:
+                print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+            else:
+                print(
+                    "Reconciliation plan "
+                    f"{plan.plan_id}: authority={plan.selected_authority} "
+                    f"safe_to_apply={plan.safe_to_apply}"
+                )
+                for action in plan.actions:
+                    print(f"action={action}")
+                for reason in plan.blocking_reasons:
+                    print(f"blocked={reason}")
+            return
+        app_paths = AppDataPaths.from_environment()
+        host = StandaloneSupervisorHost(paths=app_paths)
+        host.assert_ready()
+        bootstrap = BootstrapService(
+            paths=app_paths,
+            host=host,
+            auto_install=True,
+        )
+        if args.command in {"doctor", "status"}:
+            result = bootstrap.status(project_directory=args.project)
+        elif args.command == "repair":
+            result = bootstrap.repair_and_status(project_directory=args.project)
+        elif args.command == "configure":
+            result = bootstrap.configure(
+                project_directory=args.project,
+                development_style=DevelopmentStyle(args.style) if args.style else None,
+                local_command_policy=CommandPolicy(args.command_policy) if args.command_policy else None,
+                allow_chatgpt_codex_delegation=args.allow_codex_delegation,
+                automatic_git_commit=args.auto_commit,
+                automatic_pull_request=args.auto_pr,
+                local_codex_repository=args.local_codex_repository,
+                node_executable=args.node,
+            )
+        else:
+            result = bootstrap.start(project_directory=args.project)
+        payload = result.advanced_view() if args.advanced else result.user_view()
+        if args.json_output:
+            print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+        else:
+            print(result.summary)
+            for item in result.doctor.components:
+                print(f"{item.status.value:11} {item.capability}: {item.user_message}")
+        return
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
     if not args.mcp_path.startswith("/"):
@@ -184,43 +464,208 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("--devspace-mcp-url must not be empty")
     if not args.codex_control_command.strip():
         parser.error("--codex-control-command must not be empty")
+    if args.transport != "stdio" and not _is_loopback_host(args.host):
+        parser.error("HTTP MCP must bind to loopback; use a secure HTTPS tunnel for remote access")
 
-    service = MemoryService(args.database)
+    app_paths = AppDataPaths.from_environment()
+    host = StandaloneSupervisorHost(paths=app_paths)
+    host.assert_ready()
+    host_identity = host.ensure_identity()
+    service = MemoryService(args.database, path_guard=host.path_guard)
+    secret_store = (
+        WindowsDpapiSecretStore(
+            app_paths.config / "secrets",
+            path_guard=host.path_guard,
+        )
+        if sys.platform == "win32"
+        else MemorySecretStore()
+    )
+    devspace_auth = DevSpaceLocalOAuthDriver()
+
+    def authenticated_devspace_factory() -> DevSpaceWorkspaceAdapter:
+        return DevSpaceWorkspaceAdapter(
+            args.devspace_mcp_url,
+            transport_factory=lambda: devspace_auth.http_transport(
+                mcp_url=args.devspace_mcp_url,
+                secret_store=secret_store,
+            ),
+        )
+
+    config = ConfigStore(paths=app_paths, path_guard=host.path_guard).load().config
+    bootstrap = BootstrapService(
+        paths=app_paths,
+        config_store=ConfigStore(paths=app_paths, path_guard=host.path_guard),
+        host=host,
+    )
+    doctor = bootstrap.doctor.run(
+        DoctorOptions(project_directory=config.basic.project_directory)
+    )
+    forced_binding = _resolve_startup_binding(service)
+    selection = RuntimeResolver(
+        _doctor_health(doctor),
+        development_style=config.basic.development_style.value,
+        task_binding=forced_binding,
+    ).resolve()
+    launch_command: list[str] | None = None
+    repository = config.advanced.local_codex_repository
+    if repository is not None:
+        try:
+            launch_command = lcb_launch_from_config(
+                repository=repository,
+                node_executable=config.advanced.executable_paths.get("node", "node"),
+            )
+        except FileNotFoundError:
+            launch_command = None
+    if selection.profile == "lightweight" and launch_command:
+        runtime_environment = lcb_environment(app_data_root=app_paths.filesystem_root)
+        if host_identity.host_instance_id is None:
+            raise RuntimeError(
+                "SUPERVISOR_HOST_IDENTITY_UNKNOWN: persistent host identity is unavailable"
+            )
+        runtime_environment[SUPERVISOR_HOST_INSTANCE_ENV] = host_identity.host_instance_id
+        composition = RuntimeComposition.profile_b(
+            service,
+            launch_command=launch_command,
+            env=runtime_environment,
+            app_data_root=app_paths.filesystem_root,
+            path_guard=host.path_guard,
+            host=host,
+            workspace_factory=authenticated_devspace_factory,
+        )
+    elif selection.binding_forced and selection.profile == "lightweight":
+        raise RuntimeError(
+            "STARTUP_RECONCILIATION_REQUIRED: the bound task needs Profile B, "
+            "but Local-Codex-Bridge cannot be launched"
+        )
+    else:
+        composition = RuntimeComposition.profile_a(
+            service,
+            adapter_factory=lambda: CodexControlAdapter.stdio(
+                args.codex_control_command,
+                env={"CODEX_MCP_EXECUTION_MODE": "client"},
+            ),
+            kandev_adapter_factory=lambda: KandevAdapter(args.kandev_mcp_url),
+        )
+    composition.codex_readiness = _doctor_health(doctor).get("codex")
     kandev = KandevCoordinator(
         service,
         lambda: KandevAdapter(args.kandev_mcp_url),
     )
     direct_workspace = DirectWorkspaceCoordinator(
         service,
-        lambda: DevSpaceWorkspaceAdapter(args.devspace_mcp_url),
+        composition.workspace_factory,
+        backend_name=composition.workspace_backend,
     )
-    codex = CodexCoordinator(
-        service,
-        lambda: CodexControlAdapter.stdio(
-            args.codex_control_command,
-            env={"CODEX_MCP_EXECUTION_MODE": "client"},
-        ),
+
+    async def serve() -> None:
+        await composition.start()
+        readiness = await composition.readiness()
+        _emit_readiness_marker(readiness)
+        facade = composition.agent_facade(service)
+        server = create_mcp_server(
+            service,
+            kandev=kandev,
+            agent_facade=facade,
+            checkpoints=composition.checkpoint_service,
+            direct_workspace=direct_workspace,
+        )
+        try:
+            if args.transport == "stdio":
+                await server.run_stdio_async()
+            else:
+                await server.run_streamable_http_async(
+                    host=args.host,
+                    port=args.port,
+                    streamable_http_path=args.mcp_path,
+                    json_response=True,
+                    stateless_http=True,
+                )
+        finally:
+            await composition.shutdown()
+            service.close()
+
+    anyio.run(serve)
+
+
+def _doctor_health(doctor: object) -> dict[str, BackendHealth]:
+    """Map Doctor components onto provider-neutral capability health."""
+    from codex_supervisor_bridge.bootstrap.models import HealthStatus
+
+    aliases = {
+        "devspace": "Local workspace",
+        "local_codex_bridge": "Codex control",
+        "kandev": "Fallback workspace",
+        "control_plane": "Fallback control",
+        "github": "GitHub",
+        "codex": "Codex",
+        "codex_runtime_isolation": "Codex runtime isolation",
+    }
+    result: dict[str, BackendHealth] = {}
+    for name, label in aliases.items():
+        item = doctor.component(label)
+        if item is None:
+            continue
+        mapped = {
+            HealthStatus.READY: BackendHealthStatus.READY,
+            HealthStatus.DEGRADED: BackendHealthStatus.DEGRADED,
+            HealthStatus.UNAVAILABLE: BackendHealthStatus.UNAVAILABLE,
+            HealthStatus.REPAIRING: BackendHealthStatus.DEGRADED,
+        }[item.status]
+        result[name] = BackendHealth(
+            capability=name,
+            status=mapped,
+            user_message=item.user_message,
+            repairable=item.repairable,
+            technical_detail=str(item.advanced.get("technical_detail", "")),
+            capabilities={
+                "supports_isolated_runtime": bool(
+                    item.advanced.get("supports_isolated_runtime", False)
+                )
+            }
+            if name == "local_codex_bridge"
+            else {},
+        )
+    return result
+
+
+def _resolve_startup_binding(service: MemoryService):
+    """Force one runtime-affinity binding, or fail closed on conflicts."""
+    active_bindings = list_runtime_affinity_bindings(service.store)
+    distinct_bindings = {
+        (
+            binding.workspace_backend,
+            binding.agent_backend,
+            binding.profile,
+        )
+        for binding in active_bindings
+    }
+    if len(distinct_bindings) > 1:
+        raise RuntimeError(
+            "STARTUP_RECONCILIATION_REQUIRED: multiple active tasks are bound "
+            "to different backend profiles; do not silently choose one"
+        )
+    return active_bindings[0] if active_bindings else None
+
+
+def _emit_readiness_marker(readiness: ProfileReadiness) -> None:
+    """Print one bounded readiness line for the bootstrap start gate."""
+    print(
+        f"SUPERVISOR_READY status={readiness.status} profile={readiness.profile} "
+        f"workspace_backend={readiness.workspace_backend} "
+        f"agent_backend={readiness.agent_backend}",
+        file=sys.stderr,
+        flush=True,
     )
-    server = create_mcp_server(
-        service,
-        kandev=kandev,
-        codex=codex,
-        direct_workspace=direct_workspace,
-    )
+
+
+def _is_loopback_host(host: str) -> bool:
+    normalized = host.strip().lower()
+    if normalized == "localhost":
+        return True
     try:
-        if args.transport == "stdio":
-            server.run(transport="stdio")
-        else:
-            server.run(
-                transport="streamable-http",
-                host=args.host,
-                port=args.port,
-                streamable_http_path=args.mcp_path,
-                json_response=True,
-                stateless_http=True,
-            )
-    finally:
-        service.close()
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 
 if __name__ == "__main__":

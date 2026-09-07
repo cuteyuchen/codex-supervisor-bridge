@@ -4,6 +4,19 @@ A persistent supervision, memory, steering, and workflow bridge for ChatGPT and 
 
 Codex Supervisor Bridge sits between ChatGPT Web, Kandev, Codex Control Plane, and GitHub. Its goal is to make long-running AI-assisted development resumable, auditable, steerable, and safe across ChatGPT conversation boundaries.
 
+> **Experimental runtime safety status (2026-08-31):** Remote Profile B is not
+> production safe while the Codex Desktop isolation release blocker remains
+> open. Do not use Supervisor/Local-Codex-Bridge control against a daily-use
+> Codex Desktop environment until the documented process-ownership, runtime
+> namespace, interrupt, restart, and concurrent Desktop gates pass.
+
+The current P6.6 blocker is confirmed Windows AppData execution-context
+redirection: the same requested AppData path can resolve to different physical
+files when launched from different Windows contexts, including a context that
+reports `NO_PACKAGE_IDENTITY`. The branch is adding a standalone Supervisor
+Host and physical-path guard. This is experimental code only; it does not yet
+claim Desktop runtime isolation or production-safe Remote Profile B.
+
 ## Why it exists
 
 A long ChatGPT conversation should not be the project's memory, and a long Codex turn should not become a black box.

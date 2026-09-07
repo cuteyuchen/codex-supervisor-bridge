@@ -15,11 +15,17 @@ from codex_supervisor_bridge.backends.models import (
     WorkspaceState,
     WriterLeaseToken,
 )
+from codex_supervisor_bridge.bootstrap.command_auth import CommandAuthorizationPolicy
 from codex_supervisor_bridge.memory.execution import acquire_writer, get_execution_state
 from codex_supervisor_bridge.memory.models import ActiveWriter, Actor
 from codex_supervisor_bridge.memory.service import MemoryService
-from codex_supervisor_bridge.memory.workspace import get_workspace_binding
+from codex_supervisor_bridge.memory.workspace import (
+    get_active_direct_command_session,
+    get_direct_command_session,
+    get_workspace_binding,
+)
 from codex_supervisor_bridge.memory.workspace_models import (
+    DirectCommandSessionStatus,
     DirectOperationStatus,
     WorkspaceBindingStatus,
 )
@@ -32,11 +38,26 @@ class FakeWorkspaceAdapter:
         *,
         on_patch: Callable[[], None] | None = None,
         patch_error: Exception | None = None,
+        poll_error: Exception | None = None,
     ) -> None:
         self.on_patch = on_patch
         self.patch_error = patch_error
+        self.poll_error = poll_error
         self.open_calls = 0
         self.patch_calls = 0
+        self.command_calls = 0
+        self.command_result = CommandResult(
+            command_id="17",
+            status="completed",
+            exit_code=0,
+            stdout="ok",
+        )
+        self.poll_result = CommandResult(
+            command_id="17",
+            status="completed",
+            exit_code=0,
+            stdout="done",
+        )
         self.git = GitState(
             branch="main",
             head="a" * 40,
@@ -113,7 +134,8 @@ class FakeWorkspaceAdapter:
         yield_time_ms: int = 10_000,
         tty: bool = False,
     ) -> CommandResult:
-        raise NotImplementedError
+        self.command_calls += 1
+        return self.command_result
 
     async def poll_command(
         self,
@@ -123,7 +145,9 @@ class FakeWorkspaceAdapter:
         input_text: str | None = None,
         interrupt: bool = False,
     ) -> CommandResult:
-        raise NotImplementedError
+        if self.poll_error is not None:
+            raise self.poll_error
+        return self.poll_result
 
     async def show_changes(self, workspace_id: str) -> ChangeReview:
         return ChangeReview(
@@ -208,6 +232,172 @@ def test_open_read_and_patch_are_durable_and_revision_fenced(tmp_path: Path) -> 
         assert get_execution_state(reopened.store, "DIRECT-COORD").active_writer == ActiveWriter.CHATGPT
     finally:
         reopened.close()
+
+
+def test_direct_command_defaults_to_ask_and_records_completed_evidence() -> None:
+    memory = MemoryService()
+    adapter = FakeWorkspaceAdapter()
+    coordinator, revision, epoch = setup_direct(memory, adapter)
+
+    async def scenario() -> None:
+        pending = await coordinator.run_command(
+            "DIRECT-COORD",
+            revision,
+            epoch,
+            "pytest",
+        )
+        assert pending.authorization.verdict.value == "ASK"
+        assert pending.command is None
+        assert adapter.command_calls == 0
+
+        completed = await coordinator.run_command(
+            "DIRECT-COORD",
+            revision,
+            epoch,
+            "pytest",
+            approved=True,
+            policy=CommandAuthorizationPolicy.ASK,
+        )
+        assert completed.authorization.verdict.value == "ALLOW"
+        assert completed.command is not None
+        assert completed.command.exit_code == 0
+        assert completed.operation is not None
+        assert completed.operation.status == DirectOperationStatus.SUCCEEDED
+        assert adapter.command_calls == 1
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        memory.close()
+
+
+def test_direct_command_long_session_can_be_polled_and_interrupted(tmp_path: Path) -> None:
+    database = tmp_path / "direct-command.db"
+    memory = MemoryService(database)
+    adapter = FakeWorkspaceAdapter()
+    adapter.command_result = CommandResult(command_id="18", status="running")
+    adapter.poll_result = CommandResult(command_id="18", status="completed", exit_code=0, stdout="done")
+    coordinator, revision, epoch = setup_direct(memory, adapter)
+
+    async def start() -> None:
+        started = await coordinator.run_command(
+            "DIRECT-COORD",
+            revision,
+            epoch,
+            "python -c pass",
+            approved=True,
+            policy=CommandAuthorizationPolicy.ALLOW,
+        )
+        assert started.command is not None and started.command.status == "running"
+        assert started.operation is not None and started.operation.status == DirectOperationStatus.PREPARED
+        session = get_active_direct_command_session(memory.store, "DIRECT-COORD")
+        assert session is not None
+        assert session.status == DirectCommandSessionStatus.RUNNING
+
+    try:
+        asyncio.run(start())
+    finally:
+        memory.close()
+
+    reopened = MemoryService(database)
+    try:
+        async def finish() -> None:
+            recovered = DirectWorkspaceCoordinator(reopened, lambda: adapter)
+            recovered_session = get_direct_command_session(reopened.store, "DIRECT-COORD", "18")
+            assert recovered_session is not None
+            assert recovered_session.status == DirectCommandSessionStatus.RUNNING
+            finished = await recovered.poll_command("DIRECT-COORD", "18", interrupt=True)
+            assert finished.command is not None and finished.command.status == "completed"
+            assert finished.operation is not None and finished.operation.status == DirectOperationStatus.SUCCEEDED
+            persisted = get_direct_command_session(reopened.store, "DIRECT-COORD", "18")
+            assert persisted is not None
+            assert persisted.status == DirectCommandSessionStatus.COMPLETED
+            assert persisted.completed_revision == finished.task.revision
+
+        asyncio.run(finish())
+    finally:
+        reopened.close()
+
+
+def test_unknown_direct_command_outcome_requires_workspace_reconciliation() -> None:
+    memory = MemoryService()
+    adapter = FakeWorkspaceAdapter()
+    adapter.command_result = CommandResult(command_id="19", status="unknown")
+    coordinator, revision, epoch = setup_direct(memory, adapter)
+
+    async def scenario() -> None:
+        result = await coordinator.run_command(
+            "DIRECT-COORD",
+            revision,
+            epoch,
+            "pytest",
+            approved=True,
+            policy=CommandAuthorizationPolicy.ALLOW,
+        )
+        assert result.reconciliation_required is True
+        assert result.operation is not None
+        assert result.operation.status == DirectOperationStatus.RECONCILIATION_REQUIRED
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        memory.close()
+
+
+def test_direct_command_poll_failure_latches_unknown_session() -> None:
+    memory = MemoryService()
+    adapter = FakeWorkspaceAdapter(poll_error=RuntimeError("transport disconnected"))
+    adapter.command_result = CommandResult(command_id="21", status="running")
+    coordinator, revision, epoch = setup_direct(memory, adapter)
+
+    async def scenario() -> None:
+        started = await coordinator.run_command(
+            "DIRECT-COORD",
+            revision,
+            epoch,
+            "pytest",
+            approved=True,
+            policy=CommandAuthorizationPolicy.ALLOW,
+        )
+        assert started.command is not None and started.command.status == "running"
+        with pytest.raises(RuntimeError, match="transport disconnected"):
+            await coordinator.poll_command("DIRECT-COORD", "21")
+        session = get_direct_command_session(memory.store, "DIRECT-COORD", "21")
+        assert session is not None
+        assert session.status == DirectCommandSessionStatus.UNKNOWN
+        status = coordinator.status("DIRECT-COORD")
+        assert status.workspace is not None
+        assert status.workspace.state == WorkspaceBindingStatus.RECONCILIATION_REQUIRED
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        memory.close()
+
+
+def test_direct_command_output_is_bounded_at_supervisor_boundary() -> None:
+    memory = MemoryService()
+    adapter = FakeWorkspaceAdapter()
+    adapter.command_result = CommandResult(command_id="20", status="completed", exit_code=0, stdout="x" * 25_000)
+    coordinator, revision, epoch = setup_direct(memory, adapter)
+
+    async def scenario() -> None:
+        result = await coordinator.run_command(
+            "DIRECT-COORD",
+            revision,
+            epoch,
+            "pytest",
+            approved=True,
+            policy=CommandAuthorizationPolicy.ALLOW,
+        )
+        assert result.command is not None
+        assert len(result.command.stdout) == 20_000
+        assert result.command.truncated is True
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        memory.close()
 
 
 def test_user_intent_change_while_patch_is_in_flight_requires_reconciliation() -> None:

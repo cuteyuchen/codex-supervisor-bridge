@@ -1,0 +1,102 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+from pydantic import BaseModel, Field, field_validator
+
+from codex_supervisor_bridge.integrations.agent_backends import LOCAL_CODEX_TOOLS
+
+from .models import ComponentHealth, HealthStatus
+from .process import ManagedProcessSpec
+
+
+class LocalCodexBridgeBootstrapConfig(BaseModel):
+    launch_command: list[str] = Field(min_length=1)
+    version_command: list[str] = Field(default_factory=list)
+    working_directory: Path | None = None
+    required_tools: list[str] = Field(default_factory=lambda: sorted(LOCAL_CODEX_TOOLS))
+
+    @field_validator("launch_command")
+    @classmethod
+    def reject_protocol_polluting_launcher(cls, value: list[str]) -> list[str]:
+        if value:
+            launcher = Path(value[0]).name.lower()
+            if launcher in {"npm", "npm.cmd", "npm.exe"}:
+                raise ValueError("use node dist/src/index.js for an MCP stdio launch")
+        return value
+
+
+class LocalCodexBridgeBootstrap:
+    """Process and protocol checks for Local-Codex-Bridge at the provider edge."""
+
+    def __init__(self, config: LocalCodexBridgeBootstrapConfig) -> None:
+        self.config = config
+
+    @classmethod
+    def from_repository(
+        cls,
+        repository_path: str | Path,
+        *,
+        node_executable: str = "node",
+    ) -> "LocalCodexBridgeBootstrap":
+        return cls(
+            LocalCodexBridgeBootstrapConfig(
+                launch_command=cls.canonical_launch_command(
+                    repository_path,
+                    node_executable=node_executable,
+                )
+            )
+        )
+
+    @staticmethod
+    def canonical_launch_command(
+        repository_path: str | Path,
+        *,
+        node_executable: str = "node",
+    ) -> list[str]:
+        entrypoint = Path(repository_path).expanduser().absolute() / "dist" / "src" / "index.js"
+        if not entrypoint.is_file():
+            raise FileNotFoundError("Local-Codex-Bridge build output is missing")
+        return [node_executable, str(entrypoint)]
+
+    def process_spec(
+        self,
+        *,
+        startup_timeout: float = 15.0,
+        shutdown_timeout: float = 10.0,
+        data_root: str | Path | None = None,
+    ) -> ManagedProcessSpec:
+        environment = dict(os.environ)
+        if data_root is not None:
+            environment["CODEX_SUPERVISOR_DATA_DIR"] = str(Path(data_root))
+        return ManagedProcessSpec(
+            name="local_codex_bridge",
+            command=self.config.launch_command,
+            cwd=self.config.working_directory,
+            env=environment,
+            startup_timeout=startup_timeout,
+            shutdown_timeout=shutdown_timeout,
+        )
+
+    def protocol_health(self, available_tools: set[str]) -> ComponentHealth:
+        missing = sorted(set(self.config.required_tools) - available_tools)
+        if missing:
+            return ComponentHealth(
+                capability="Codex control",
+                status=HealthStatus.DEGRADED,
+                repairable=True,
+                user_message="Codex control needs an update or repair.",
+                recommended_action="repair_codex_control",
+                advanced={"provider": "local-codex-bridge", "missing_tools": missing},
+            )
+        return ComponentHealth(
+            capability="Codex control",
+            status=HealthStatus.READY,
+            user_message="Codex control is ready.",
+            advanced={
+                "provider": "local-codex-bridge",
+                "tools": sorted(available_tools & set(self.config.required_tools)),
+                "semantics": ["turn", "observe", "steer", "respond", "interrupt"],
+            },
+        )

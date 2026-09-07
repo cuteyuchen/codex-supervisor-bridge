@@ -20,6 +20,7 @@ class BackendHealth(BaseModel):
     user_message: str
     repairable: bool = False
     technical_detail: str | None = None
+    capabilities: dict[str, bool] = Field(default_factory=dict)
 
 
 class WriterLeaseToken(BaseModel):
@@ -73,6 +74,10 @@ class PendingInteraction(BaseModel):
     prompt: str | None = None
     thread_id: str | None = None
     turn_id: str | None = None
+    runtime_instance_id: str | None = None
+    runtime_epoch: int = Field(default=0, ge=0)
+    runtime_ownership: str = "UNKNOWN"
+    isolation_verified: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -92,6 +97,10 @@ class AgentSnapshot(BaseModel):
     workflow_id: str | None = None
     thread_id: str | None = None
     turn_id: str | None = None
+    runtime_instance_id: str | None = None
+    runtime_epoch: int = Field(default=0, ge=0)
+    runtime_ownership: str = "UNKNOWN"
+    isolation_verified: bool = False
     completed: list[str] = Field(default_factory=list)
     in_progress: list[str] = Field(default_factory=list)
     files_changed: list[str] = Field(default_factory=list)
@@ -107,10 +116,15 @@ class AgentSnapshot(BaseModel):
 
 
 class PlanHandle(BaseModel):
+    task_id: str | None = None
     operation_id: str | None = None
     workflow_id: str | None = None
     thread_id: str | None = None
     turn_id: str | None = None
+    runtime_instance_id: str | None = None
+    runtime_epoch: int = Field(default=0, ge=0)
+    runtime_ownership: str = "UNKNOWN"
+    isolation_verified: bool = False
     status: str
     plan: PlanResult | None = None
     reconciliation_required: bool = False
